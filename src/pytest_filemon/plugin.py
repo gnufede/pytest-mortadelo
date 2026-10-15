@@ -108,7 +108,7 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
     return changed, True, not candidates
 
 
-def _early_probe_pure_fast(args: list[str]) -> bool:
+def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
     """Heuristic pre-configure check: can we skip monitor activation?
 
     Conservative in the right direction: any raw-argument that could mean
@@ -130,7 +130,10 @@ def _early_probe_pure_fast(args: list[str]) -> bool:
     root = git_root(Path.cwd())
     if root is None:
         return False
-    store = GitStore(root, command_key(args, root))
+    # The shard key comes from the *invocation* arguments: the hook's args
+    # already include ini addopts, which the configure-time key
+    # (config.invocation_params.args) does not.
+    store = GitStore(root, command_key(cli_args, root))
     _, fast, pure = _fast_conditions(store, store.load_meta())
     return fast and pure
 
@@ -194,7 +197,7 @@ def pytest_load_initial_conftests(early_config, parser, args):
     # instead of the command line is handled by a late activation fallback in
     # pytest_configure.)
     if "--filemon" in args or _env_enabled():
-        if _early_probe_pure_fast(args):
+        if _early_probe_pure_fast(args, early_config.invocation_params.args):
             # No-change rerun (decided from meta.json alone, before any
             # conftest is imported): no recorded dependency can be stale
             # and nothing new can run, so the whole monitoring machinery is
