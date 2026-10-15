@@ -12,8 +12,9 @@ Lifecycle (``pytest --filemon``):
    module imports); afterwards to the *test* phase.
 4. ``pytest_collection_modifyitems`` -- select tests via git diff against the
    shard's base commit; deselect the rest.
-5. ``pytest_runtest_logstart`` / ``logreport`` -- attribute PY_START events to
-   the running test; track failures and completion.
+5. ``pytest_runtest_protocol`` / ``pytest_runtest_makereport`` (both
+   wrappers) -- bracket each test to attribute PY_START events to it, and
+   track failures and completion from the outcome reports.
 6. ``pytest_sessionfinish`` -- merge recorded dependencies (per-test deps +
    import-time deps) and store the shard as a git ref.
 """
@@ -30,11 +31,6 @@ from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import Selection, Shard, load_shard, select_tests
 from .util import command_key, git_root, to_repo_rel
-
-# Module-level state.  The plugin runs once per pytest process; hooks that do
-# not receive a config object read these globals.
-_EARLY_MONITOR: FileMonitor | None = None
-_STATE: FilemonState | None = None
 
 # The plugin's own package directory: never recorded as a test dependency
 # (relevant when the plugin is installed editable inside the tested repo).
@@ -104,8 +100,9 @@ def pytest_load_initial_conftests(early_config, parser, args):
         if root is not None:
             monitor = FileMonitor(root, exclude_roots=(_PLUGIN_PACKAGE_DIR,))
             if monitor.activate():
-                global _EARLY_MONITOR
-                _EARLY_MONITOR = monitor
+                # Stash on the config (the same instance pytest_configure
+                # receives) instead of a module global.
+                early_config._filemon_early_monitor = monitor
     return (yield)
 
 
@@ -319,6 +316,8 @@ class FilemonState:
     # -- recording -------------------------------------------------------
 
     def record_report(self, report) -> None:
+        """Track failures and completion from a test's outcome reports
+        (TestReport: setup/call/teardown, via pytest_runtest_makereport)."""
         if report.failed:
             self.failed.add(report.nodeid)
         if report.when in ("call", "teardown"):
@@ -380,19 +379,17 @@ class FilemonState:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    global _EARLY_MONITOR, _STATE
     option = config.option
     enabled = bool(getattr(option, "filemon", False)) or _env_enabled()
+    early_monitor = getattr(config, "_filemon_early_monitor", None)
+    config._filemon_early_monitor = None
     state = FilemonState()
-    _STATE = state
     config._filemon_state = state
     if not enabled:
-        if _EARLY_MONITOR is not None:
-            _EARLY_MONITOR.deactivate()
-            _EARLY_MONITOR = None
+        if early_monitor is not None:
+            early_monitor.deactivate()
         return
-    state.setup(config, _EARLY_MONITOR)
-    _EARLY_MONITOR = None
+    state.setup(config, early_monitor)
 
 
 @pytest.hookimpl(trylast=True)
@@ -442,23 +439,49 @@ def pytest_ignore_collect(collection_path, config):
     return None
 
 
-def pytest_runtest_logstart(nodeid: str, location) -> None:
-    state = _STATE
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem):
+    """Bracket each test's whole runtest protocol (setup/call/teardown).
+
+    This is the canonical per-test lifecycle hook; ``logstart`` is only a
+    notification hook and does not carry the item or config.  Setting the
+    attribution bucket here is also what re-arms the silenced code objects
+    (via the monitor's bucket-change hook) for the new test.
+    """
+    state = _state_from(item.config)
     if state is not None and state.monitor is not None:
         state.monitor.phase = "test"
-        state.monitor.current_nodeid = nodeid
+        state.monitor.current_nodeid = item.nodeid
+    result = yield
+    # current_nodeid deliberately stays set after the protocol: teardown of
+    # session-scoped fixtures and other inter-test machinery still attribute
+    # to the test that just ran, until the next protocol starts.
+    return result
 
 
-def pytest_runtest_logreport(report) -> None:
-    state = _STATE
-    if state is not None and state.enabled:
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call):
+    """Observe each phase's outcome report (firstresult wrapper).
+
+    The canonical hook for acting on outcomes; ``logreport`` is a
+    notification hook without the item/config.
+    """
+    report = yield
+    state = _state_from(item.config)
+    if state is not None and state.enabled and report is not None:
         state.record_report(report)
+    return report
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus) -> None:
     state = _state_from(session.config)
     if state is None or not state.enabled:
         return
+    if exitstatus == pytest.ExitCode.INTERRUPTED:
+        state.notes.append(
+            "filemon: run interrupted; tests that never finished will be "
+            "re-run next time"
+        )
     try:
         state.finish(session.config)
     except Exception as e:  # never break the test run
@@ -466,14 +489,13 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus) -> None:
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
-    global _EARLY_MONITOR, _STATE
     state = _state_from(config)
+    early_monitor = getattr(config, "_filemon_early_monitor", None)
+    if early_monitor is not None:
+        early_monitor.deactivate()
+        config._filemon_early_monitor = None
     if state is not None and state.monitor is not None:
         state.monitor.deactivate()
-    if _EARLY_MONITOR is not None:
-        _EARLY_MONITOR.deactivate()
-        _EARLY_MONITOR = None
-    _STATE = None
 
 
 def pytest_report_header(config: pytest.Config):
