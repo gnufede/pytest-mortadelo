@@ -207,6 +207,54 @@ class TestOptions:
         result.assert_outcomes(passed=2)
 
 
+class TestSyncEndToEnd:
+    """Onboarding: PYTEST_FILEMON_SYNC / filemon_sync make the plugin itself
+    push and pull the shard, no refspecs needed."""
+
+    def test_env_sync_records_pushes_and_pulls_back(self, project, monkeypatch):
+        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        bare = project.path.parent / (project.path.name + "-remote.git")
+        bare.mkdir()
+        git(bare, "init", "--bare", "-q")
+        git(project.path, "remote", "add", "origin", str(bare))
+        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
+
+        # Run 1: records everything and pushes the shard to the remote.
+        result = project.runpytest_subprocess("--filemon", "-q")
+        result.assert_outcomes(passed=2)
+        result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+
+        # Simulate a fresh clone: no local shard.
+        for ref in git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+        ).stdout.split():
+            git(project.path, "update-ref", "-d", ref)
+
+        # Run 2: pulls the remote shard before selection, so instead of a
+        # fresh recording run it deselects everything.
+        result = project.runpytest_subprocess("--filemon", "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(
+            ["*selected 0/2 tests*", "*pulled a newer shard from 'origin'*"]
+        )
+
+    def test_ini_option_enables_sync(self, project, monkeypatch):
+        # The env var takes precedence over the ini option: make sure a
+        # dogfood run of our own suite with sync enabled doesn't leak in.
+        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        bare = project.path.parent / (project.path.name + "-remote.git")
+        bare.mkdir()
+        git(bare, "init", "--bare", "-q")
+        git(project.path, "remote", "add", "origin", str(bare))
+        (project.path / "pyproject.toml").write_text(
+            "[tool.pytest.ini_options]\nfilemon_sync = \"origin\"\n"
+        )
+        result = project.runpytest_subprocess("--filemon", "-q")
+        result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+
+
 class TestSelfHosting:
     """The plugin running *inside* the plugin's own pytest session, in one
     process: per-config state and dynamic sys.monitoring tool ids must keep the

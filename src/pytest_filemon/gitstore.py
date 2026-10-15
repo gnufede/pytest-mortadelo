@@ -8,8 +8,10 @@ A shard is stored as a lightweight commit whose tree contains two blobs::
 The ref ``refs/filemon/<shard>`` always points at the latest record for that
 pytest command ("latest wins"; overwriting is just an ``update-ref``).  The
 ref never touches the working tree, HEAD, or any branch, and plain
-``git push``/``git fetch``/``git clone`` do not transfer it.  To share shards
-between machines, use an explicit refspec::
+``git push``/``git fetch``/``git clone`` do not transfer it.  Sharing is
+either automatic (``filemon_sync`` / ``PYTEST_FILEMON_SYNC``, see the
+README: the plugin pulls the shard before selection and pushes it after
+recording) or manual via an explicit refspec::
 
     git push   origin 'refs/filemon/*:refs/filemon/*'
     git fetch   origin 'refs/filemon/*:refs/filemon/*'
@@ -20,9 +22,23 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from .util import run_git
+
+# Sync operations must never hang or prompt for credentials during a test run.
+_SYNC_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+_SYNC_TIMEOUT = 30.0
+
+
+def _parse_iso(value) -> object:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 class GitStore:
@@ -146,6 +162,86 @@ class GitStore:
             return True
         except subprocess.CalledProcessError:
             return False
+
+    # -- shard sync (sharing between machines) ----------------------------
+
+    def sync_pull(self, remote: str) -> str:
+        """Pull this shard from *remote*, adopting it if newer than local.
+
+        Returns a human-readable status for the run summary; never raises
+        (a missing shard, an unreachable remote or a timeout just means no
+        sync, and the run continues with whatever is local).
+        """
+        scratch = f"refs/filemon-remote/{self.shard}"
+        try:
+            run_git(
+                self.root,
+                "fetch",
+                "--quiet",
+                remote,
+                f"+refs/filemon/{self.shard}:{scratch}",
+                timeout=_SYNC_TIMEOUT,
+                extra_env=_SYNC_ENV,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            self._delete_ref_quiet(scratch)
+            return (
+                f"no shard for this command on '{remote}' (or remote unreachable); "
+                "using local data"
+            )
+        remote_created = _parse_iso(
+            (self._json_blob(f"{scratch}:meta.json") or {}).get("created")
+        )
+        local_created = _parse_iso(
+            (self._json_blob(f"{self.ref}:meta.json") or {}).get("created")
+        )
+        if remote_created is None or (
+            local_created is not None and remote_created <= local_created
+        ):
+            self._delete_ref_quiet(scratch)
+            return f"shard on '{remote}' is not newer than local; keeping local"
+        run_git(self.root, "update-ref", self.ref, scratch)
+        self._delete_ref_quiet(scratch)
+        return f"pulled a newer shard from '{remote}'"
+
+    def sync_push(self, remote: str) -> str:
+        """Push this shard to *remote* (latest record wins; force is safe:
+        the ref is single-purpose, tiny, and never a branch)."""
+        if self._ref_sha(self.ref) is None:
+            return "nothing recorded locally; skipping push"
+        try:
+            run_git(
+                self.root,
+                "push",
+                "--quiet",
+                "--force",
+                remote,
+                f"{self.ref}:{self.ref}",
+                timeout=_SYNC_TIMEOUT,
+                extra_env=_SYNC_ENV,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            return f"push to '{remote}' failed ({e}); shard kept locally"
+        return f"shard pushed to '{remote}'"
+
+    def _ref_sha(self, ref: str) -> str | None:
+        try:
+            sha = run_git(self.root, "rev-parse", "--verify", "--quiet", ref)
+            return sha.strip() or None
+        except subprocess.CalledProcessError:
+            return None
+
+    def _json_blob(self, rev: str) -> dict | None:
+        try:
+            return json.loads(run_git(self.root, "cat-file", "blob", rev))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return None
+
+    def _delete_ref_quiet(self, ref: str) -> None:
+        try:
+            run_git(self.root, "update-ref", "-d", ref)
+        except subprocess.CalledProcessError:
+            pass
 
     def list_shards(self) -> list[str]:
         """All shard keys recorded in this repository."""

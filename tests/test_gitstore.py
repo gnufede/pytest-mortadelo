@@ -79,6 +79,71 @@ class TestChangedSince:
         assert store.changed_since("ab" * 20) is None
 
 
+class TestSync:
+    """Pull/push the shard via a git remote (onboarding without refspecs)."""
+
+    def _repo_pair(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        git(repo, "init", "-q")
+        git(repo, "config", "user.email", "t@t.t")
+        git(repo, "config", "user.name", "t")
+        bare = tmp_path / "remote.git"
+        bare.mkdir()
+        git(bare, "init", "--bare", "-q")
+        git(repo, "remote", "add", "origin", str(bare))
+        return repo, bare
+
+    def _save(self, store, tests, created):
+        store.save(
+            {"version": 1, "tests": tests, "failed": []},
+            {"version": 1, "shard": store.shard, "base_commit": None, "created": created},
+        )
+
+    def test_push_then_pull_states(self, tmp_path):
+        repo, bare = self._repo_pair(tmp_path)
+        store = GitStore(repo, "shard1")
+
+        # Push: the remote gets exactly our shard ref.
+        self._save(store, {"a": ["x"]}, "2024-01-01T00:00:00+00:00")
+        assert "pushed to 'origin'" in store.sync_push("origin")
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == [
+            "refs/filemon/shard1"
+        ]
+
+        # Fresh machine (no local ref): remote is adopted.
+        git(repo, "update-ref", "-d", "refs/filemon/shard1")
+        assert "pulled a newer shard" in store.sync_pull("origin")
+        data, meta = store.load()
+        assert data["tests"] == {"a": ["x"]}
+        assert meta["created"] == "2024-01-01T00:00:00+00:00"
+
+        # Local newer than remote: keep local.
+        self._save(store, {"a": ["x", "y"]}, "2025-01-01T00:00:00+00:00")
+        assert "not newer than local" in store.sync_pull("origin")
+        data, _ = store.load()
+        assert data["tests"]["a"] == ["x", "y"]
+
+        # Local OLDER than remote: adopt the remote record.
+        self._save(store, {"a": ["stale"]}, "2023-01-01T00:00:00+00:00")
+        assert "pulled a newer shard" in store.sync_pull("origin")
+        data, _ = store.load()
+        assert data["tests"]["a"] == ["x"]
+
+        # The scratch namespace used during pulls is always cleaned up.
+        assert git(repo, "for-each-ref", "--format=%(refname)", "refs/filemon-remote/").stdout.strip() == ""
+
+    def test_missing_shard_and_failures_are_non_fatal(self, tmp_path):
+        repo, _bare = self._repo_pair(tmp_path)
+        other = GitStore(repo, "noshard")
+        assert "no shard" in other.sync_pull("origin")
+        assert "nothing recorded locally" in other.sync_push("origin")
+        # A bogus remote never raises.
+        assert "no shard" in other.sync_pull("no-such-remote")
+        self._save(other, {"a": ["x"]}, "2024-01-01T00:00:00+00:00")
+        assert "push to 'no-such-remote' failed" in other.sync_push("no-such-remote")
+
+
 class TestShardPersistence:
     def test_save_load_roundtrip(self, repo):
         commit(repo)

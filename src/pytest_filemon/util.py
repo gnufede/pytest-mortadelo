@@ -9,14 +9,19 @@ from collections.abc import Sequence
 from pathlib import Path
 
 
-def run_git(root: Path, *args: str, stdin: str | None = None) -> str:
+def run_git(root: Path, *args: str, stdin: str | None = None, timeout: float | None = None, extra_env: dict | None = None) -> str:
     """Run a git command in *root*; raise CalledProcessError on failure."""
+    env = None
+    if extra_env:
+        env = {**os.environ, **extra_env}
     proc = subprocess.run(
         ["git", "-C", str(root), *args],
         input=stdin,
         capture_output=True,
         text=True,
         check=True,
+        timeout=timeout,
+        env=env,
     )
     return proc.stdout
 

@@ -93,35 +93,70 @@ refs/filemon/<shard>   →  lightweight commit
 - Latest record wins: the ref always points at the most recent run's data.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
-To share shards between machines, use explicit refspecs:
+
+#### Automatic sync (recommended)
+
+Let the plugin do the sharing — onboarding is one line. It pulls the shard for
+the current command from the remote **before** selection (a fresh clone
+starts with your recorded dependencies and can deselect immediately instead
+of a full record run) and pushes it after recording:
+
+```toml
+# pyproject.toml
+[tool.pytest.ini_options]
+filemon_sync = "origin"     # any git remote name
+```
+
+or per-invocation, without touching the repo config:
+
+```bash
+PYTEST_FILEMON_SYNC=1 pytest --filemon -q tests        # '1' means 'origin'
+PYTEST_FILEMON_SYNC=upstream pytest --filemon -q tests # an explicit remote
+```
+
+Semantics and safety:
+
+- "latest record wins": the shard with the newer `meta.json: created`
+  timestamp is kept (local vs. remote, both directions);
+- sync failures are **non-fatal** and only surface as notes in the run
+  summary (offline, no remote configured, missing shard, auth refused);
+  pushes force-push the tiny `refs/filemon/<shard>` only — never a branch;
+- credentials are never prompted (`GIT_TERMINAL_PROMPT=0`) and remote
+  operations time out after 30s, so a test run can never hang on them;
+- `--filemon-clean` skips the pull, so "discard" really discards;
+- the shard key is the *normalized pytest command*: the machine that
+  recorded the data must run the same command shape (e.g. `pytest tests -q`)
+  for the shard to match — relevant for CI reuse.
+
+#### Manual sharing (explicit refspecs)
 
 ```bash
 git push  origin 'refs/filemon/*:refs/filemon/*'
 git fetch  origin 'refs/filemon/*:refs/filemon/*'
+git ls-remote origin 'refs/filemon/*'   # what is on the remote?
 
 # inspect a shard
 git cat-file blob refs/filemon/<shard>:data.json | python -m json.tool
 ```
 
-To make plain ``git pull``/``git fetch`` transfer shards automatically, add a
-second fetch refspec::
+To make plain `git pull`/`git fetch` transfer shards automatically, add a
+second fetch refspec:
 
     git config --add remote.origin.fetch '+refs/filemon/*:refs/filemon/*'
 
-For push, note that setting ``remote.origin.push`` *replaces* the default
-branch-pushing behavior (not merges with it), so include both refspecs::
+For push, note that setting `remote.origin.push` *replaces* the default
+branch-pushing behavior (it does not merge with it), so include both
+refspecs:
 
     git config --add remote.origin.push 'refs/heads/*:refs/heads/*'
     git config --add remote.origin.push 'refs/filemon/*:refs/filemon/*'
 
-or keep it explicit with an alias::
+or keep it explicit with an alias:
 
     git config alias.push-filemon "push origin refs/filemon/*:refs/filemon/*"
 
-(On GitHub/GitLab arbitrary ``refs/*`` are accepted and stored; they are not
-shown in the web UI. CI can fetch the same way -- remember the shard key is
-the *normalized pytest command*, so the CI invocation must produce the same
-args as the run that recorded the data.)
+(On GitHub/GitLab arbitrary `refs/*` are accepted and stored; they are not
+shown in the web UI.)
 
 ### 3. Selection: git diff + collection skipping
 
