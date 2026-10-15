@@ -83,3 +83,4 @@ class TestSelectTests:
         sel = select_tests(self.COLLECTED, make_shard(), {"README.md"})
         assert sel.selected == ["tests/test_c.py::test_c"]
         assert sel.deselected == ["tests/test_a.py::test_a", "tests/test_b.py::test_b"]
+# dogfood demo: touch one test file
