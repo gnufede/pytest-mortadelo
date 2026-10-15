@@ -6,6 +6,7 @@ import hashlib
 import os
 import subprocess
 from collections.abc import Sequence
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -55,22 +56,8 @@ _EXCLUDED_SEGMENTS = frozenset(
 )
 
 
-def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
-    """Normalize a filename to a repo-root-relative POSIX path.
-
-    Returns None for synthetic locations (``<string>``, ``<frozen ...>``),
-    non-strings, paths outside the repository, and paths inside virtual
-    environments / site-packages / similar third-party trees.
-    """
-    if not filename:
-        return None
-    if not isinstance(filename, str):
-        try:
-            filename = os.fspath(filename)
-        except TypeError:
-            return None
-    if not isinstance(filename, str) or filename.startswith("<"):
-        return None
+def _compute_repo_rel(filename: str, root: Path) -> str | None:
+    """Uncached core of :func:`to_repo_rel`."""
     try:
         p = Path(filename)
         if not p.is_absolute():
@@ -90,6 +77,36 @@ def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
     if _EXCLUDED_SEGMENTS.intersection(parts):
         return None
     return rel.as_posix()
+
+
+@lru_cache(maxsize=65536)
+def _compute_repo_rel_cached(filename: str, root_str: str) -> str | None:
+    return _compute_repo_rel(filename, Path(root_str))
+
+
+def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
+    """Normalize a filename to a repo-root-relative POSIX path.
+
+    Returns None for synthetic locations (``<string>``, ``<frozen ...>``),
+    non-strings, paths outside the repository, and paths inside virtual
+    environments / site-packages / similar third-party trees.
+
+    This is the hottest file-resolution function in the monitor (once per
+    code block), so results for absolute inputs are memoized with an LRU
+    cache; relative inputs depend on the cwd and are resolved uncached.
+    """
+    if not filename:
+        return None
+    if not isinstance(filename, str):
+        try:
+            filename = os.fspath(filename)
+        except TypeError:
+            return None
+    if not isinstance(filename, str) or not filename or filename.startswith("<"):
+        return None
+    if os.path.isabs(filename):
+        return _compute_repo_rel_cached(filename, os.fspath(root))
+    return _compute_repo_rel(filename, root)
 
 
 def normalize_arg(arg: str, root: Path) -> str:

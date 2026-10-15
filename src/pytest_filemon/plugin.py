@@ -47,6 +47,22 @@ def _env_enabled() -> bool:
     return os.environ.get("PYTEST_FILEMON", "").strip().lower() in _ENV_TRUTHY
 
 
+def _selectors_active(config: pytest.Config) -> bool:
+    """Whether test selectors (-k, -m, --lf/--ff, explicit node ids) are in play.
+
+    When they are, selection is disabled entirely (like testmon's forced
+    ``--testmon-noselect``): otherwise an explicitly requested but unaffected
+    test would be silently deselected -- or, with collection skipping, its
+    file would not even be collected.
+    """
+    opts = config.option
+    if getattr(opts, "keyword", None) or getattr(opts, "markexpr", None):
+        return True
+    if getattr(opts, "lf", None) or getattr(opts, "failedfirst", None):
+        return True
+    return any("::" in arg for arg in getattr(config, "args", []))
+
+
 # ---------------------------------------------------------------- options
 
 
@@ -114,6 +130,11 @@ class FilemonState:
         self.conftest_deps: set[str] = set()
         self.failed: set[str] = set()
         self.finished: set[str] = set()
+        # Collection plan (computed at the start of the collection phase).
+        self.changed: set[str] | None = None
+        self.skip_collect_files: set[str] = set()
+        self.skipped_test_ids: list[str] = []
+        self.selectors_active: bool = False
 
     # -- setup ----------------------------------------------------------
 
@@ -177,6 +198,42 @@ class FilemonState:
 
     # -- collection / selection ------------------------------------------
 
+    def plan(self, config: pytest.Config) -> None:
+        """Pre-compute the change set and the per-test-file collection plan.
+
+        Runs at the start of the collection phase, before ``pytest_ignore_collect``
+        fires: a test file whose recorded tests are *all* unaffected (and that
+        is itself unchanged -- its tests always depend on their own module)
+        can skip collection entirely, avoiding the module import.  Adding a
+        test to a file changes the file, so its tests are selected and it is
+        collected: new tests can never be missed.
+        """
+        if not self.enabled or self.store is None or self.shard is None:
+            return
+        self.selectors_active = _selectors_active(config)
+        if config.option.filemon_force or self.selectors_active:
+            return
+        try:
+            changed = self.store.changed_since(self.shard.base_commit)
+        except Exception as e:
+            self.notes.append(f"filemon: could not compute changes ({e!r}); running everything")
+            return
+        self.changed = changed
+        if changed is None:
+            return
+        # Which files still have at least one test that will run?
+        file_tests: dict[str, list[str]] = {}
+        for nodeid in self.shard.tests:
+            file_tests.setdefault(nodeid.split("::")[0], []).append(nodeid)
+        for file, nodeids in file_tests.items():
+            if any(
+                nodeid in self.shard.failed or self.shard.tests[nodeid] & changed
+                for nodeid in nodeids
+            ):
+                continue
+            self.skip_collect_files.add(file)
+            self.skipped_test_ids.extend(nodeids)
+
     def remember_items(self, items: list[pytest.Item]) -> None:
         assert self.root is not None
         for item in items:
@@ -186,24 +243,43 @@ class FilemonState:
                 self.module_files.add(rel)
 
     def select(self, config: pytest.Config, items: list[pytest.Item]) -> None:
+        """Select tests among the *collected* items (files whose tests are
+        all unaffected were already skipped at collection time)."""
         assert self.store is not None
-        if config.option.filemon_force:
-            self.selection = Selection(
-                [i.nodeid for i in items], [], set(), "--filemon-force: running everything"
-            )
-            return
         collected = [i.nodeid for i in items]
         shard = self.shard
-        changed = None
-        if shard is not None:
-            changed = self.store.changed_since(shard.base_commit)
-        selection = select_tests(collected, shard, changed)
+        if shard is None:
+            self.selection = Selection(
+                collected, [], set(),
+                "no usable stored data for this command; running and recording everything",
+            )
+            return
+        if config.option.filemon_force:
+            self.selection = Selection(
+                collected, [], set(), "--filemon-force: running everything"
+            )
+            return
+        if self.selectors_active:
+            self.selection = Selection(
+                collected, [], set(),
+                "test selectors (-k/-m/--lf/explicit node ids) present: running everything",
+            )
+            return
+        selection = select_tests(collected, shard, self.changed)
+        if self.skipped_test_ids:
+            # Fold the tests skipped at collection time into the report.
+            selection.deselected.extend(self.skipped_test_ids)
+            selection.reason += (
+                f"; skipped collection of {len(self.skip_collect_files)} file(s)"
+            )
         self.selection = selection
         if selection.deselected:
-            keep = [i for i in items if i.nodeid in selection.selected_set]
-            drop = [i for i in items if i.nodeid not in selection.selected_set]
-            config.hook.pytest_deselected(items=drop)
-            items[:] = keep
+            selected_set = set(selection.selected)
+            keep = [i for i in items if i.nodeid in selected_set]
+            drop = [i for i in items if i.nodeid not in selected_set]
+            if drop:
+                config.hook.pytest_deselected(items=drop)
+                items[:] = keep
 
     # -- recording -------------------------------------------------------
 
@@ -242,6 +318,19 @@ class FilemonState:
                 tests[nodeid] = sorted(base | old_tests[nodeid])
             # else: never ran and no history -> omit, so it is always
             # re-run in the future ("new test").
+        # Tests in files whose collection was skipped never ran and are not
+        # in item_map: keep their recorded dependencies, otherwise the shard
+        # would silently lose them.
+        for nodeid, old_deps in old_tests.items():
+            if nodeid in tests:
+                continue
+            file = nodeid.split("::")[0]
+            if file in self.skip_collect_files:
+                base = set(global_deps)
+                if file.endswith(".py"):
+                    base.add(file)
+                tests[nodeid] = sorted(base | old_deps)
+            # else: the file was collected but the test is gone -> drop
         data = {"version": 1, "tests": tests, "failed": sorted(self.failed)}
         meta = {
             "version": 1,
@@ -285,12 +374,37 @@ def pytest_collection_modifyitems(
 @pytest.hookimpl(wrapper=True)
 def pytest_collection(session: pytest.Session):
     state = _state_from(session.config)
+    if state is not None:
+        try:
+            state.plan(session.config)
+        except Exception as e:  # never break the run
+            state.notes.append(f"filemon: planning failed ({e!r}); running everything")
     if state is not None and state.monitor is not None:
         state.monitor.phase = "collect"
     result = yield
     if state is not None and state.monitor is not None:
         state.monitor.phase = "test"
     return result
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_ignore_collect(collection_path, config):
+    """Skip collecting test files whose recorded tests are all unaffected.
+
+    testmon-style optimization: unchanged, fully-deselected test modules are
+    not even imported.  Safe because a test always depends on its own module
+    file: any edit (including adding tests) selects the file's tests, and a
+    brand-new file has no recorded tests and is always collected.
+    """
+    state = _state_from(config)
+    if state is None or not state.skip_collect_files:
+        return None
+    if collection_path.suffix != ".py":
+        return None
+    rel = to_repo_rel(collection_path, state.root)
+    if rel is not None and rel in state.skip_collect_files:
+        return True
+    return None
 
 
 def pytest_runtest_logstart(nodeid: str, location) -> None:

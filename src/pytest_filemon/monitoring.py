@@ -20,7 +20,19 @@ Dependencies are bucketed by execution phase, which the plugin drives:
 * ``test``    -- everything executed while a given test runs, attributed to
   that test's node id.
 
-Code that lives outside the repository is ignored entirely.
+Code that lives outside the repository is ignored entirely, as are the
+exclusion roots (the plugin's own package) and virtual environments.
+
+Performance notes (the hot path runs once per code block start -- millions of
+times per suite; profiling numbers from the sqlalchemy benchmark):
+
+* the callback is flattened into a single function: a dict lookup plus a
+  tuple comparison for code objects already analyzed in the current bucket;
+* dependencies of a code object are re-attributed only when the attribution
+  bucket changes (i.e. when the next test starts), not on every start;
+* file resolutions are memoized per file name (``to_repo_rel`` uses an
+  LRU cache; exclusion checks and import resolutions are memoized on the
+  monitor).
 """
 
 from __future__ import annotations
@@ -41,6 +53,10 @@ except ImportError:  # pragma: no cover - Python < 3.12
 # profiler/optimizer; 3 and 4 are currently unnamed.  We prefer 4 and fall
 # back to 3 (and give up if both are taken by another tool).
 _TOOL_IDS = (4, 3)
+
+# Sentinel for "no cache cell for this code object yet" (distinct from a
+# cached empty dependency set, which is a legitimate cell).
+_NO_CELL = object()
 
 
 def _use_tool(tool_id: int, name: str) -> None:
@@ -94,9 +110,11 @@ class FileMonitor:
         # (e.g. the pytest_filemon package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
         self._exclude_roots = tuple(Path(p).resolve() for p in exclude_roots)
+        self._exclude_cache: dict[str, bool] = {}
         # Buckets.
-        self.phase = "import"  # import | collect | test | done
-        self.current_nodeid: str | None = None
+        self._phase = "import"  # import | collect | test | done
+        self._nodeid: str | None = None
+        self._key: tuple = ("import",)  # current attribution bucket
         self.import_deps: set[str] = set()
         self.collect_deps: set[str] = set()
         self.test_deps: dict[str, set[str]] = {}
@@ -104,9 +122,43 @@ class FileMonitor:
         self._active = False
         self._tool_id: int | None = None
         self._busy = False  # re-entrancy guard (find_spec imports fire PY_START)
-        self._code_cache: dict = {}  # code object -> frozenset[str]; strong refs
+        # code object -> mutable [deps, last_bucket] cell.  Strong refs keep
+        # the code objects (and their ids) alive for the whole run.  Deps are
+        # re-attributed only when the bucket changes, so a code block that
+        # starts a thousand times inside one test costs a tuple comparison
+        # per event after the first.
+        self._code_cache: dict = {}
         self._spec_cache: dict[str, str | None] = {}
+        self._resolve_cache: dict[
+            tuple[str | None, int, str | None], tuple[frozenset[str], str | None]
+        ] = {}
         self._pkg_prefix_cache: dict[str, list[str]] = {}
+
+    # -- phase / attribution target ------------------------------------
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @phase.setter
+    def phase(self, value: str) -> None:
+        self._phase = value
+        self._update_key()
+
+    @property
+    def current_nodeid(self) -> str | None:
+        return self._nodeid
+
+    @current_nodeid.setter
+    def current_nodeid(self, value: str | None) -> None:
+        self._nodeid = value
+        self._update_key()
+
+    def _update_key(self) -> None:
+        if self._phase == "test" and self._nodeid is not None:
+            self._key = ("test", self._nodeid)
+        else:
+            self._key = (self._phase,)
 
     # -- lifecycle -----------------------------------------------------
 
@@ -163,36 +215,58 @@ class FileMonitor:
         except ValueError:  # pragma: no cover
             pass
 
-    # -- event handling ------------------------------------------------
+    # -- event handling --------------------------------------------------
 
     def _on_py_start(self, code, instruction_offset) -> None:
-        # Never let a monitoring bug break the user's test run.
+        """Hot path: called for every code block start in the process.
+
+        Flattened to a dict lookup plus a tuple comparison for the
+        overwhelmingly common case (a code object already analyzed, still
+        executing within the same attribution bucket).  Never let a
+        monitoring bug break the user's test run.
+        """
         try:
-            self._handle(code)
+            cell = self._code_cache.get(code, _NO_CELL)
+            if cell is _NO_CELL:
+                self._first_start(code)
+                return
+            deps = cell[0]
+            if deps and cell[1] is not self._key:
+                self._bucket(deps)
+                cell[1] = self._key
         except Exception:  # pragma: no cover - defensive
             pass
 
-    def _handle(self, code) -> None:
-        if self._busy or self.phase == "done":
+    def _first_start(self, code) -> None:
+        """Cold path: first start of this code object."""
+        if self._busy or self._phase == "done":
+            # Nested event while resolving imports for an outer block (or
+            # after the run ended): skip analysis and, crucially, cache
+            # nothing -- this code object gets a normal analysis the next
+            # time it starts outside a busy region.
             return
-        cached = self._code_cache.get(code, False)
-        if cached is False:
-            self._busy = True
-            try:
-                cached = self._analyze(code)
-            finally:
-                self._busy = False
-            self._code_cache[code] = cached
-        if not cached:
-            return
-        phase = self.phase
+        self._busy = True
+        try:
+            deps = self._analyze(code)
+        except Exception:  # pragma: no cover - defensive
+            deps = frozenset()
+        finally:
+            self._busy = False
+        cell = [deps, None]
+        self._code_cache[code] = cell
+        if deps:
+            self._bucket(deps)
+            cell[1] = self._key
+
+    def _bucket(self, deps) -> None:
+        phase = self._phase
         if phase == "test":
-            if self.current_nodeid is not None:
-                self.test_deps.setdefault(self.current_nodeid, set()).update(cached)
+            if self._nodeid is not None:
+                self.test_deps.setdefault(self._nodeid, set()).update(deps)
         elif phase == "collect":
-            self.collect_deps.update(cached)
+            self.collect_deps.update(deps)
         elif phase == "import":
-            self.import_deps.update(cached)
+            self.import_deps.update(deps)
 
     # -- analysis ------------------------------------------------------
 
@@ -201,11 +275,11 @@ class FileMonitor:
         if self._exclude_roots and self._is_excluded(code.co_filename):
             return frozenset()
         own = to_repo_rel(code.co_filename, self.root)
-        files: set[str] = set()
         if own is None:
             # Code outside the repository cannot import repository modules in
             # any way we care about; skip the (relatively expensive) scan.
             return frozenset()
+        files: set[str] = set()
         files.add(own)
         last_full: str | None = None
         instrs = list(dis.get_instructions(code, show_caches=False))
@@ -231,26 +305,38 @@ class FileMonitor:
     ) -> tuple[frozenset[str], str | None]:
         """Resolve an IMPORT_NAME operand to (dep files, absolute dotted name).
 
+        Results are memoized per (name, level, importing file): the same
+        import statement appears in many code blocks of the same module.
+
         *level* > 0 indicates a relative import, resolved against the package
         of the importing file.  Unresolvable imports return no dependencies
         (if they actually execute, the imported module's PY_START still
         captures them at runtime).
         """
+        key = (name, level, own_rel)
+        cached = self._resolve_cache.get(key)
+        if cached is not None:
+            return cached
         if level > 0:
             prefix = self._pkg_prefix(own_rel)
             keep = len(prefix) - (level - 1)
             if keep < 0:
-                return frozenset(), None
-            parts = list(prefix[:keep]) if keep > 0 else []
-            if name:
-                parts.extend(p for p in name.split(".") if p)
-            if not parts:
-                return frozenset(), None
-            full = ".".join(parts)
-            return self._resolve_dotted(full), full
-        if not name:
-            return frozenset(), None
-        return self._resolve_dotted(name), name
+                result = (frozenset(), None)
+            else:
+                parts = list(prefix[:keep]) if keep > 0 else []
+                if name:
+                    parts.extend(p for p in name.split(".") if p)
+                if not parts:
+                    result = (frozenset(), None)
+                else:
+                    full = ".".join(parts)
+                    result = (self._resolve_dotted(full), full)
+        elif not name:
+            result = (frozenset(), None)
+        else:
+            result = (self._resolve_dotted(name), name)
+        self._resolve_cache[key] = result
+        return result
 
     def _resolve_dotted(self, dotted: str) -> frozenset[str]:
         """Resolve a dotted module path, including every ancestor package."""
@@ -263,12 +349,23 @@ class FileMonitor:
         return frozenset(files)
 
     def _is_excluded(self, filename: str) -> bool:
-        """Whether *filename* lives under one of the excluded roots."""
+        """Whether *filename* lives under one of the excluded roots.
+
+        Memoized per (absolute) file name: the check involves a resolve()
+        syscall and runs once per code object otherwise.
+        """
         if not self._exclude_roots:
             return False
-        p = Path(filename)
-        if not p.is_absolute():
-            p = Path.cwd() / p
+        if not os.path.isabs(filename):
+            # Rare (relative co_filename): depends on the cwd, do not cache.
+            return self._compute_excluded(Path.cwd() / filename)
+        cached = self._exclude_cache.get(filename)
+        if cached is None:
+            cached = self._compute_excluded(Path(filename))
+            self._exclude_cache[filename] = cached
+        return cached
+
+    def _compute_excluded(self, p: Path) -> bool:
         try:
             p = p.resolve()
         except OSError:

@@ -97,7 +97,19 @@ git fetch  origin 'refs/filemon/*:refs/filemon/*'
 git cat-file blob refs/filemon/<shard>:data.json | python -m json.tool
 ```
 
-### 3. Selection: git diff
+### 3. Selection: git diff + collection skipping
+
+Before collection starts, the changed-file set is computed and test files
+whose recorded tests are **all** unaffected are not even *collected* (their
+modules are never imported) — the same optimization testmon applies via
+``pytest_ignore_collect``.  This is safe because a test always depends on
+its own module file: any edit (including adding a test) selects the file's
+tests, and a brand-new file has no recorded tests and is always collected.
+
+When explicit test selectors are in play (``-k``, ``-m``, ``--lf``/``--ff``,
+or a ``file.py::test`` argument), selection is disabled entirely (matching
+testmon's forced ``--testmon-noselect``): an explicitly requested but
+unaffected test must never be silently skipped.
 
 `changed = (files differing between the shard's base commit and the current
 working tree) ∪ (untracked files)`. A test runs when:
@@ -107,9 +119,18 @@ working tree) ∪ (untracked files)`. A test runs when:
 - it **failed** in the recorded run, or
 - one of its dependencies is in `changed`.
 
-Everything else is deselected (pytest reports them as `deselected`). If the
-recorded data is missing/unreadable, or the base commit no longer exists
-(e.g. after a rebase), everything runs.
+Everything else is deselected — or, when its whole file is unaffected, its
+file is never collected. If the recorded data is missing/unreadable, or the
+base commit no longer exists (e.g. after a rebase), everything runs.
+
+Performance (sqlalchemy `test/orm`, 11,313 tests, Python 3.13, serial):
+recording costs ~1.8× a plain run (~40s on top of a 48s suite), dominated by
+the per-code-block-start callback (millions of PY_START events).  Hot paths
+are memoized: file→repo-relative-path resolution (LRU cache), import
+(function→file) resolution, exclusion checks, and per-(module, level, file)
+import resolutions are each computed once and cached.  A no-change rerun
+takes ~2s because collection is skipped outright; touching one rarely-used
+module re-runs only its 20 dependents in ~3s.
 
 ## Limitations (by design)
 
