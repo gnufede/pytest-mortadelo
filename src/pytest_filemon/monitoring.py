@@ -224,6 +224,13 @@ class FileMonitor:
         self._active = False
         self._tool_id: int | None = None
         self._busy = False  # re-entrancy guard (find_spec imports fire PY_START)
+        # Code objects that first started inside a busy region (the stdlib
+        # helpers of our own analysis: pathlib, ast, ...): analyzed after the
+        # outer analysis completes instead of being dropped.  Dropping them
+        # left them uncached, so every later execution re-entered the cold
+        # path (~7M redundant dispatches per sqlalchemy run), and could lose
+        # deps for code that only ever executes in busy regions.
+        self._pending: list = []
         # code object -> mutable [deps, last_bucket] cell.  Strong refs keep
         # the code objects (and their ids) alive for the whole run.  Deps are
         # re-attributed only when the bucket changes, so a code block that
@@ -379,10 +386,15 @@ class FileMonitor:
     def _first_start(self, code):
         """Cold path: first start of this code object."""
         if self._busy or self._phase == "done":
-            # Nested event while resolving imports for an outer block (or
-            # after the run ended): skip analysis and, crucially, cache
-            # nothing -- this code object gets a normal analysis the next
-            # time it starts outside a busy region.
+            # Nested event while resolving/analyzing for an outer block (or
+            # after the run ended): queue it for analysis once the outer one
+            # completes.  Analyzing inline would re-enter the machinery that
+            # triggered the event; dropping it would both lose dependencies
+            # for code that only ever executes in busy regions and leave the
+            # object uncached, so every later execution would pay the cold
+            # path again.
+            if self._phase != "done":
+                self._pending.append(code)
             return None
         self._busy = True
         try:
@@ -396,9 +408,26 @@ class FileMonitor:
         if deps:
             self._bucket(deps)
             cell[1] = self._key
-            return _sys_monitoring.DISABLE if _REARM else None
-        # No dependencies ever: silence this code object for good.
-        return _sys_monitoring.DISABLE
+            result = _sys_monitoring.DISABLE if _REARM else None
+        else:
+            # No dependencies ever: silence this code object for good.
+            result = _sys_monitoring.DISABLE
+        self._drain_pending()
+        return result
+
+    def _drain_pending(self) -> None:
+        """Analyze code objects that first started inside a busy region."""
+        while self._pending:
+            code = self._pending.pop()
+            cell = self._code_cache.get(code)
+            if cell is not None:
+                # Queued and analyzed since (nested drains): just keep the
+                # attribution current.
+                if cell[0] and cell[1] is not self._key:
+                    self._bucket(cell[0])
+                    cell[1] = self._key
+                continue
+            self._first_start(code)  # busy is False here; nested events re-queue
 
     def _bucket(self, deps) -> None:
         phase = self._phase
