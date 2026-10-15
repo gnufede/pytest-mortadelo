@@ -191,7 +191,11 @@ class TestShardPersistence:
             stdin=None,
         ).stdout.strip()
         git(repo, "update-ref", store.ref, commit_sha)
-        assert store.load() == (None, None)
+        # data.json and meta.json are loadable independently: a corrupt data
+        # blob degrades to "no old data" only when something actually runs,
+        # while meta (the standalone first-level cache) still answers the
+        # "did anything relevant change?" question.
+        assert store.load() == (None, {"version": 1})
 
     def test_delete(self, repo):
         commit(repo)

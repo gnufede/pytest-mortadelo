@@ -101,20 +101,25 @@ class GitStore:
 
     # -- shard persistence -------------------------------------------------
 
+    def load_meta(self) -> dict | None:
+        """Load only meta.json (tiny: the fast-path summary)."""
+        try:
+            return json.loads(self._git("cat-file", "blob", f"{self.ref}:meta.json"))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return None
+
+    def load_data(self) -> dict | None:
+        """Load only data.json (the potentially large dependency blob)."""
+        try:
+            return json.loads(self._git("cat-file", "blob", f"{self.ref}:data.json"))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return None
+
     def load(self) -> tuple[dict | None, dict | None]:
         """Load the latest shard, or (None, None) if absent/unreadable."""
-        try:
-            sha = run_git(self.root, "rev-parse", "--verify", "--quiet", self.ref).strip()
-        except subprocess.CalledProcessError:
+        if self._ref_sha(self.ref) is None:
             return None, None
-        if not sha:
-            return None, None
-        try:
-            data = json.loads(self._git("cat-file", "blob", f"{self.ref}:data.json"))
-            meta = json.loads(self._git("cat-file", "blob", f"{self.ref}:meta.json"))
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
-            return None, None
-        return data, meta
+        return self.load_data(), self.load_meta()
 
     def save(self, data: dict, meta: dict) -> None:
         """Store the shard as a fresh lightweight commit and move the ref."""

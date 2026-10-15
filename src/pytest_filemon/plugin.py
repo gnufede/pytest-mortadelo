@@ -171,6 +171,10 @@ class FilemonState:
         # Shard sync (see _sync_remote).
         self.sync_remote: str | None = None
         self.sync_mode: str = "both"
+        # No-change fast path (meta.json is the first-level cache).
+        self.fast = False
+        self.fast_recorded: set[str] = set()
+        self._meta: dict | None = None
         # Current block tables of the changed files (selection input).
         self.new_maps: dict = {}
 
@@ -222,9 +226,62 @@ class FilemonState:
                 self.notes.append(f"filemon: {self.store.sync_pull(self.sync_remote)}")
             except Exception as e:  # never break the run
                 self.notes.append(f"filemon: sync pull failed ({e!r})")
-        data, meta = self.store.load()
-        self.shard = load_shard(data, meta)
+        meta = self.store.load_meta()
+        if not self._try_fast_path(config, meta):
+            # Slow path: load the full dependency blob.
+            self.shard = load_shard(self.store.load_data(), meta)
         self.enabled = True
+
+    def _try_fast_path(self, config: pytest.Config, meta) -> bool:
+        """Decide the run without reading data.json at all.
+
+        meta.json doubles as the first-level cache: it carries the recorded
+        node ids, the failed list, and -- crucially -- ``dep_files``, the set
+        of every file any recorded dependency references.  git itself is the
+        cache-validity oracle: if no file in that set changed since the
+        recorded base commit (working tree + untracked), no recorded
+        dependency can be stale, so the 40MB data blob is never read and no
+        per-test block expansion ever happens.  Runs everything through the
+        normal path when the summary is absent (old shards), anything
+        relevant changed, or tests failed (they must re-run).
+        """
+        self._meta = meta
+        if (
+            meta is None
+            or not isinstance(meta.get("nodeids"), list)
+            or not isinstance(meta.get("dep_files"), list)
+            or config.option.filemon_force
+        ):
+            return False
+        if _selectors_active(config):
+            self.selectors_active = True
+            return False
+        try:
+            changed = self.store.changed_since(meta.get("base_commit"))
+        except Exception as e:  # never break the run
+            self.notes.append(f"filemon: could not compute changes ({e!r}); running everything")
+            return False
+        if changed is None:
+            return False
+        self.changed = changed
+        dep_files = {f for f in meta["dep_files"] if isinstance(f, str)}
+        if changed & dep_files or meta.get("failed"):
+            return False
+        # Nothing any recorded test depends on changed.
+        nodeids = [n for n in meta["nodeids"] if isinstance(n, str)]
+        self.fast = True
+        self.fast_recorded = set(nodeids)
+        explicit = self._explicit_arg_files(config)
+        self.skip_collect_files = {n.split("::")[0] for n in nodeids} - explicit
+        self.skipped_test_ids = [
+            n for n in nodeids if n.split("::")[0] in self.skip_collect_files
+        ]
+        base = (meta.get("base_commit") or "?")[:8]
+        self.notes.append(
+            f"filemon: no recorded dependency changed since {base}; "
+            "fast path (dependency data not read)"
+        )
+        return True
 
     def _drop_early_monitor(self, monitor: FileMonitor | None) -> None:
         if monitor is not None:
@@ -346,25 +403,36 @@ class FilemonState:
         all unaffected were already skipped at collection time)."""
         assert self.store is not None
         collected = [i.nodeid for i in items]
-        shard = self.shard
-        if shard is None:
+        if self.fast:
+            # Decision was already made from meta.json: recorded tests are
+            # deselected (nothing they depend on changed); anything not in
+            # the recorded set is new and runs.
+            recorded = self.fast_recorded
+            selection = Selection(
+                [n for n in collected if n not in recorded],
+                [n for n in collected if n in recorded],
+                set(self.changed or ()),
+                "no recorded dependency changed; fast path",
+            )
+        elif self.shard is None:
             self.selection = Selection(
                 collected, [], set(),
                 "no usable stored data for this command; running and recording everything",
             )
             return
-        if config.option.filemon_force:
+        elif config.option.filemon_force:
             self.selection = Selection(
                 collected, [], set(), "--filemon-force: running everything"
             )
             return
-        if self.selectors_active:
+        elif self.selectors_active:
             self.selection = Selection(
                 collected, [], set(),
                 "test selectors (-k/-m/--lf/explicit node ids) present: running everything",
             )
             return
-        selection = select_tests(collected, shard, self.changed, self.new_maps)
+        else:
+            selection = select_tests(collected, self.shard, self.changed, self.new_maps)
         if self.skipped_test_ids:
             # Only report tests whose files were genuinely not collected;
             # a planned skip can be overridden by pytest (e.g. a file given
@@ -415,6 +483,15 @@ class FilemonState:
         """
         if self.monitor is None or self.store is None or self.root is None:
             return
+        if self.fast and not self.finished and not self.failed:
+            # Fast path and nothing ran: the stored shard is still exactly
+            # valid (same base commit, same content) -- leave it untouched.
+            self.notes.append("filemon: nothing ran; stored shard left unchanged")
+            return
+        if self.fast:
+            # Something ran (a new test, or a previously failed one):
+            # lazily load the full data now to preserve everything else.
+            self.shard = load_shard(self.store.load_data(), self._meta)
         monitor = self.monitor
         monitor.phase = "done"
         monitor.current_nodeid = None
@@ -489,11 +566,20 @@ class FilemonState:
             "failed": sorted(self.failed),
         }
         data["blocks"] = [list(b) for b in ordered]
+        dep_files: set[str] = {b[0] for b in import_blocks}
+        for deps in tests.values():
+            dep_files.update(b[0] for b in deps)
         meta = {
             "version": 1,
             "shard": self.store.shard,
             "base_commit": self.store.head(),
             "created": datetime.now(UTC).isoformat(),
+            # First-level cache for the no-change rerun (see
+            # _try_fast_path): everything needed to decide "can anything
+            # be stale?" without reading data.json.
+            "failed": sorted(self.failed),
+            "nodeids": sorted(tests),
+            "dep_files": sorted(dep_files),
         }
         self.store.save(data, meta)
         if self.sync_remote and self.sync_mode in ("push", "both"):

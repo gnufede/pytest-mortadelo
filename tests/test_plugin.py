@@ -330,6 +330,77 @@ class TestSyncEndToEnd:
         assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == seeded
 
 
+class TestFastPath:
+    """The no-change rerun: meta.json as first-level cache, data.json never read."""
+
+    def _shard_sha(self, path):
+        return git(
+            path, "for-each-ref", "--format=%(objectname)", "refs/filemon/"
+        ).stdout.split()[0]
+
+    def test_no_change_rerun_is_fast_and_leaves_shard_untouched(self, project):
+        run_filemon(project, "-q")
+        before = self._shard_sha(project.path)
+        result = run_filemon(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(
+            ["*selected 0/2 tests: no recorded dependency changed; fast path*"]
+        )
+        # Nothing ran: the shard was not even rewritten.
+        assert self._shard_sha(project.path) == before
+
+    def test_irrelevant_change_still_takes_fast_path(self, project):
+        run_filemon(project, "-q")
+        (project.path / "README.md").write_text("docs change, not a dependency\n")
+        result = run_filemon(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*fast path*"])
+
+    def test_new_test_file_runs_via_fast_path_and_preserves_old(self, project):
+        run_filemon(project, "-q")
+        (project.path / "tests" / "test_new.py").write_text(
+            "def test_new():\n    assert True\n"
+        )
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*fast path*"])
+        data = shard_data(project.path)
+        tests, _ = decode_shard(data)
+        assert set(tests) == {
+            "tests/test_a.py::test_a",
+            "tests/test_b.py::test_b",
+            "tests/test_new.py::test_new",
+        }
+        # and the meta summary covers the new file
+        ref = git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+        ).stdout.split()[0]
+        meta = json.loads(
+            git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout
+        )
+        assert "tests/test_new.py" in meta["dep_files"]
+        assert "tests/test_new.py::test_new" in meta["nodeids"]
+
+    def test_changed_dependency_disables_fast_path(self, project):
+        run_filemon(project, "-q")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 12345\n")
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(failed=1)
+        assert "fast path" not in result.stdout.str()
+
+    def test_previous_failure_disables_fast_path_then_reenables(self, project):
+        run_filemon(project, "-q")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 12345\n")
+        run_filemon(project, "-q")  # test_a fails
+        result = run_filemon(project, "-q")  # failed -> rerun (slow path)
+        result.assert_outcomes(failed=1)
+        assert "fast path" not in result.stdout.str()
+        # it passes again after the fix -> meta.failed empty -> fast again
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1\n")
+        result = run_filemon(project, "-q")
+        result.stdout.fnmatch_lines(["*1 previously failed*"])
+
+
 class TestBlockGranularity:
     """The point of block-level deps: edit granularity decides re-runs."""
 
