@@ -393,8 +393,17 @@ class FileMonitor:
             # for code that only ever executes in busy regions and leave the
             # object uncached, so every later execution would pay the cold
             # path again.
-            if self._phase != "done":
-                self._pending.append(code)
+            if self._phase == "done":
+                # Recording is over: no code executing now can ever become a
+                # dependency, so cache the object as empty and silence it.
+                # Without this, every execution during teardown -- and during
+                # our own finish() serialization, which alone makes millions
+                # of Python-level calls -- re-entered the cold path as an
+                # uncached miss (~7M redundant dispatches per sqlalchemy
+                # run).
+                self._code_cache[code] = [frozenset(), None]
+                return _sys_monitoring.DISABLE
+            self._pending.append(code)
             return None
         self._busy = True
         try:
