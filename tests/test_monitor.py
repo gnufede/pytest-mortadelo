@@ -212,6 +212,68 @@ print(json.dumps({
 """
 
 
+class TestModuleIndex:
+    """The precomputed repo module index (replaces find_spec on hot paths)."""
+
+    def _make_repo(self, tmp_path):
+        root = tmp_path / "repo"
+        pkg = root / "pkg" / "sub"
+        pkg.mkdir(parents=True)
+        (root / "pkg" / "__init__.py").touch()
+        (pkg / "__init__.py").touch()
+        (pkg / "mod.py").touch()
+        (root / "plain.py").touch()
+        (root / "tests" / "lib.py").parent.mkdir(parents=True)
+        (root / "tests" / "lib.py").touch()
+        (root / ".venv" / "lib" / "x.py").parent.mkdir(parents=True)
+        (root / ".venv" / "lib" / "x.py").touch()
+        (root / "secret" / "hide.py").parent.mkdir(parents=True)
+        (root / "secret" / "hide.py").touch()
+        return root
+
+    def test_index_names_and_exclusions(self, tmp_path):
+        from pytest_filemon.monitoring import _build_module_index
+
+        root = self._make_repo(tmp_path)
+        idx = _build_module_index(root, (root / "secret",))
+        assert idx["pkg"] == "pkg/__init__.py"
+        assert idx["pkg.sub"] == "pkg/sub/__init__.py"
+        assert idx["pkg.sub.mod"] == "pkg/sub/mod.py"
+        assert idx["plain"] == "plain.py"
+        # Files outside any package are indexed by stem (their directory
+        # might be on sys.path -- pytest does this for test dirs).
+        assert idx["lib"] == "tests/lib.py"
+        # venvs and excluded roots are pruned.
+        assert not any(".venv" in p for p in idx.values())
+        assert not any(p.startswith("secret/") for p in idx.values())
+
+    def test_spec_origin_resolves_via_index_without_importlib(self, tmp_path, monkeypatch):
+        import importlib.util
+
+        from pytest_filemon.monitoring import FileMonitor
+
+        root = self._make_repo(tmp_path)
+        monkeypatch.setattr(
+            importlib.util, "find_spec", lambda *a: (_ for _ in ()).throw(AssertionError("index miss"))
+        )
+        mon = FileMonitor(root)
+        assert mon._spec_origin("pkg.sub.mod") == "pkg/sub/mod.py"
+        assert mon._spec_origin("pkg") == "pkg/__init__.py"
+        # Unknown names fall back to importlib (which raises here -> None).
+        assert mon._spec_origin("nope.nope") is None
+
+    def test_extended_arg_import_still_resolved(self, tmp_path):
+        # 300 module-level names push the import's name index past 255,
+        # forcing an EXTENDED_ARG in front of IMPORT_NAME. The disassembly
+        # path (and its operand resolution) must handle it.
+        root = make_repo(tmp_path)
+        (root / "lib.py").write_text("def f():\n    return 1\n")
+        names = "\n".join(f"x{i} = {i}" for i in range(300))
+        snippet = f"{names}\nimport lib\nassert lib.f() == 1\n"
+        out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
+        assert "lib.py" in out["test"]
+
+
 class TestDisable:
     def test_depless_code_is_silenced_and_repo_code_keeps_firing(self, tmp_path):
         # sys.monitoring.DISABLE is honored for globally-set events: a

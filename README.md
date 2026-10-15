@@ -127,9 +127,10 @@ file is never collected. If the recorded data is missing/unreadable, or the
 base commit no longer exists (e.g. after a rebase), everything runs.
 
 Performance (sqlalchemy `test/orm`, 11,313 tests, Python 3.13, serial):
-recording costs ~1.65× a plain run (~34s on top of a 52s suite).  The
+recording costs ~1.55× a plain run (~28s on top of a 52s suite).  The
 sys.monitoring floor itself is tiny (~3%, measured with a no-op callback);
-the cost is our per-event Python callback, so:
+the cost is our per-event Python callback and the first-time analysis of
+each code block, so:
 
 - code objects whose analysis yields no dependencies (stdlib, the venv,
   pytest internals) are permanently silenced by returning
@@ -138,12 +139,31 @@ the cost is our per-event Python callback, so:
 - in-repo code objects keep firing (attribution to the running test is
   required) but only pay a dict lookup + identity comparison, with deps
   re-attributed only when the test changes;
+- code blocks without any import bytecode (about three quarters) are
+  detected with a byte-level pre-check and skip disassembly entirely;
+- a repository module index (one walk, built lazily) resolves import
+  names to files without calling ``find_spec`` -- which not only avoids
+  hundreds of microseconds per resolution but also removes its side
+  effect of importing parent packages.  That side effect previously cost
+  real correctness: module trees first imported *inside* our resolution
+  had their one-time PY_START events swallowed, silently dropping
+  dependencies (on sqlalchemy, whole ``orm`` submodules went unrecorded).
+  Resolving from the index imports nothing, so import-time dependency
+  tracking is now complete.  The index over-approximates importability,
+  which is safe in the conservative direction: a scan-resolved dep can
+  only ever be an *extra* dep, because an import that actually executes
+  is always captured directly by the imported module's own PY_START;
 - file→repo-relative-path resolution (LRU cache), exclusion checks, and
-  per-(module, level, file) import resolutions are each computed once and
-  memoized.
+  per-(module, level, file) import resolutions are each computed once
+  and memoized.
 
-A no-change rerun takes ~1.8s because collection is skipped outright;
-touching one rarely-used module re-runs only its 20 dependents in ~3s.
+A no-change rerun takes ~2s because collection is skipped outright;
+editing a test file re-runs only that file's tests (~3s for 3 tests).
+Note that in packages with an eager ``__init__`` (sqlalchemy's
+``sqlalchemy.orm`` imports most of the package at import time), every
+eagerly imported module is legitimately an import-time dependency of
+every test: changing those files re-runs everything.  That is the
+conservative model working as designed.
 
 ## Limitations (by design)
 

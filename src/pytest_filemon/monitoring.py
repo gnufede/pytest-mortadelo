@@ -39,10 +39,12 @@ from __future__ import annotations
 
 import dis
 import importlib.util
+import opcode
 import os
+import sys
 from pathlib import Path
 
-from .util import to_repo_rel
+from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 try:
     from sys import monitoring as _sys_monitoring
@@ -57,6 +59,21 @@ _TOOL_IDS = (4, 3)
 # Sentinel for "no cache cell for this code object yet" (distinct from a
 # cached empty dependency set, which is a legitimate cell).
 _NO_CELL = object()
+
+try:
+    _IMPORT_NAME_OP = opcode.opmap["IMPORT_NAME"]
+    _IMPORT_FROM_OP = opcode.opmap["IMPORT_FROM"]
+except KeyError:  # pragma: no cover - future bytecode without import ops
+    _IMPORT_NAME_OP = None
+    _IMPORT_FROM_OP = None
+
+# On Python 3.13+ code.co_code returns the original (unadaptive) bytecode
+# snapshot, so a byte-level presence test for the import opcodes is sound:
+# if an import opcode is absent from the bytes, the code object provably
+# contains no import bytecode and can skip disassembly entirely (roughly
+# three quarters of code objects).  On 3.12 co_code may reflect the live
+# adaptive array; there we always disassemble.
+_FAST_IMPORT_PRECHECK = sys.version_info >= (3, 13) and _IMPORT_NAME_OP is not None
 
 
 def _use_tool(tool_id: int, name: str) -> None:
@@ -99,6 +116,66 @@ def _static_level(instrs, index: int) -> int:
     return 0
 
 
+def _build_module_index(root: Path, exclude_roots: tuple[Path, ...]) -> dict[str, str]:
+    """Map importable dotted names to repo-relative files, conservatively.
+
+    A file's name is its package-qualified path (walking up while each
+    directory has an ``__init__.py``); files not inside any package are
+    indexed by their stem, as if their directory were on ``sys.path``.
+
+    The map over-approximates importability, which is exactly what the
+    conservative import scan wants: a scan-resolved dependency can only
+    ever be an *extra* dependency, because an import that actually executes
+    is always recorded directly through the imported module's own PY_START
+    event.  So an imprecise index can over-record (a few extra reruns) but
+    never under-record.
+    """
+    excluded = {"__pycache__", ".git"} | _EXCLUDED_SEGMENTS
+    excl_roots = tuple(os.fspath(p) for p in exclude_roots)
+
+    def excluded_dirpath(dp: str) -> bool:
+        return any(dp == e or dp.startswith(e + os.sep) for e in excl_roots)
+
+    is_pkg: dict[Path, bool] = {}
+
+    def dir_is_package(d: Path) -> bool:
+        if d not in is_pkg:
+            is_pkg[d] = (d / "__init__.py").is_file()
+        return is_pkg[d]
+
+    index: dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        if excluded_dirpath(dirpath):
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in excluded
+            and not d.startswith(".")
+            and not excluded_dirpath(os.path.join(dirpath, d))
+        ]
+        directory = Path(dirpath)
+        parts: list[str] = []
+        cur = directory
+        while cur != root and dir_is_package(cur):
+            parts.insert(0, cur.name)
+            cur = cur.parent
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            stem = fn[:-3]
+            rel = (directory / fn).relative_to(root).as_posix()
+            if stem == "__init__":
+                if not parts:
+                    continue
+                name = ".".join(parts)
+            else:
+                name = ".".join([*parts, stem]) if parts else stem
+            index.setdefault(name, rel)
+    return index
+
+
 class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
@@ -129,6 +206,7 @@ class FileMonitor:
         # per event after the first.
         self._code_cache: dict = {}
         self._spec_cache: dict[str, str | None] = {}
+        self._module_index: dict[str, str] | None = None
         self._resolve_cache: dict[
             tuple[str | None, int, str | None], tuple[frozenset[str], str | None]
         ] = {}
@@ -292,6 +370,15 @@ class FileMonitor:
             return frozenset()
         files: set[str] = set()
         files.add(own)
+        if _FAST_IMPORT_PRECHECK:
+            co_code = code.co_code
+            if (
+                _IMPORT_NAME_OP not in co_code
+                and _IMPORT_FROM_OP not in co_code
+            ):
+                # No import bytecode anywhere in this block (byte-level
+                # check over the original snapshot): nothing to resolve.
+                return frozenset(files)
         last_full: str | None = None
         instrs = list(dis.get_instructions(code, show_caches=False))
         for i, ins in enumerate(instrs):
@@ -387,23 +474,31 @@ class FileMonitor:
         if dotted in self._spec_cache:
             return self._spec_cache[dotted]
         origin = None
-        try:
-            spec = importlib.util.find_spec(dotted)
-            # Only real files count: builtin modules report "built-in",
-            # frozen modules report synthetic locations, namespace packages
-            # report None. (pytest's assertion rewriter injects
-            # ``import builtins`` into rewritten modules, so "built-in"
-            # origins are common in practice.)
-            if (
-                spec is not None
-                and spec.origin
-                and not spec.origin.startswith("<")
-                and os.path.isfile(spec.origin)
-                and not self._is_excluded(spec.origin)
-            ):
-                origin = to_repo_rel(spec.origin, self.root)
-        except Exception:
-            origin = None
+        if self._module_index is None:
+            self._module_index = _build_module_index(self.root, self._exclude_roots)
+        origin = self._module_index.get(dotted)
+        if origin is None:
+            # Not in the repository index: fall back to importlib for
+            # sys.path subtleties (e.g. a module importable only via a
+            # directory that pytest put on sys.path).  The index values are
+            # already repo-relative; importlib needs the conversion.
+            try:
+                spec = importlib.util.find_spec(dotted)
+                # Only real files count: builtin modules report "built-in",
+                # frozen modules report synthetic locations, namespace
+                # packages report None. (pytest's assertion rewriter
+                # injects ``import builtins`` into rewritten modules, so
+                # "built-in" origins are common in practice.)
+                if (
+                    spec is not None
+                    and spec.origin
+                    and not spec.origin.startswith("<")
+                    and os.path.isfile(spec.origin)
+                    and not self._is_excluded(spec.origin)
+                ):
+                    origin = to_repo_rel(spec.origin, self.root)
+            except Exception:
+                origin = None
         self._spec_cache[dotted] = origin
         return origin
 
