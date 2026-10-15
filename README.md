@@ -6,7 +6,7 @@ pytest-testmon but deliberately different:
 | | pytest-testmon | pytest-filemon |
 |---|---|---|
 | dependency storage | sqlite | JSON shards stored in git refs |
-| dependency resolution | code-block / line level | **file paths**, relative to the repo root |
+| dependency resolution | code-block / line level | **code blocks** (qualified name + AST hash) and module skeletons for imports |
 | coverage collection | coverage.py | a custom `sys.monitoring` tool using **PY_START** events (no per-line tracking) |
 | dynamic imports | — | conservative bytecode scan for import opcodes inside every executed code block |
 | import-time dependencies | — | everything imported before tests start is a dependency of *every* test |
