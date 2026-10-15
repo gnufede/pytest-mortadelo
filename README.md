@@ -103,6 +103,26 @@ git fetch  origin 'refs/filemon/*:refs/filemon/*'
 git cat-file blob refs/filemon/<shard>:data.json | python -m json.tool
 ```
 
+To make plain ``git pull``/``git fetch`` transfer shards automatically, add a
+second fetch refspec::
+
+    git config --add remote.origin.fetch '+refs/filemon/*:refs/filemon/*'
+
+For push, note that setting ``remote.origin.push`` *replaces* the default
+branch-pushing behavior (not merges with it), so include both refspecs::
+
+    git config --add remote.origin.push 'refs/heads/*:refs/heads/*'
+    git config --add remote.origin.push 'refs/filemon/*:refs/filemon/*'
+
+or keep it explicit with an alias::
+
+    git config alias.push-filemon "push origin refs/filemon/*:refs/filemon/*"
+
+(On GitHub/GitLab arbitrary ``refs/*`` are accepted and stored; they are not
+shown in the web UI. CI can fetch the same way -- remember the shard key is
+the *normalized pytest command*, so the CI invocation must produce the same
+args as the run that recorded the data.)
+
 ### 3. Selection: git diff + collection skipping
 
 Before collection starts, the changed-file set is computed and test files
