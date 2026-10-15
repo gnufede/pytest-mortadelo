@@ -65,8 +65,12 @@ Events are bucketed by phase:
 
 Files outside the repository are ignored. So are virtual environments and
 third-party trees that happen to live *inside* the repo (`.venv`,
-`site-packages`, `.tox`, `node_modules`, ...) and the plugin's own package —
-only first-party repository code is ever recorded.
+`site-packages`, `.tox`, `node_modules`, ...) — only first-party repository
+code is ever recorded. When the plugin itself is installed inside the tested
+repo (its own dev repo), its files are first-party code and are recorded:
+the hooks and monitor callback execute during every test, so any plugin edit
+conservatively re-runs everything. This is what makes the plugin safe to run
+on its own test suite (`uv run pytest --filemon tests`).
 
 ### 2. Storage: JSON shards in git refs (never a commit)
 

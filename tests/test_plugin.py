@@ -207,6 +207,27 @@ class TestOptions:
         result.assert_outcomes(passed=2)
 
 
+class TestSelfHosting:
+    """The plugin running *inside* the plugin's own pytest session, in one
+    process: per-config state and dynamic sys.monitoring tool ids must keep the
+    nested run independent of the outer one (and vice versa)."""
+
+    def test_inprocess_nested_filemon_run(self, project):
+        # In-process (not subprocess): the inner session shares this process
+        # and, when the outer suite is itself run with --filemon, a monitor.
+        result = project.runpytest("--filemon", "-q")
+        result.assert_outcomes(passed=2)
+        result = project.runpytest("--filemon", "-q")
+        # Nothing changed in the project repo: deselect everything.
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+        # The nested run stored its shard in the project repo, not ours.
+        refs = git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+        ).stdout.split()
+        assert len(refs) == 1
+
+
 class TestSelectorsDisableSelection:
     """Explicitly requested tests must never be silently skipped."""
 
