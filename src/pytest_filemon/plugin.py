@@ -543,7 +543,7 @@ class FilemonState:
             # The test body finished; deps recorded for it are trustworthy.
             self.finished.add(report.nodeid)
 
-    def finish(self, config: pytest.Config) -> None:
+    def finish(self, config: pytest.Config, interrupted: bool = False) -> None:
         """Merge monitor buckets into per-test deps and store the shard.
 
         Block-level model (data version 2): each test keeps the blocks that
@@ -637,6 +637,23 @@ class FilemonState:
             if file in self.skip_collect_files:
                 tests[nodeid] = set(old_deps)
             # else: the file was collected but the test is gone -> drop
+        if interrupted:
+            # A test that was collected but did not finish has an unknown
+            # result: it must re-run.  With valid old deps it would otherwise
+            # be deselected forever ("no stale block"), and without any
+            # recorded history it would be omitted entirely -- letting its
+            # file be collection-skipped, silently never running again.
+            # Keeping it in the shard (old deps if any, else none) and on the
+            # failed/must-rerun list closes both holes.
+            if self.selection is not None:
+                deselected = set(self.selection.deselected)
+            else:
+                deselected = set()
+            for nodeid in self.item_map:
+                if nodeid in self.finished or nodeid in deselected:
+                    continue
+                tests.setdefault(nodeid, set())
+                self.failed.add(nodeid)
 
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
@@ -787,13 +804,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus) -> None:
     state = _state_from(session.config)
     if state is None or not state.enabled:
         return
-    if exitstatus == pytest.ExitCode.INTERRUPTED:
-        state.notes.append(
-            "filemon: run interrupted; tests that never finished will be "
-            "re-run next time"
-        )
     try:
-        state.finish(session.config)
+        state.finish(session.config, interrupted=exitstatus == pytest.ExitCode.INTERRUPTED)
     except Exception as e:  # never break the test run
         state.notes.append(f"filemon: failed to store dependency data: {e!r}")
 

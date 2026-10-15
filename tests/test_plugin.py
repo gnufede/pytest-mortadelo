@@ -465,6 +465,63 @@ class TestFastPath:
         result.stdout.fnmatch_lines(["*1 previously failed*"])
 
 
+class TestInterruptedRuns:
+    """Interrupted runs must never lose a test to collection skipping."""
+
+    def test_interrupted_tests_are_marked_to_rerun(self, project):
+        # test_a fails (a real failure), then test_b raises KeyboardInterrupt
+        # mid-run: neither result is trustworthy, so both must re-run next
+        # time -- test_b especially, whose result is unknown.
+        (project.path / "tests" / "test_a.py").write_text(
+            "def test_a():\n    import lib\n    assert lib.ping() == 12345\n"
+        )
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    raise KeyboardInterrupt\n"
+        )
+        result = run_filemon(project, "-q")
+        assert result.ret in (1, 2)
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/filemon/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert set(meta["failed"]) == {
+            "tests/test_a.py::test_a", "tests/test_b.py::test_b",
+        }
+        # and both stay in the recorded node ids (with deps for the one that
+        # did finish, an entry for the interrupted one)
+        assert set(meta["nodeids"]) == {
+            "tests/test_a.py::test_a", "tests/test_b.py::test_b",
+        }
+        # next run: previously-failed/unfinished re-run (fast path disabled)
+        result = run_filemon(project, "-q")
+        result.stdout.fnmatch_lines(["*2 previously failed*"])
+
+    def test_interrupted_first_run_never_loses_a_test(self, project):
+        # Interrupt the very first run mid-test: the unfinished test keeps a
+        # shard entry (empty deps) and is must-rerun, so the next run cannot
+        # collection-skip it away.
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    raise KeyboardInterrupt\n"
+        )
+        result = run_filemon(project, "-q")
+        assert result.ret in (1, 2)
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/filemon/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert "tests/test_b.py::test_b" in meta["nodeids"]
+        assert "tests/test_b.py::test_b" in meta["failed"]
+        # fix the interruption and run again: test_b re-runs
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    assert True\n"
+        )
+        git(project.path, "add", "-A")
+        git(project.path, "commit", "-q", "-m", "fix interruption")
+        result = run_filemon(project, "-q")
+        # test_b (previously interrupted -> must-rerun) runs and passes;
+        # test_a finished in the interrupted run with unchanged deps, so it
+        # stays deselected.
+        result.assert_outcomes(passed=1)
+
+
 class TestBlockGranularity:
     """The point of block-level deps: edit granularity decides re-runs."""
 
