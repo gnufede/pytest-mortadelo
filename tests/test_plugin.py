@@ -33,6 +33,18 @@ def shard_data(path):
     return json.loads(git(path, "cat-file", "blob", f"{refs[0]}:data.json").stdout)
 
 
+def decode_shard(data):
+    """v2 shard -> (tests: {nid: set[(file, block, hash)]}, import_deps: set)."""
+    table = [tuple(b) for b in data["blocks"]]
+    tests = {nid: {table[i] for i in idxs} for nid, idxs in data["tests"].items()}
+    import_deps = {table[i] for i in data.get("import_deps", [])}
+    return tests, import_deps
+
+
+def dep_ids(deps):
+    return sorted(f"{f}:{b}" for f, b, _ in deps)
+
+
 @pytest.fixture
 def project(pytester):
     """A small git repository with two tests and two lazily-imported helpers.
@@ -78,19 +90,23 @@ class TestRecording:
         )
 
         data = shard_data(project.path)
-        assert set(data["tests"]) == {
+        tests, import_deps = decode_shard(data)
+        assert set(tests) == {
             "tests/test_a.py::test_a",
             "tests/test_b.py::test_b",
         }
         assert data["failed"] == []
-        # Executed dynamic import recorded for test_a...
-        assert "tests/lib.py" in data["tests"]["tests/test_a.py::test_a"]
-        # ...and the never-executed import recorded for test_b.
-        assert "tests/other.py" in data["tests"]["tests/test_b.py::test_b"]
-        # Import-time deps (conftest) and the test's own module are recorded...
-        for deps in data["tests"].values():
-            assert "tests/conftest.py" in deps
-        assert "tests/test_a.py" in data["tests"]["tests/test_a.py::test_a"]
+        # Executed dynamic import recorded for test_a: lib's SKELETON plus
+        # the executed body of ping...
+        assert "tests/lib.py:<module>" in dep_ids(tests["tests/test_a.py::test_a"])
+        assert "tests/lib.py:ping" in dep_ids(tests["tests/test_a.py::test_a"])
+        # ...while test_b's never-executed (dead branch) import records only
+        # other's SKELETON -- a body edit there would NOT re-run test_b.
+        assert dep_ids(tests["tests/test_b.py::test_b"]) == [
+            "tests/other.py:<module>", "tests/test_b.py:<module>", "tests/test_b.py:test_b",
+        ]
+        # Conftest skeleton is a shared import-time dep.
+        assert "tests/conftest.py:<module>" in dep_ids(import_deps)
         # ...but other tests' modules must NOT leak into a test's deps.
         assert "tests/test_b.py" not in data["tests"]["tests/test_a.py::test_a"]
         assert "tests/test_a.py" not in data["tests"]["tests/test_b.py::test_b"]
@@ -114,8 +130,9 @@ class TestRecording:
             "tests/test_a.py::test_a",
             "tests/test_b.py::test_b",
         }
-        assert "tests/lib.py" in data["tests"]["tests/test_a.py::test_a"]
-        assert "tests/other.py" in data["tests"]["tests/test_b.py::test_b"]
+        tests, _ = decode_shard(data)
+        assert "tests/lib.py:<module>" in dep_ids(tests["tests/test_a.py::test_a"])
+        assert "tests/other.py:<module>" in dep_ids(tests["tests/test_b.py::test_b"])
 
     def test_disabled_without_flag_records_nothing(self, project):
         result = project.runpytest_subprocess("-q")
@@ -311,6 +328,76 @@ class TestSyncEndToEnd:
         assert "pushed" not in result.stdout.str()
         # The remote was not touched.
         assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == seeded
+
+
+class TestBlockGranularity:
+    """The point of block-level deps: edit granularity decides re-runs."""
+
+    def test_body_edit_of_one_test_reruns_only_that_test(self, project):
+        # File-level tracking re-ran the whole file's tests on any edit;
+        # block-level re-runs only the test whose function body changed.
+        run_filemon(project, "-q")
+        content = (project.path / "tests" / "test_a.py").read_text()
+        (project.path / "tests" / "test_a.py").write_text(
+            content.replace("assert lib.ping() == 1", "assert lib.ping() == 1\n    marker = 1")
+        )
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*1 affected*"])
+
+    def test_comment_edit_of_helper_reruns_nothing(self, project):
+        run_filemon(project, "-q")
+        (project.path / "tests" / "lib.py").write_text(
+            "# a comment change only\ndef ping():\n    return 1\n"
+        )
+        result = run_filemon(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+
+    def test_body_edit_of_dead_imported_helper_does_not_rerun(self, project):
+        # test_b imports `other` in a dead branch: its recorded dep is
+        # other's SKELETON. Editing other.pong's BODY must not re-run test_b
+        # (file-level tracking would have).
+        run_filemon(project, "-q")
+        (project.path / "tests" / "other.py").write_text(
+            "def pong():\n    return 99\n"  # body edit
+        )
+        result = run_filemon(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+
+    def test_module_level_edit_of_dead_imported_helper_reruns(self, project):
+        run_filemon(project, "-q")
+        (project.path / "tests" / "other.py").write_text(
+            "NEW_CONSTANT = 1\ndef pong():\n    return 2\n"  # module-level edit
+        )
+        result = run_filemon(project, "-v")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*test_b.py::test_b PASSED*"])
+
+    def test_body_edit_of_executed_helper_reruns_only_its_caller(self, project):
+        # lib.ping's body executes inside test_a only.  (The edited body is
+        # deliberately a different byte length: a same-length edit inside the
+        # same mtime second could otherwise be served from a stale .pyc.)
+        run_filemon(project, "-q")
+        (project.path / "tests" / "lib.py").write_text(
+            "def ping():\n    return 12345\n"
+        )
+        result = run_filemon(project, "-q")
+        # test_a re-runs (and fails: the assertion now mismatches).
+        result.assert_outcomes(failed=1)
+        result.stdout.fnmatch_lines(["*FAILED tests/test_a.py::test_a*"])
+
+    def test_conftest_body_edit_reruns_everything_import_time(self, project):
+        # Anything that executes at import time (here: a function body in a
+        # conftest called at module level) is a shared import-time dep: a
+        # body edit re-runs the world.
+        run_filemon(project, "-q")
+        (project.path / "tests" / "conftest.py").write_text(
+            "def helper():\n    return 2  # body edit\n\nVAL = helper()\n"
+        )
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(passed=2)  # everything re-ran (import-time stale)
 
 
 class TestSelfHosting:

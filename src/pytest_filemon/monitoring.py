@@ -44,6 +44,7 @@ import os
 import sys
 from pathlib import Path
 
+from .blocks import WILDCARD, Block, BlockCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 try:
@@ -214,9 +215,11 @@ class FileMonitor:
         self._phase = "import"  # import | collect | test | done
         self._nodeid: str | None = None
         self._key: tuple = ("import",)  # current attribution bucket
-        self.import_deps: set[str] = set()
-        self.collect_deps: set[str] = set()
-        self.test_deps: dict[str, set[str]] = {}
+        self.import_deps: set[Block] = set()
+        self.collect_deps: set[Block] = set()
+        self.test_deps: dict[str, set[Block]] = {}
+        # Block analysis (one AST parse per file, lazily).
+        self._blocks = BlockCache(self.root)
         # Internals.
         self._active = False
         self._tool_id: int | None = None
@@ -409,17 +412,33 @@ class FileMonitor:
 
     # -- analysis ------------------------------------------------------
 
-    def _analyze(self, code) -> frozenset[str]:
-        """Deps of a code block: its own file plus anything it may import."""
+    def _analyze(self, code) -> frozenset[Block]:
+        """Deps of a code block: the block itself plus the module skeletons
+        of anything its bytecode may import."""
         if self._exclude_roots and self._is_excluded(code.co_filename):
             return frozenset()
         own = self.repo_rel(code.co_filename)
         if own is None:
-            # Code outside the repository cannot import repository modules in
-            # any way we care about; skip the (relatively expensive) scan.
+            # Code outside the repository cannot import repository modules
+            # in any way we care about; skip the (relatively expensive)
+            # scan.
             return frozenset()
-        files: set[str] = set()
-        files.add(own)
+        deps: set[Block] = set()
+        fb = self._blocks.file_blocks(own)
+        if fb is None:
+            # File not parseable (deleted mid-run, mid-edit): file-level dep.
+            deps.add((own, WILDCARD, WILDCARD))
+        else:
+            resolved = fb.resolve(
+                getattr(code, "co_qualname", code.co_name), code.co_firstlineno
+            )
+            if resolved is None or resolved[1] == WILDCARD:
+                # Unmappable code object (dynamic code, redefined name):
+                # file-level fallback.
+                deps.add((own, WILDCARD, WILDCARD))
+            else:
+                block_id, content = resolved
+                deps.add((own, block_id, content))
         if _FAST_IMPORT_PRECHECK:
             co_code = code.co_code
             if (
@@ -428,7 +447,7 @@ class FileMonitor:
             ):
                 # No import bytecode anywhere in this block (byte-level
                 # check over the original snapshot): nothing to resolve.
-                return frozenset(files)
+                return frozenset(deps)
         last_full: str | None = None
         instrs = list(dis.get_instructions(code, show_caches=False))
         for i, ins in enumerate(instrs):
@@ -437,7 +456,11 @@ class FileMonitor:
                 name = _operand_name(code, ins)
                 level = _static_level(instrs, i)
                 resolved, full = self._resolve_module(name, level, own)
-                files |= resolved
+                for rel in resolved:
+                    # Importing a module executes its module-level code: the
+                    # dependency is the module skeleton, not the whole file
+                    # (function bodies of the imported module do not run).
+                    deps.add(self._blocks.module_dep(rel))
                 last_full = full
             elif op == "IMPORT_FROM":
                 # ``from pkg import attr`` where attr is a submodule.  If it
@@ -445,8 +468,9 @@ class FileMonitor:
                 # skip it -- conservative in the right direction.
                 attr = _operand_name(code, ins)
                 if attr and last_full:
-                    files |= self._resolve_dotted(f"{last_full}.{attr}")
-        return frozenset(files)
+                    for rel in self._resolve_dotted(f"{last_full}.{attr}"):
+                        deps.add(self._blocks.module_dep(rel))
+        return frozenset(deps)
 
     def _resolve_module(
         self, name: str | None, level: int, own_rel: str
@@ -495,6 +519,14 @@ class FileMonitor:
             if origin:
                 files.add(origin)
         return frozenset(files)
+
+    def module_dep(self, rel: str) -> Block:
+        """Import-time dependency on a module (its skeleton)."""
+        return self._blocks.module_dep(rel)
+
+    def file_blocks(self, rel: str):
+        """Block table of a repo file (None if unparseable); cached."""
+        return self._blocks.file_blocks(rel)
 
     def repo_rel(self, filename: str) -> str | None:
         """Repo-relative path for a filename, memoized per monitor.

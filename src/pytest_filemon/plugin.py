@@ -27,9 +27,17 @@ from pathlib import Path
 
 import pytest
 
+from .blocks import Block
 from .gitstore import GitStore
 from .monitoring import FileMonitor
-from .selection import Selection, Shard, load_shard, select_tests
+from .selection import (
+    DATA_VERSION,
+    Selection,
+    Shard,
+    load_shard,
+    select_tests,
+    stale_dep,
+)
 from .util import command_key, git_root, to_repo_rel
 
 _ENV_TRUTHY = ("1", "true", "yes")
@@ -163,6 +171,8 @@ class FilemonState:
         # Shard sync (see _sync_remote).
         self.sync_remote: str | None = None
         self.sync_mode: str = "both"
+        # Current block tables of the changed files (selection input).
+        self.new_maps: dict = {}
 
     # -- setup ----------------------------------------------------------
 
@@ -258,13 +268,21 @@ class FilemonState:
         self.changed = changed
         if changed is None:
             return
-        # Which files still have at least one test that will run?
+        self.new_maps = self._new_maps(changed)
+        # If any shared import-time dependency went stale, every test runs:
+        # nothing is skippable.
+        if any(stale_dep(b, changed, self.new_maps) for b in self.shard.import_deps):
+            return
+        # Which files still have at least one test that will run?  A test
+        # runs if it previously failed or any of its recorded blocks went
+        # stale in the changed files.
         file_tests: dict[str, list[str]] = {}
         for nodeid in self.shard.tests:
             file_tests.setdefault(nodeid.split("::")[0], []).append(nodeid)
         for file, nodeids in file_tests.items():
             if any(
-                nodeid in self.shard.failed or self.shard.tests[nodeid] & changed
+                nodeid in self.shard.failed
+                or any(stale_dep(b, changed, self.new_maps) for b in self.shard.tests[nodeid])
                 for nodeid in nodeids
             ):
                 continue
@@ -280,6 +298,20 @@ class FilemonState:
             self.skipped_test_ids = [
                 n for n in self.skipped_test_ids if n.split("::")[0] not in dropped
             ]
+
+    def _new_maps(self, changed: set[str]) -> dict:
+        """Current block tables of the changed .py files (selection input).
+
+        Files that no longer parse (deleted, mid-edit) map to None, which
+        the stale check treats as "changed in a way we cannot resolve".
+        """
+        maps: dict = {}
+        if self.monitor is None:
+            return maps
+        for f in changed:
+            if f.endswith(".py"):
+                maps[f] = self.monitor.file_blocks(f)
+        return maps
 
     def _explicit_arg_files(self, config: pytest.Config) -> set[str]:
         """Repo-relative files explicitly given as pytest arguments."""
@@ -332,7 +364,7 @@ class FilemonState:
                 "test selectors (-k/-m/--lf/explicit node ids) present: running everything",
             )
             return
-        selection = select_tests(collected, shard, self.changed)
+        selection = select_tests(collected, shard, self.changed, self.new_maps)
         if self.skipped_test_ids:
             # Only report tests whose files were genuinely not collected;
             # a planned skip can be overridden by pytest (e.g. a file given
@@ -373,31 +405,53 @@ class FilemonState:
             self.finished.add(report.nodeid)
 
     def finish(self, config: pytest.Config) -> None:
-        """Merge monitor buckets into per-test deps and store the shard."""
+        """Merge monitor buckets into per-test deps and store the shard.
+
+        Block-level model (data version 2): each test keeps the blocks that
+        executed while it ran (plus the collect-time blocks of its own test
+        module); import-time blocks (module skeletons of everything imported
+        before the tests, conftests, and the bodies of anything that
+        executed during import) are shared by every test and stored once.
+        """
         if self.monitor is None or self.store is None or self.root is None:
             return
         monitor = self.monitor
         monitor.phase = "done"
         monitor.current_nodeid = None
-        global_deps = (
-            monitor.import_deps
-            | (monitor.collect_deps - self.module_files)
-            | self.conftest_deps
-        )
-        old_tests = self.shard.tests if self.shard is not None else {}
-        tests: dict[str, list[str]] = {}
+
+        # Partition collect-phase blocks: those executed in test-module
+        # files belong to that module's tests only; everything else is a
+        # shared import-time dependency.
+        module_collect: dict[str, set[Block]] = {}
+        import_blocks: set[Block] = set(monitor.import_deps)
+        for block in monitor.collect_deps:
+            rel = block[0]
+            if rel in self.module_files:
+                module_collect.setdefault(rel, set()).add(block)
+            else:
+                import_blocks.add(block)
+        # Conftest skeletons: dependency of every test. (Normally captured
+        # by the monitor at import time anyway; covers late activation and
+        # empty conftest files.)
+        for rel in self.conftest_deps:
+            import_blocks.add(monitor.module_dep(rel))
+
+        old_shard = self.shard
+        old_tests = old_shard.tests if old_shard is not None else {}
+        # Keep previously recorded import-time deps (conservative: a module
+        # that stopped being imported still re-runs its dependents).
+        import_blocks |= old_shard.import_deps if old_shard is not None else set()
+
+        tests: dict[str, set[Block]] = {}
         for nodeid, module_rel in self.item_map.items():
-            base = set(global_deps)
-            if module_rel:
-                base.add(module_rel)
-            ran = monitor.test_deps.get(nodeid)
-            if ran is not None and nodeid in self.finished:
-                tests[nodeid] = sorted(base | ran)
+            own = monitor.test_deps.get(nodeid)
+            if own is not None and nodeid in self.finished:
+                extra = module_collect.get(module_rel, set()) if module_rel else set()
+                tests[nodeid] = own | extra
             elif nodeid in old_tests:
                 # Not run this time (deselected or interrupted): keep the
-                # previous dependency set, conservatively unioned with the
-                # current import-time deps.
-                tests[nodeid] = sorted(base | old_tests[nodeid])
+                # previous block set; the shared import deps cover the rest.
+                tests[nodeid] = set(old_tests[nodeid])
             # else: never ran and no history -> omit, so it is always
             # re-run in the future ("new test").
         # Tests in files whose collection was skipped never ran and are not
@@ -408,12 +462,33 @@ class FilemonState:
                 continue
             file = nodeid.split("::")[0]
             if file in self.skip_collect_files:
-                base = set(global_deps)
-                if file.endswith(".py"):
-                    base.add(file)
-                tests[nodeid] = sorted(base | old_deps)
+                tests[nodeid] = set(old_deps)
             # else: the file was collected but the test is gone -> drop
-        data = {"version": 1, "tests": tests, "failed": sorted(self.failed)}
+
+        # Serialize with a dedup table: shared blocks (import-time and
+        # common helpers) are stored once.
+        table: dict[Block, int] = {}
+        ordered: list[Block] = []
+
+        def index(block: Block) -> int:
+            i = table.get(block)
+            if i is None:
+                i = len(ordered)
+                ordered.append(block)
+                table[block] = i
+            return i
+
+        data = {
+            "version": DATA_VERSION,
+            "blocks": [list(b) for b in ordered],  # filled below
+            "tests": {
+                nid: sorted({index(b) for b in tests[nid]})
+                for nid in sorted(tests)
+            },
+            "import_deps": sorted({index(b) for b in import_blocks}),
+            "failed": sorted(self.failed),
+        }
+        data["blocks"] = [list(b) for b in ordered]
         meta = {
             "version": 1,
             "shard": self.store.shard,
