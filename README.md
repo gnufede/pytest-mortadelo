@@ -318,3 +318,4 @@ src/pytest_filemon/
 ├── selection.py   # shard parsing + test selection
 └── util.py        # path normalization, command shard key
 ```
+<!-- dogfood demo: a change no test depends on -->
