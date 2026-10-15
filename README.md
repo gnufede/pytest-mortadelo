@@ -124,13 +124,21 @@ recorded data is missing/unreadable, or the base commit no longer exists
 
 ## Development
 
+The repo is managed with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e .
-.venv/bin/python -m pytest
+uv sync            # create/update .venv from uv.lock (dev tools included)
+uv run pytest      # run the test suite (syncs automatically if needed)
+uv run ruff check src tests
+uv lock            # re-resolve after editing dependencies
 ```
 
-The test suite uses `pytester` subprocess runs against real git repositories.
+The lockfile (`uv.lock`) and `.python-version` are committed; the dev tools
+(ruff) live in the PEP 735 `dev` dependency group. Any Python 3.12+ works
+(`uv sync` will fetch one if needed).
+
+The test suite uses `pytester` subprocess runs against real git repositories,
+so it needs network-free local git only.
 
 ## Layout
 

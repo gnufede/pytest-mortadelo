@@ -22,6 +22,9 @@ classifiers = [
 [project.entry-points.pytest11]
 filemon = "pytest_filemon.plugin"
 
+[dependency-groups]
+dev = ["ruff>=0.8"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pytest_filemon"]
 
