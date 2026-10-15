@@ -5,16 +5,28 @@ from pytest_filemon.util import command_key, to_repo_rel
 class TestToRepoRel:
     def test_absolute_inside(self, tmp_path):
         root = tmp_path / "repo"
-        root.mkdir()
-        assert to_repo_rel(str(root / "src" / "a.py"), root) == "src/a.py"
+        src = root / "src"
+        src.mkdir(parents=True)
+        f = src / "a.py"
+        f.write_text("")
+        assert to_repo_rel(str(f), root) == "src/a.py"
         # pathlib.Path inputs (e.g. item.path) must work too.
-        assert to_repo_rel(root / "src" / "a.py", root) == "src/a.py"
+        assert to_repo_rel(f, root) == "src/a.py"
 
     def test_relative_to_cwd(self, tmp_path, monkeypatch):
         root = tmp_path / "repo"
         (root / "src").mkdir(parents=True)
+        (root / "src" / "a.py").write_text("")
         monkeypatch.chdir(root)
         assert to_repo_rel("src/a.py", root) == "src/a.py"
+
+    def test_nonexistent_files_are_none(self, tmp_path):
+        # Phantom relative co_filenames (e.g. a bare "bootstrap.py" from
+        # generated code) must never become dependencies.
+        root = tmp_path / "repo"
+        root.mkdir()
+        assert to_repo_rel("bootstrap.py", root) is None
+        assert to_repo_rel(str(root / "nope.py"), root) is None
 
     def test_outside_repo_is_none(self, tmp_path):
         root = tmp_path / "repo"
@@ -25,14 +37,17 @@ class TestToRepoRel:
 
     def test_venv_and_site_packages_excluded(self, tmp_path):
         root = tmp_path / "repo"
-        (root / ".venv" / "lib" / "python3.13" / "site-packages" / "plg").mkdir(
-            parents=True
-        )
-        excluded = root / ".venv" / "lib" / "python3.13" / "site-packages" / "plg" / "x.py"
+        other_root = tmp_path / "other"
+        venv = root / ".venv" / "lib" / "python3.13" / "site-packages" / "plg"
+        venv.mkdir(parents=True)
+        excluded = venv / "x.py"
         excluded.write_text("")
         assert to_repo_rel(str(excluded), root) is None
         # also covers bare venv/ and tox layouts
-        assert to_repo_rel(str(tmp_path / "other" / "site-packages" / "y.py"), tmp_path / "other") is None
+        bare = other_root / "venv" / "y.py"
+        bare.parent.mkdir(parents=True)
+        bare.write_text("")
+        assert to_repo_rel(str(bare), other_root) is None
 
     def test_synthetic_locations_are_none(self, tmp_path):
         root = tmp_path / "repo"

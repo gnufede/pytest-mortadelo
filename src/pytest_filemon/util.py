@@ -76,6 +76,11 @@ def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
         if not p.is_absolute():
             p = Path.cwd() / p
         p = p.resolve()
+        # Guard against phantom relative co_filenames (e.g. bare
+        # "bootstrap.py" from some generated/embedded code): only real files
+        # can be dependencies.
+        if not p.is_file():
+            return None
         rel = p.relative_to(root)
     except (OSError, ValueError, RuntimeError):
         return None
