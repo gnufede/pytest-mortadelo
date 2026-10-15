@@ -39,12 +39,15 @@ def _env_enabled() -> bool:
     return os.environ.get("PYTEST_FILEMON", "").strip().lower() in _ENV_TRUTHY
 
 
-def _sync_remote(config: pytest.Config) -> str | None:
-    """The git remote to sync shards with, if any.
+def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
+    """The (remote, mode) to sync shards with, if any.
 
     ``PYTEST_FILEMON_SYNC`` takes precedence over the ``filemon_sync`` ini
-    option; both accept a remote name, or ``1``/``true``/``yes`` meaning
-    ``origin``.
+    option.  Both accept a remote name (pull *and* push), ``1``/``true``/
+    ``yes`` meaning ``origin``, or ``pull:<remote>`` / ``push:<remote>`` for
+    one-directional sync.  ``pull:`` is the CI mode: it consumes shards
+    with the same read-only credentials the checkout already uses, needing
+    no write token at all.
     """
     value = os.environ.get("PYTEST_FILEMON_SYNC")
     if value is None:
@@ -53,8 +56,13 @@ def _sync_remote(config: pytest.Config) -> str | None:
     if not value or value.lower() in ("0", "false", "no"):
         return None
     if value.lower() in ("1", "true", "yes"):
-        return "origin"
-    return value
+        return ("origin", "both")
+    mode = "both"
+    remote = value
+    left, sep, right = value.partition(":")
+    if sep and left.lower() in ("pull", "push") and right.strip():
+        mode, remote = left.lower(), right.strip()
+    return (remote, mode)
 
 
 def _selectors_active(config: pytest.Config) -> bool:
@@ -154,6 +162,7 @@ class FilemonState:
         self.selectors_active: bool = False
         # Shard sync (see _sync_remote).
         self.sync_remote: str | None = None
+        self.sync_mode: str = "both"
 
     # -- setup ----------------------------------------------------------
 
@@ -189,11 +198,13 @@ class FilemonState:
 
         self._collect_conftest_deps(config)
         self.store = GitStore(self.root, command_key(config.invocation_params.args, self.root))
-        self.sync_remote = _sync_remote(config)
+        sync = _sync_remote(config)
+        if sync is not None:
+            self.sync_remote, self.sync_mode = sync
         if config.option.filemon_clean:
             self.store.delete()
             self.notes.append(f"filemon: cleared stored data for ref {self.store.ref}")
-        elif self.sync_remote:
+        elif self.sync_remote and self.sync_mode in ("pull", "both"):
             # Pull before loading the shard: a newer record on the remote is
             # used for this run's selection.  (Skipped under --filemon-clean,
             # so "discard" really discards.)
@@ -410,7 +421,7 @@ class FilemonState:
             "created": datetime.now(UTC).isoformat(),
         }
         self.store.save(data, meta)
-        if self.sync_remote:
+        if self.sync_remote and self.sync_mode in ("push", "both"):
             try:
                 self.notes.append(f"filemon: {self.store.sync_push(self.sync_remote)}")
             except Exception as e:  # never break the run

@@ -120,6 +120,9 @@ PYTEST_FILEMON_SYNC=1 pytest --filemon -q tests        # '1' means 'origin'
 PYTEST_FILEMON_SYNC=upstream pytest --filemon -q tests # an explicit remote
 ```
 
+Sync is bidirectional by default; `pull:<remote>` / `push:<remote>` select
+one direction. `pull:` is the CI mode — see below.
+
 Semantics and safety:
 
 - "latest record wins": the shard with the newer `meta.json: created`
@@ -134,6 +137,37 @@ Semantics and safety:
   recorded the data must run a command that normalizes to the same shard
   key (same positional paths and selection arguments; presentation flags
   like `-q`/`-v`/`--tb` don't matter) — relevant for CI reuse.
+
+#### CI
+
+The recommended topology needs **no write credentials in CI at all**:
+developers push shards with their code (the runs that record the data), CI
+only pulls them — using the same read-only access the checkout already has:
+
+```bash
+PYTEST_FILEMON_SYNC=pull:origin pytest --filemon -q tests
+```
+
+On GitHub Actions, the default token permissions suffice (nothing to
+configure; `contents: read` is the default and `actions/checkout` already
+authenticates `git fetch`):
+
+```yaml
+# no 'permissions:' block needed
+- run: PYTEST_FILEMON_SYNC=pull:origin pytest --filemon -q tests
+```
+
+To also *push* recorded data back from CI (so fresh clones and other
+machines benefit from CI runs), grant the built-in token write access:
+
+```yaml
+permissions:
+  contents: write   # pushes refs/filemon/* only; never branches
+```
+
+Notes for the push direction: pushes made with `GITHUB_TOKEN` do not
+trigger new workflow runs (documented GitHub behavior), and parallel jobs
+racing on the same command resolve as latest-record-wins.
 
 #### Manual sharing (explicit refspecs)
 
@@ -162,8 +196,12 @@ or keep it explicit with an alias:
 
     git config alias.push-filemon "push origin refs/filemon/*:refs/filemon/*"
 
-(On GitHub/GitLab arbitrary `refs/*` are accepted and stored; they are not
-shown in the web UI.)
+Host support: verified against plain and self-hosted git servers (bare
+remotes). On GitHub.com, `refs/notes/*` pushes are known to work while
+reports on fully custom namespaces are mixed; if a host rejects
+`refs/filemon/*`, the push simply fails non-fatally (a note in the run
+summary) and everything stays local — pull-only CI is unaffected either
+way.
 
 ### 3. Selection: git diff + collection skipping
 

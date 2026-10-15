@@ -207,6 +207,34 @@ class TestOptions:
         result.assert_outcomes(passed=2)
 
 
+class _FakeConfig:
+    def __init__(self, ini=""):
+        self._ini = ini
+
+    def getini(self, name):
+        return self._ini
+
+
+class TestSyncRemoteParsing:
+    def test_parsing(self, monkeypatch):
+        from pytest_filemon.plugin import _sync_remote
+
+        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        assert _sync_remote(_FakeConfig()) is None
+        assert _sync_remote(_FakeConfig("0")) is None
+        assert _sync_remote(_FakeConfig("false")) is None
+        assert _sync_remote(_FakeConfig("origin")) == ("origin", "both")
+        assert _sync_remote(_FakeConfig("pull:origin")) == ("origin", "pull")
+        assert _sync_remote(_FakeConfig("PUSH:Upstream")) == ("Upstream", "push")
+        # a value that merely contains ':' is a remote name, not a mode
+        assert _sync_remote(_FakeConfig("weird:name")) == ("weird:name", "both")
+
+        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
+        assert _sync_remote(_FakeConfig("pull:origin")) == ("origin", "both")  # env wins
+        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "pull:origin")
+        assert _sync_remote(_FakeConfig("origin")) == ("origin", "pull")
+
+
 class TestSyncEndToEnd:
     """Onboarding: PYTEST_FILEMON_SYNC / filemon_sync make the plugin itself
     push and pull the shard, no refspecs needed."""
@@ -253,6 +281,36 @@ class TestSyncEndToEnd:
         result = project.runpytest_subprocess("--filemon", "-q")
         result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
         assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+
+
+    def test_pull_only_mode_never_pushes(self, project, monkeypatch):
+        """The CI topology: consume shards read-only, no write token needed."""
+        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        bare = project.path.parent / (project.path.name + "-remote.git")
+        bare.mkdir()
+        git(bare, "init", "--bare", "-q")
+        git(project.path, "remote", "add", "origin", str(bare))
+
+        # Seed the remote with a full record (a developer's pushed shard).
+        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
+        project.runpytest_subprocess("--filemon", "-q")
+        seeded = git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+        assert len(seeded) == 1
+
+        # Simulate a fresh clone (CI): no local shard.
+        for ref in git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+        ).stdout.split():
+            git(project.path, "update-ref", "-d", ref)
+
+        # Pull-only run: uses the pushed shard, never writes back.
+        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "pull:origin")
+        result = project.runpytest_subprocess("--filemon", "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*pulled a newer shard from 'origin'*"])
+        assert "pushed" not in result.stdout.str()
+        # The remote was not touched.
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == seeded
 
 
 class TestSelfHosting:
