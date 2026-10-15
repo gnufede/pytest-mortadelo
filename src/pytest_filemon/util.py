@@ -38,11 +38,29 @@ def git_root(start: Path | str | None = None) -> Path | None:
     return Path(out).resolve()
 
 
+# Path segments that never hold first-party repository code: virtual
+# environments and third-party packages that happen to live *inside* the
+# repository tree (uv's default in-repo .venv, tox envs, vendored deps). A
+# repo directory legitimately named like one of these is an accepted loss.
+_EXCLUDED_SEGMENTS = frozenset(
+    {
+        "site-packages",
+        "dist-packages",
+        "node_modules",
+        ".venv",
+        "venv",
+        ".tox",
+        ".nox",
+    }
+)
+
+
 def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
     """Normalize a filename to a repo-root-relative POSIX path.
 
     Returns None for synthetic locations (``<string>``, ``<frozen ...>``),
-    non-strings, and anything outside the repository.
+    non-strings, paths outside the repository, and paths inside virtual
+    environments / site-packages / similar third-party trees.
     """
     if not filename:
         return None
@@ -63,6 +81,8 @@ def to_repo_rel(filename: str | os.PathLike | None, root: Path) -> str | None:
         return None
     parts = rel.parts
     if not parts or ".." in parts:
+        return None
+    if _EXCLUDED_SEGMENTS.intersection(parts):
         return None
     return rel.as_posix()
 

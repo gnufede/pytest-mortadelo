@@ -86,8 +86,14 @@ def _static_level(instrs, index: int) -> int:
 class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
-    def __init__(self, root: Path):
+    def __init__(
+        self, root: Path, exclude_roots: tuple[Path, ...] = ()
+    ):
         self.root = Path(root).resolve()
+        # Absolute directories whose files are never recorded as dependencies
+        # (e.g. the pytest_filemon package itself, which would otherwise show
+        # up as a dependency of every test when installed editable in-repo).
+        self._exclude_roots = tuple(Path(p).resolve() for p in exclude_roots)
         # Buckets.
         self.phase = "import"  # import | collect | test | done
         self.current_nodeid: str | None = None
@@ -192,6 +198,8 @@ class FileMonitor:
 
     def _analyze(self, code) -> frozenset[str]:
         """Deps of a code block: its own file plus anything it may import."""
+        if self._exclude_roots and self._is_excluded(code.co_filename):
+            return frozenset()
         own = to_repo_rel(code.co_filename, self.root)
         files: set[str] = set()
         if own is None:
@@ -254,6 +262,19 @@ class FileMonitor:
                 files.add(origin)
         return frozenset(files)
 
+    def _is_excluded(self, filename: str) -> bool:
+        """Whether *filename* lives under one of the excluded roots."""
+        if not self._exclude_roots:
+            return False
+        p = Path(filename)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        try:
+            p = p.resolve()
+        except OSError:
+            return False
+        return any(p.is_relative_to(root) for root in self._exclude_roots)
+
     def _spec_origin(self, dotted: str) -> str | None:
         if dotted in self._spec_cache:
             return self._spec_cache[dotted]
@@ -270,6 +291,7 @@ class FileMonitor:
                 and spec.origin
                 and not spec.origin.startswith("<")
                 and os.path.isfile(spec.origin)
+                and not self._is_excluded(spec.origin)
             ):
                 origin = to_repo_rel(spec.origin, self.root)
         except Exception:

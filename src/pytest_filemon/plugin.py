@@ -36,6 +36,10 @@ from .util import command_key, git_root, to_repo_rel
 _EARLY_MONITOR: FileMonitor | None = None
 _STATE: FilemonState | None = None
 
+# The plugin's own package directory: never recorded as a test dependency
+# (relevant when the plugin is installed editable inside the tested repo).
+_PLUGIN_PACKAGE_DIR = Path(__file__).resolve().parent
+
 _ENV_TRUTHY = ("1", "true", "yes")
 
 
@@ -82,7 +86,7 @@ def pytest_load_initial_conftests(early_config, parser, args):
     if "--filemon" in args or _env_enabled():
         root = git_root(Path.cwd())
         if root is not None:
-            monitor = FileMonitor(root)
+            monitor = FileMonitor(root, exclude_roots=(_PLUGIN_PACKAGE_DIR,))
             if monitor.activate():
                 global _EARLY_MONITOR
                 _EARLY_MONITOR = monitor
@@ -129,7 +133,9 @@ class FilemonState:
                 # Late activation (e.g. --filemon came from ini addopts):
                 # root conftest imports already happened unwatched, so add
                 # the conftest files themselves as import-time deps.
-                self.monitor = FileMonitor(self.root)
+                self.monitor = FileMonitor(
+                    self.root, exclude_roots=(_PLUGIN_PACKAGE_DIR,)
+                )
                 self.monitor.activate()
                 self.notes.append(
                     "filemon: monitoring activated late; conftest files added "

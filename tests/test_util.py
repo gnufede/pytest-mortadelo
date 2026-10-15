@@ -23,6 +23,17 @@ class TestToRepoRel:
         other.write_text("")
         assert to_repo_rel(str(other), root) is None
 
+    def test_venv_and_site_packages_excluded(self, tmp_path):
+        root = tmp_path / "repo"
+        (root / ".venv" / "lib" / "python3.13" / "site-packages" / "plg").mkdir(
+            parents=True
+        )
+        excluded = root / ".venv" / "lib" / "python3.13" / "site-packages" / "plg" / "x.py"
+        excluded.write_text("")
+        assert to_repo_rel(str(excluded), root) is None
+        # also covers bare venv/ and tox layouts
+        assert to_repo_rel(str(tmp_path / "other" / "site-packages" / "y.py"), tmp_path / "other") is None
+
     def test_synthetic_locations_are_none(self, tmp_path):
         root = tmp_path / "repo"
         root.mkdir()

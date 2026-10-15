@@ -23,8 +23,11 @@ from pytest_filemon.monitoring import FileMonitor
 root = Path(sys.argv[1])
 phase = sys.argv[2]
 snippet_path = Path(sys.argv[3])
+exclude = Path(sys.argv[5]) if len(sys.argv) > 5 else None
 
-monitor = FileMonitor(root)
+monitor = FileMonitor(
+    root, exclude_roots=(exclude,) if exclude is not None else ()
+)
 assert monitor.activate(), "could not activate a monitoring tool id"
 monitor.phase = phase
 monitor.current_nodeid = "T"
@@ -59,14 +62,17 @@ def make_repo(tmp_path):
     return root
 
 
-def run_monitor(tmp_path, root, phase, snippet_rel, snippet_text):
+def run_monitor(tmp_path, root, phase, snippet_rel, snippet_text, exclude=None):
     driver = tmp_path / "driver.py"
     driver.write_text(DRIVER)
     snippet = root / snippet_rel
     snippet.parent.mkdir(parents=True, exist_ok=True)
     snippet.write_text(snippet_text)
+    argv = [sys.executable, str(driver), str(root), phase, str(snippet), str(SRC)]
+    if exclude is not None:
+        argv.append(str(exclude))
     proc = subprocess.run(
-        [sys.executable, str(driver), str(root), phase, str(snippet), str(SRC)],
+        argv,
         capture_output=True,
         text=True,
         check=True,
@@ -153,3 +159,35 @@ class TestImports:
         snippet = "import pkg.sub.deep\nassert pkg.sub.deep.v == 1\n"
         out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
         assert {"pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/deep.py"} <= set(out["test"])
+
+
+class TestExclusions:
+    def test_excluded_roots_are_never_recorded(self, tmp_path):
+        # E.g. the plugin's own package: code that runs inside it (here, a
+        # "plugin-ish" package living inside the repo) must not become a
+        # dependency of anything.
+        root = make_repo(tmp_path)
+        plugin_dir = root / "fake_plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "hooks.py").write_text("def hook():\n    return 1\n")
+        snippet = (
+            "import fake_plugin.hooks\n"
+            "assert fake_plugin.hooks.hook() == 1\n"
+        )
+        out = run_monitor(
+            tmp_path, root, "test", "probe.py", snippet, exclude=plugin_dir
+        )
+        assert "fake_plugin/hooks.py" not in out["test"]
+        assert "fake_plugin/hooks.py" not in out["import"]
+        assert out["test"] == ["probe.py"]
+
+    def test_venv_inside_repo_is_not_recorded(self, tmp_path):
+        # uv-style in-repo virtual environment: code executed from inside
+        # .venv must not leak into dependencies even though the paths are
+        # inside the repo root.
+        root = make_repo(tmp_path)
+        venv_rel = ".venv/lib/python3.13/site-packages/dep/mod.py"
+        out = run_monitor(
+            tmp_path, root, "test", venv_rel, "x = 1\n"
+        )
+        assert out["test"] == []

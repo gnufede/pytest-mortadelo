@@ -61,7 +61,10 @@ Events are bucketed by phase:
   editing one test file does not re-run the whole suite.
 - **test phase** → attributed to the running test's node id.
 
-Files outside the repository are ignored.
+Files outside the repository are ignored. So are virtual environments and
+third-party trees that happen to live *inside* the repo (`.venv`,
+`site-packages`, `.tox`, `node_modules`, ...) and the plugin's own package —
+only first-party repository code is ever recorded.
 
 ### 2. Storage: JSON shards in git refs (never a commit)
 
