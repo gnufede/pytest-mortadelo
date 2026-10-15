@@ -105,6 +105,9 @@ modules are never imported) — the same optimization testmon applies via
 ``pytest_ignore_collect``.  This is safe because a test always depends on
 its own module file: any edit (including adding a test) selects the file's
 tests, and a brand-new file has no recorded tests and is always collected.
+(Files given as explicit pytest *arguments* are always collected anyway:
+pytest exempts command-line paths -- "init paths" -- from
+``pytest_ignore_collect``.)
 
 When explicit test selectors are in play (``-k``, ``-m``, ``--lf``/``--ff``,
 or a ``file.py::test`` argument), selection is disabled entirely (matching

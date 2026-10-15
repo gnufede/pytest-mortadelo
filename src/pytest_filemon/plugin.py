@@ -233,6 +233,28 @@ class FilemonState:
                 continue
             self.skip_collect_files.add(file)
             self.skipped_test_ids.extend(nodeids)
+        # pytest exempts explicit command-line paths ("init paths") from
+        # pytest_ignore_collect: files given as arguments are always
+        # collected, so planning to skip them would only corrupt the report.
+        explicit = self._explicit_arg_files(config)
+        if explicit & self.skip_collect_files:
+            dropped = explicit & self.skip_collect_files
+            self.skip_collect_files -= dropped
+            self.skipped_test_ids = [
+                n for n in self.skipped_test_ids if n.split("::")[0] not in dropped
+            ]
+
+    def _explicit_arg_files(self, config: pytest.Config) -> set[str]:
+        """Repo-relative files explicitly given as pytest arguments."""
+        assert self.root is not None
+        out: set[str] = set()
+        for arg in getattr(config, "args", []):
+            p = Path(str(arg).split("::")[0])
+            if p.is_file():
+                rel = to_repo_rel(p, self.root)
+                if rel:
+                    out.add(rel)
+        return out
 
     def remember_items(self, items: list[pytest.Item]) -> None:
         assert self.root is not None
@@ -267,11 +289,24 @@ class FilemonState:
             return
         selection = select_tests(collected, shard, self.changed)
         if self.skipped_test_ids:
-            # Fold the tests skipped at collection time into the report.
-            selection.deselected.extend(self.skipped_test_ids)
-            selection.reason += (
-                f"; skipped collection of {len(self.skip_collect_files)} file(s)"
-            )
+            # Only report tests whose files were genuinely not collected;
+            # a planned skip can be overridden by pytest (e.g. a file given
+            # as an explicit argument), in which case those tests are
+            # already in the collected deselected list.
+            collected_set = set(collected)
+            actually_skipped = [
+                n for n in self.skipped_test_ids if n not in collected_set
+            ]
+            skipped_files = {
+                f
+                for f in self.skip_collect_files
+                if not any(n.startswith(f + "::") for n in collected_set)
+            }
+            if actually_skipped or skipped_files:
+                selection.deselected.extend(actually_skipped)
+                selection.reason += (
+                    f"; skipped collection of {len(skipped_files)} file(s)"
+                )
         self.selection = selection
         if selection.deselected:
             selected_set = set(selection.selected)

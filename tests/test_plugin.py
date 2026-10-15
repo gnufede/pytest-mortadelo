@@ -144,6 +144,19 @@ class TestSelection:
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*test_b.py::test_b PASSED*"])
 
+    def test_explicit_file_arguments_still_collect_and_report_correctly(self, project):
+        # pytest exempts explicit command-line paths ("init paths") from
+        # pytest_ignore_collect: files given as arguments must still be
+        # collected, and their deselected tests must not be double-counted
+        # in the report.
+        run_filemon(project, "-q", "tests/test_a.py", "tests/test_b.py")
+        result = run_filemon(project, "-q", "tests/test_a.py", "tests/test_b.py")
+        result.assert_outcomes(deselected=2)
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["selected 0/2 tests:*"])
+        # No bogus "skipped collection" claim, no double counting.
+        assert "skipped collection" not in result.stdout.str()
+
     def test_failed_tests_always_rerun(self, project):
         # Make test_a fail (lib.ping no longer matches the assertion).
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 2\n")
