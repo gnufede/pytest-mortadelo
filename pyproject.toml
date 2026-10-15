@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-filemon"
+version = "0.1.0"
+description = "File-level test impact analysis for pytest: sys.monitoring-based dependencies, JSON shards stored in git refs, selection via git diff."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+  "pytest>=8.0",
+]
+classifiers = [
+  "Framework :: Pytest",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.entry-points.pytest11]
+filemon = "pytest_filemon.plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pytest_filemon"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff.lint]
+# BLE001/S110: the monitor and storage layer intentionally swallow broad
+# exceptions -- a monitoring bug must never break the user's test run.
+ignore = ["BLE001", "S110"]
