@@ -220,31 +220,39 @@ class FileMonitor:
     def _on_py_start(self, code, instruction_offset) -> None:
         """Hot path: called for every code block start in the process.
 
-        Flattened to a dict lookup plus a tuple comparison for the
+        Flattened to a dict lookup plus an identity comparison for the
         overwhelmingly common case (a code object already analyzed, still
-        executing within the same attribution bucket).  Never let a
-        monitoring bug break the user's test run.
+        executing within the same attribution bucket).  Code objects whose
+        analysis yielded no dependencies are *permanently* silenced by
+        returning ``sys.monitoring.DISABLE`` -- CPython honors DISABLE for
+        globally-set events (verified on 3.13) and dep-less code can never
+        contribute to any bucket, so this is a pure win: out-of-repo,
+        venv and excluded code stops firing events after its first start.
+        Never let a monitoring bug break the user's test run.
         """
         try:
             cell = self._code_cache.get(code, _NO_CELL)
             if cell is _NO_CELL:
-                self._first_start(code)
-                return
+                return self._first_start(code)
+            if cell[1] is self._key:
+                return None
             deps = cell[0]
-            if deps and cell[1] is not self._key:
-                self._bucket(deps)
-                cell[1] = self._key
+            if not deps:
+                return _sys_monitoring.DISABLE
+            self._bucket(deps)
+            cell[1] = self._key
+            return None
         except Exception:  # pragma: no cover - defensive
-            pass
+            return None
 
-    def _first_start(self, code) -> None:
+    def _first_start(self, code):
         """Cold path: first start of this code object."""
         if self._busy or self._phase == "done":
             # Nested event while resolving imports for an outer block (or
             # after the run ended): skip analysis and, crucially, cache
             # nothing -- this code object gets a normal analysis the next
             # time it starts outside a busy region.
-            return
+            return None
         self._busy = True
         try:
             deps = self._analyze(code)
@@ -257,6 +265,9 @@ class FileMonitor:
         if deps:
             self._bucket(deps)
             cell[1] = self._key
+            return None
+        # No dependencies ever: silence this code object for good.
+        return _sys_monitoring.DISABLE
 
     def _bucket(self, deps) -> None:
         phase = self._phase

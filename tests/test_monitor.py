@@ -161,6 +161,82 @@ class TestImports:
         assert {"pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/deep.py"} <= set(out["test"])
 
 
+DISABLE_DRIVER = """
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[4])
+sys.path.insert(0, sys.argv[1])   # repo root, for module resolution
+from pytest_filemon.monitoring import FileMonitor
+
+root = Path(sys.argv[1])
+calls = {"n": 0}
+
+m = FileMonitor(root)
+orig_cb = m._on_py_start
+
+# Wrap the callback BEFORE activate() so the registered callback counts
+# every event dispatch.
+def counting_on_py_start(code, offset):
+    calls["n"] += 1
+    return orig_cb(code, offset)
+
+m._on_py_start = counting_on_py_start
+assert m.activate()
+
+# Dep-less hot loop: this driver lives outside the monitored root, so all
+# its code objects resolve to no dependencies.
+def hot(x):
+    return x + 1
+
+for _ in range(20000):
+    hot(1)
+hot_calls = calls["n"]
+
+# In-repo code must keep firing (attribution per test).
+calls["n"] = 0
+m.phase = "test"
+m.current_nodeid = "T1"
+snippet = Path(sys.argv[3])
+exec(compile(snippet.read_text(), str(snippet), "exec"), {"__name__": "snippet"})
+m.current_nodeid = "T2"
+exec(compile(snippet.read_text(), str(snippet), "exec"), {"__name__": "snippet"})
+m.phase = "done"
+
+print(json.dumps({
+    "hot_loop_events": hot_calls,
+    "snippet_events": calls["n"],
+    "test": sorted(m.test_deps.get("T1", [])),
+    "test2": sorted(m.test_deps.get("T2", [])),
+}))
+"""
+
+
+class TestDisable:
+    def test_depless_code_is_silenced_and_repo_code_keeps_firing(self, tmp_path):
+        # sys.monitoring.DISABLE is honored for globally-set events: a
+        # dep-less code object fires (almost) once, not once per start.
+        root = make_repo(tmp_path)
+        (root / "lib.py").write_text("def f():\n    return 1\n")
+        driver = tmp_path / "disable_driver.py"
+        driver.write_text(DISABLE_DRIVER)
+        snippet = root / "probe.py"
+        snippet.write_text("import lib\nassert lib.f() == 1\n")
+        proc = subprocess.run(
+            [sys.executable, str(driver), str(root), "test", str(snippet), str(SRC)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        # 20,000 starts of dep-less code produced only a handful of events.
+        assert out["hot_loop_events"] < 10, out["hot_loop_events"]
+        # Repo code still fires on every test: both buckets are attributed.
+        assert out["test"] == ["lib.py", "probe.py"]
+        assert out["test2"] == ["lib.py", "probe.py"]
+        assert out["snippet_events"] > 0
+
+
 class TestExclusions:
     def test_excluded_roots_are_never_recorded(self, tmp_path):
         # E.g. the plugin's own package: code that runs inside it (here, a

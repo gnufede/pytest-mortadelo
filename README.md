@@ -124,13 +124,23 @@ file is never collected. If the recorded data is missing/unreadable, or the
 base commit no longer exists (e.g. after a rebase), everything runs.
 
 Performance (sqlalchemy `test/orm`, 11,313 tests, Python 3.13, serial):
-recording costs ~1.8× a plain run (~40s on top of a 48s suite), dominated by
-the per-code-block-start callback (millions of PY_START events).  Hot paths
-are memoized: file→repo-relative-path resolution (LRU cache), import
-(function→file) resolution, exclusion checks, and per-(module, level, file)
-import resolutions are each computed once and cached.  A no-change rerun
-takes ~2s because collection is skipped outright; touching one rarely-used
-module re-runs only its 20 dependents in ~3s.
+recording costs ~1.65× a plain run (~34s on top of a 52s suite).  The
+sys.monitoring floor itself is tiny (~3%, measured with a no-op callback);
+the cost is our per-event Python callback, so:
+
+- code objects whose analysis yields no dependencies (stdlib, the venv,
+  pytest internals) are permanently silenced by returning
+  ``sys.monitoring.DISABLE`` -- CPython honors DISABLE even for
+  globally-set events, so out-of-repo code fires essentially once;
+- in-repo code objects keep firing (attribution to the running test is
+  required) but only pay a dict lookup + identity comparison, with deps
+  re-attributed only when the test changes;
+- file→repo-relative-path resolution (LRU cache), exclusion checks, and
+  per-(module, level, file) import resolutions are each computed once and
+  memoized.
+
+A no-change rerun takes ~1.8s because collection is skipped outright;
+touching one rarely-used module re-runs only its 20 dependents in ~3s.
 
 ## Limitations (by design)
 
