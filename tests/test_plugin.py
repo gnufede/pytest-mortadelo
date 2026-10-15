@@ -381,6 +381,70 @@ class TestFastPath:
         assert "tests/test_new.py" in meta["dep_files"]
         assert "tests/test_new.py::test_new" in meta["nodeids"]
 
+    def test_pure_rerun_never_activates_the_monitor(self, project):
+        # The distinguishing note of the monitor-less fast path.
+        run_filemon(project, "-q")
+        result = run_filemon(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*fast path (monitoring not armed*"])
+
+    def test_unmonitored_test_in_pure_run_failure_is_persisted(self, project):
+        # The only thing that can run in a pure (monitor-less) rerun is a
+        # test that was never recorded -- e.g. lost to an interrupted run.
+        # Simulate that: drop test_a from the recorded shard, then make it
+        # fail via an untracked non-dependency, non-.py file.  The failure
+        # list must be persisted (so the next run re-runs it) while its deps
+        # stay as recorded-or-absent.
+        # Make test_a's outcome depend on a marker file (committed first so
+        # the edit is not itself a change).
+        (project.path / "tests" / "test_a.py").write_text(
+            "import pathlib\n\ndef test_a():\n"
+            "    import lib\n"
+            "    assert lib.ping() == 1\n"
+            "    assert not pathlib.Path('flag.txt').exists()\n"
+        )
+        git(project.path, "add", "-A")
+        git(project.path, "commit", "-q", "-m", "outcome marker")
+        run_filemon(project, "-q")
+
+        # Simulate the interruption loss: rewrite the shard without test_a.
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/filemon/").stdout.split()[0]
+        data = json.loads(git(project.path, "cat-file", "blob", f"{ref}:data.json").stdout)
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        drop = [i for i, b in enumerate(data["blocks"])
+                if b[0] == "tests/test_a.py"]
+        keep = [i for i in range(len(data["blocks"])) if i not in drop]
+        remap = {old: new for new, old in enumerate(keep)}
+        data["blocks"] = [data["blocks"][i] for i in keep]
+        data["tests"] = {nid: [remap[i] for i in idxs if i in remap]
+                         for nid, idxs in data["tests"].items()
+                         if nid != "tests/test_a.py::test_a"}
+        data["import_deps"] = [remap[i] for i in data["import_deps"] if i in remap]
+        meta["nodeids"] = [n for n in meta["nodeids"]
+                           if n != "tests/test_a.py::test_a"]
+        meta["dep_files"] = [f for f in meta["dep_files"] if f != "tests/test_a.py"]
+        from pytest_filemon.gitstore import GitStore
+        GitStore(project.path, meta["shard"]).save(data, meta)
+
+        # Flip the outcome via the untracked marker (non-.py, not a dep:
+        # still pure -- no dep changed, no new .py file).
+        (project.path / "flag.txt").write_text("x\n")
+
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(failed=1)  # test_a ran (unrecorded) and failed
+        result.stdout.fnmatch_lines(["*monitoring not armed*"])
+        # ... and the failure is persisted for the next run
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/filemon/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert meta["failed"] == ["tests/test_a.py::test_a"]
+        # next run: test_a is BOTH unrecorded and previously failed; the
+        # new-test branch wins the label (it runs either way).
+        result = run_filemon(project, "-q")
+        result.assert_outcomes(failed=1)
+        result.stdout.fnmatch_lines(["*selected 1/2 tests:*1 new*"])
+
     def test_changed_dependency_disables_fast_path(self, project):
         run_filemon(project, "-q")
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 12345\n")
