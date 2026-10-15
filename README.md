@@ -268,8 +268,12 @@ each code block, so:
   per-(module, level, file) import resolutions are each computed once
   and memoized.
 
-A no-change rerun takes ~2s because collection is skipped outright;
-editing a test file re-runs only that file's tests (~3s for 3 tests).
+A no-change rerun takes ~0.5s: an early hook probe decides from
+meta.json (the recorded node ids, failures, and the dependency file
+universe) that nothing can be stale, so the monitor is never armed,
+the dependency blob is never read, and recorded test modules are not
+even imported. Editing a test file re-runs only that file's affected
+tests.
 Note that in packages with an eager ``__init__`` (sqlalchemy's
 ``sqlalchemy.orm`` imports most of the package at import time), every
 eagerly imported module is legitimately an import-time dependency of

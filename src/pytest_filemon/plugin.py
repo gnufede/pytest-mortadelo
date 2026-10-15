@@ -122,9 +122,7 @@ def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
         for flag in ("--filemon-force", "--filemon-clean", "--lf", "--ff",
                      "--last-failed", "--failed-first")
     ) or any(
-        a.startswith(("-k", "-m", "--lf", "--ff", "-x", "--maxfail"))
-        or "::" in a
-        for a in args
+        a.startswith(("-k", "-m", "--lf", "--ff")) or "::" in a for a in args
     ):
         return False
     root = git_root(Path.cwd())
