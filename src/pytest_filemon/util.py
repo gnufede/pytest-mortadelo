@@ -130,20 +130,65 @@ def normalize_arg(arg: str, root: Path) -> str:
 _NON_KEY_FLAGS = {"--filemon", "--filemon-force", "--filemon-clean"}
 
 
+# Arguments that never change which tests are collected or executed, only
+# how results are presented (or how early the run stops -- partial runs merge
+# safely into the cumulative shard).  Excluded from the shard key so that
+# e.g. ``pytest tests -q`` and ``pytest tests -v`` share one database.
+#
+# DELIBERATELY an allowlist, not a denylist: anything not listed stays in
+# the key.  Over-merging shards risks stale selections (a wrong test set);
+# under-merging only costs a fresh record run.  Notably ``-W`` (warning
+# filters can change test outcomes mid-run and thus the executed code),
+# ``-p`` (plugin loading), ``--deselect``, ``-k``/``-m`` and positional args
+# all remain part of the key.
+_PRESENATION_NOARG = frozenset(
+    {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-l",
+        "--showlocals",
+        "--full-trace",
+        "--no-header",
+        "--no-summary",
+        "-x",
+        "--exitfirst",
+    }
+)
+_PRESENTATION_VALUE = frozenset(
+    {
+        "--tb",          # traceback style
+        "-r",            # report chars (e.g. -ra)
+        "--durations",
+        "--durations-min",
+        "--verbosity",
+        "--color",
+        "--maxfail",     # stops early; partial runs merge safely
+    }
+)
+
+
 def _filter_args(args: Sequence[str]) -> list[str]:
-    """Drop plugin flags and volatile value-taking options from *args*."""
+    """Drop key-irrelevant arguments from *args*.
+
+    Three groups are excluded: the plugin's own flags, volatile value-taking
+    options (``--basetemp``), and presentation-only flags (verbosity, report
+    formatting, early exit).  Unknown arguments are always kept.
+    """
     out: list[str] = []
     skip_next = False
     for arg in args:
         if skip_next:
             skip_next = False
             continue
-        if arg in _NON_KEY_FLAGS:
+        if arg in _NON_KEY_FLAGS or arg in _PRESENATION_NOARG:
             continue
-        if arg == "--basetemp":
+        if arg in _PRESENTATION_VALUE or arg == "--basetemp":
             skip_next = True
             continue
-        if arg.startswith("--basetemp="):
+        stripped = arg.split("=", 1)[0]
+        if stripped in _PRESENTATION_VALUE or arg.startswith("--basetemp="):
             continue
         out.append(arg)
     return out
@@ -153,9 +198,12 @@ def command_key(args: Sequence[str], root: Path) -> str:
     """Shard key for a pytest invocation: normalized args, order/dup-insensitive.
 
     The same *set* of normalized arguments always produces the same shard,
-    regardless of argument order or repetitions; adding/removing/rewording an
-    argument produces a different shard.  The plugin's own flags and volatile
-    pytest arguments (``--basetemp``) are excluded from the key.
+    regardless of argument order or repetitions.  Excluded from the key: the
+    plugin's own flags, volatile pytest arguments (``--basetemp``), and
+    presentation-only flags (``-q``/``-v``/``--tb``/``-x``/... -- see
+    ``_filter_args``); everything else, notably selection-affecting arguments
+    (``-k``, ``-m``, ``--deselect``, positional paths) and unknown arguments,
+    stays in the key.
     """
     filtered = _filter_args(args)
     normalized = sorted({normalize_arg(a, root) for a in filtered})

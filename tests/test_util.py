@@ -83,8 +83,29 @@ class TestCommandKey:
 
     def test_different_args_different_shard(self, tmp_path):
         root = tmp_path
-        assert command_key(["-q"], root) != command_key(["-q", "-x"], root)
+        # selection/semantics-affecting args stay in the key
+        assert command_key(["-q"], root) != command_key(["-q", "-m", "foo"], root)
         assert command_key(["tests"], root) != command_key(["tests/unit"], root)
+        # warning filters can change outcomes mid-run -> kept
+        assert command_key(["-W", "error", "tests"], root) != command_key(
+            ["-W", "ignore", "tests"], root
+        )
+        # unknown args are kept (conservative: never merge what we don't know)
+        assert command_key(["--some-plugin-flag", "tests"], root) != command_key(
+            ["tests"], root
+        )
+
+    def test_presentation_flags_do_not_change_the_shard(self, tmp_path):
+        # Verbosity/report/traceback formatting and early exit never change
+        # which tests run -> one shard for all of these.
+        base = command_key(["tests"], tmp_path)
+        assert base == command_key(["-q", "tests"], tmp_path)
+        assert base == command_key(["tests", "-v"], tmp_path)
+        assert base == command_key(["--quiet", "--verbose", "tests"], tmp_path)
+        assert base == command_key(["--tb=short", "-r", "a", "tests"], tmp_path)
+        assert base == command_key(["--tb", "long", "--durations", "10", "tests"], tmp_path)
+        assert base == command_key(["-x", "--maxfail", "3", "--color", "yes", "tests"], tmp_path)
+        assert base == command_key(["-l", "--full-trace", "--no-header", "--no-summary", "tests"], tmp_path)
 
     def test_paths_normalized_to_repo_relative(self, tmp_path, monkeypatch):
         root = tmp_path

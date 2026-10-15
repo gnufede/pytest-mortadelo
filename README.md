@@ -84,9 +84,15 @@ refs/filemon/<shard>   →  lightweight commit
 
 - The shard key is a hash of the **normalized** invocation arguments
   (repo-relative paths, order- and duplicate-insensitive), so only a re-run
-  of the same command reuses the data. `pytest tests/ -q` and
-  `pytest -q tests/` share a shard; `pytest tests/test_a.py` is a different
-  one.
+  of the same command reuses the data. Presentation-only flags are excluded
+  from the key — `pytest tests`, `pytest tests -q` and `pytest tests -v
+  --tb=short -x --durations 5` all share **one** shard (they collect and
+  execute the same tests; early exit just makes a partial run, which the
+  cumulative merge handles). Arguments that change the test set — positional
+  paths, `-k`, `-m`, `--deselect`, `-p`, `-W` — and any **unknown** argument
+  stay in the key: over-merging shards would risk stale selections, while
+  under-merging only costs a fresh record run. `pytest tests/test_a.py` is
+  therefore a different shard.
 - The ref is updated with git plumbing (`hash-object` / `mktree` /
   `commit-tree` / `update-ref`); it never touches the working tree, `HEAD`,
   or any branch, and nothing is ever committed by normal `git commit`.
@@ -125,8 +131,9 @@ Semantics and safety:
   operations time out after 30s, so a test run can never hang on them;
 - `--filemon-clean` skips the pull, so "discard" really discards;
 - the shard key is the *normalized pytest command*: the machine that
-  recorded the data must run the same command shape (e.g. `pytest tests -q`)
-  for the shard to match — relevant for CI reuse.
+  recorded the data must run a command that normalizes to the same shard
+  key (same positional paths and selection arguments; presentation flags
+  like `-q`/`-v`/`--tb` don't matter) — relevant for CI reuse.
 
 #### Manual sharing (explicit refspecs)
 
