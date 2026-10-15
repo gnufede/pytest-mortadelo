@@ -28,6 +28,17 @@ class TestToRepoRel:
         assert to_repo_rel("bootstrap.py", root) is None
         assert to_repo_rel(str(root / "nope.py"), root) is None
 
+    def test_pure_function_no_stale_cache(self, tmp_path):
+        # to_repo_rel must be pure (per-instance caching lives on the
+        # monitor): a file created after a miss is resolved on the next
+        # call, even in the same process.
+        root = tmp_path / "repo"
+        root.mkdir()
+        f = root / "late.py"
+        assert to_repo_rel(str(f), root) is None
+        f.write_text("")
+        assert to_repo_rel(str(f), root) == "late.py"
+
     def test_outside_repo_is_none(self, tmp_path):
         root = tmp_path / "repo"
         root.mkdir()

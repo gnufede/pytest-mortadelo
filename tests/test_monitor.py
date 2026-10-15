@@ -274,6 +274,73 @@ class TestModuleIndex:
         assert "lib.py" in out["test"]
 
 
+COEXIST_DRIVER = """
+import json, sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[4])
+sys.path.insert(0, sys.argv[1])   # repo root, for module resolution
+from sys import monitoring as sm
+from pytest_filemon.monitoring import FileMonitor
+
+root = Path(sys.argv[1])
+snippet = Path(sys.argv[3])
+
+# Occupy the preferred tool ids (4, 3) with dummy tools, as another
+# monitor (e.g. an outer pytest session running this plugin in-process)
+# would.
+for tid in (4, 3):
+    sm.use_tool_id(tid, "dummy-occupier")
+    sm.set_events(tid, sm.events.PY_START)
+    sm.register_callback(tid, sm.events.PY_START, lambda code, off: None)
+
+mon = FileMonitor(root)
+assert mon.activate(), "dynamic tool id allocation failed with 4/3 taken"
+assert mon._tool_id not in (4, 3), mon._tool_id
+
+mon2 = FileMonitor(root)
+assert mon2.activate(), "second concurrent monitor failed to activate"
+assert mon2._tool_id != mon._tool_id
+
+# Both monitors record independently in the same process.
+for m_ in (mon, mon2):
+    m_.phase = "test"
+    m_.current_nodeid = "T"
+    exec(compile(snippet.read_text(), str(snippet), "exec"), {"__name__": "s"})
+    m_.phase = "done"
+    m_.current_nodeid = None
+
+print(json.dumps({
+    "tool_ids": [mon._tool_id, mon2._tool_id],
+    "mon": sorted(mon.test_deps.get("T", [])),
+    "mon2": sorted(mon2.test_deps.get("T", [])),
+}))
+"""
+
+
+class TestToolIdAllocation:
+    def test_dynamic_allocation_and_monitor_coexistence(self, tmp_path):
+        # Preferred ids taken -> a different id is allocated; two monitors
+        # coexist in one process and record independently (the nested-run
+        # scenario of running our own plugin on our own tests).
+        root = make_repo(tmp_path)
+        (root / "lib.py").write_text("def f():\n    return 1\n")
+        driver = tmp_path / "coexist_driver.py"
+        driver.write_text(COEXIST_DRIVER)
+        snippet = root / "probe.py"
+        snippet.write_text("import lib\nassert lib.f() == 1\n")
+        proc = subprocess.run(
+            [sys.executable, str(driver), str(root), "test", str(snippet), str(SRC)],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        assert len(set(out["tool_ids"])) == 2
+        assert out["mon"] == ["lib.py", "probe.py"]
+        assert out["mon2"] == ["lib.py", "probe.py"]
+
+
 class TestDisable:
     def test_depless_code_is_silenced_and_repo_code_keeps_firing(self, tmp_path):
         # sys.monitoring.DISABLE is honored for globally-set events: a

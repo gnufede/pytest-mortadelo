@@ -253,6 +253,14 @@ class FilemonState:
                     out.add(rel)
         return out
 
+    def repo_rel(self, path) -> str | None:
+        """Repo-relative path, via the monitor's per-instance cache when
+        available (hot during collection traversal)."""
+        assert self.root is not None
+        if self.monitor is not None:
+            return self.monitor.repo_rel(os.fspath(path))
+        return to_repo_rel(path, self.root)
+
     def remember_items(self, items: list[pytest.Item]) -> None:
         assert self.root is not None
         for item in items:
@@ -433,7 +441,7 @@ def pytest_ignore_collect(collection_path, config):
         return None
     if collection_path.suffix != ".py":
         return None
-    rel = to_repo_rel(collection_path, state.root)
+    rel = state.repo_rel(collection_path)
     if rel is not None and rel in state.skip_collect_files:
         return True
     return None

@@ -41,7 +41,9 @@ code 5** ("no tests collected"), just like a `pytest -k nomatch` run.
 ### 1. Dependency collection (`sys.monitoring`, PY_START)
 
 The plugin registers a monitoring tool (PEP 669) with a single global event:
-`PY_START`. Every time a code block starts executing it records the repo
+`PY_START`. Tool ids are allocated dynamically (preferring the unnamed ids 4
+and 3, then any free id), so several monitors can coexist in one process --
+e.g. the plugin running its own test suite. Every time a code block starts executing it records the repo
 file it lives in — file-level coverage, no lines. On top of that, for every
 code block that starts, the plugin scans its bytecode for `IMPORT_NAME` /
 `IMPORT_FROM` opcodes and resolves the referenced modules to file paths. This

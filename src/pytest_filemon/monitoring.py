@@ -51,10 +51,21 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.12
     _sys_monitoring = None
 
-# PEP 669 defines six tool ids (0-5).  0-2 and 5 are debugger/coverage/
-# profiler/optimizer; 3 and 4 are currently unnamed.  We prefer 4 and fall
-# back to 3 (and give up if both are taken by another tool).
-_TOOL_IDS = (4, 3)
+# PEP 669 defines six tool ids (0-5).  0, 1, 2 and 5 belong to the standard
+# debugger/coverage/profiler/optimizer tools; 3 and 4 are unnamed.  We prefer
+# the unnamed ones, then fall back to ANY free id: the allocation is
+# dynamic so that several monitors can coexist in one process (e.g. our
+# own plugin running on our own tests via an in-process pytester, where the
+# outer monitor already holds an id).
+_PREFERRED_TOOL_IDS = (4, 3)
+_ALL_TOOL_IDS = tuple(range(6))
+
+
+def _candidate_tool_ids():
+    yield from _PREFERRED_TOOL_IDS
+    for tool_id in _ALL_TOOL_IDS:
+        if tool_id not in _PREFERRED_TOOL_IDS:
+            yield tool_id
 
 # Sentinel for "no cache cell for this code object yet" (distinct from a
 # cached empty dependency set, which is a legitimate cell).
@@ -195,6 +206,10 @@ class FileMonitor:
         # up as a dependency of every test when installed editable in-repo).
         self._exclude_roots = tuple(Path(p).resolve() for p in exclude_roots)
         self._exclude_cache: dict[str, bool] = {}
+        # Per-instance file-resolution cache (absolute paths only; relative
+        # ones depend on the cwd).  No module-level state: two monitors in
+        # one process never share (or stale-share) anything.
+        self._rel_cache: dict[str, str | None] = {}
         # Buckets.
         self._phase = "import"  # import | collect | test | done
         self._nodeid: str | None = None
@@ -265,10 +280,15 @@ class FileMonitor:
         return self._active
 
     def activate(self) -> bool:
-        """Register the sys.monitoring tool and the PY_START callback."""
+        """Register the sys.monitoring tool and the PY_START callback.
+
+        Grabs the first free tool id, preferring the unnamed ones (4, 3) so
+        that co-resident standard tools (debugger/coverage/profiler) are
+        only claimed as a last resort.
+        """
         if not _sys_monitoring:
             return False
-        for tool_id in _TOOL_IDS:
+        for tool_id in _candidate_tool_ids():
             try:
                 _use_tool(tool_id, "pytest-filemon")
             except ValueError:
@@ -333,7 +353,11 @@ class FileMonitor:
             if cell is _NO_CELL:
                 return self._first_start(code)
             if cell[1] is self._key:
-                return None
+                # Already attributed to this bucket: re-silence.  A foreign
+                # restart_events() (another monitor in this process, or a
+                # co-resident tool) may have re-armed us; this restores the
+                # one-event-per-bucket invariant without extra work.
+                return _sys_monitoring.DISABLE if _REARM else None
             deps = cell[0]
             if not deps:
                 return _sys_monitoring.DISABLE
@@ -389,7 +413,7 @@ class FileMonitor:
         """Deps of a code block: its own file plus anything it may import."""
         if self._exclude_roots and self._is_excluded(code.co_filename):
             return frozenset()
-        own = to_repo_rel(code.co_filename, self.root)
+        own = self.repo_rel(code.co_filename)
         if own is None:
             # Code outside the repository cannot import repository modules in
             # any way we care about; skip the (relatively expensive) scan.
@@ -472,6 +496,21 @@ class FileMonitor:
                 files.add(origin)
         return frozenset(files)
 
+    def repo_rel(self, filename: str) -> str | None:
+        """Repo-relative path for a filename, memoized per monitor.
+
+        The hot file-resolution entry point (once per code object start).
+        Only absolute paths are cached; relative ones depend on the cwd.
+        """
+        if not os.path.isabs(filename):
+            return to_repo_rel(filename, self.root)
+        try:
+            return self._rel_cache[filename]
+        except KeyError:
+            rel = to_repo_rel(filename, self.root)
+            self._rel_cache[filename] = rel
+            return rel
+
     def _is_excluded(self, filename: str) -> bool:
         """Whether *filename* lives under one of the excluded roots.
 
@@ -522,7 +561,7 @@ class FileMonitor:
                     and os.path.isfile(spec.origin)
                     and not self._is_excluded(spec.origin)
                 ):
-                    origin = to_repo_rel(spec.origin, self.root)
+                    origin = self.repo_rel(spec.origin)
             except Exception:
                 origin = None
         self._spec_cache[dotted] = origin
