@@ -196,12 +196,12 @@ or keep it explicit with an alias:
 
     git config alias.push-filemon "push origin refs/filemon/*:refs/filemon/*"
 
-Host support: verified against plain and self-hosted git servers (bare
-remotes). On GitHub.com, `refs/notes/*` pushes are known to work while
-reports on fully custom namespaces are mixed; if a host rejects
-`refs/filemon/*`, the push simply fails non-fatally (a note in the run
-summary) and everything stays local — pull-only CI is unaffected either
-way.
+Host support: verified against plain/self-hosted git servers and against
+github.com itself (a `refs/filemon/*` ref pushed, listed via `ls-remote`,
+and fetched back intact). If some host or push-ruleset policy rejects
+custom refs, the push simply fails non-fatally (a note in the run summary)
+and everything stays local — pull-only CI is unaffected either way. This
+repository dogfoods the whole loop in CI (`.github/workflows/ci.yml`).
 
 ### 3. Selection: git diff + collection skipping
 

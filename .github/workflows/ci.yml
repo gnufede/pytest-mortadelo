@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  # Push the filemon shards (refs/filemon/*) back to the remote.  This never
+  # touches branches, and pushes made with GITHUB_TOKEN do not trigger new
+  # workflow runs, so there is no recursion.  (Fork PRs get a read-only token
+  # regardless; the pull-only sync mode below never attempts a push there.)
+  contents: write
+
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: selection diffs the working tree against the
+          # shard's recorded base commit, which a shallow checkout would
+          # not contain (every run would degenerate to a full re-record).
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install
+        run: uv sync
+
+      - name: Run tests (filemon dogfood)
+        env:
+          # Record + push on push events.  On pull_request, consume
+          # read-only instead: the PR checkout is a synthetic merge commit
+          # that main runs cannot resolve as a base, and recording it would
+          # poison the shared shard (forcing one full run back on main).
+          PYTEST_FILEMON_SYNC: ${{ github.event_name == 'push' && '1' || 'pull:origin' }}
+        run: |
+          set +e
+          uv run pytest --filemon -q tests
+          code=$?
+          set -e
+          # Exit 5 = "no tests collected": nothing in this change affects
+          # any test, which is a perfectly green outcome for a TIA run.
+          if [ "$code" -eq 5 ]; then exit 0; fi
+          exit "$code"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync
+      - run: uv run ruff check src tests
