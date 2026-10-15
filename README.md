@@ -127,18 +127,23 @@ file is never collected. If the recorded data is missing/unreadable, or the
 base commit no longer exists (e.g. after a rebase), everything runs.
 
 Performance (sqlalchemy `test/orm`, 11,313 tests, Python 3.13, serial):
-recording costs ~1.55× a plain run (~28s on top of a 52s suite).  The
+recording costs ~1.3× a plain run (~16s on top of a 52s suite).  The
 sys.monitoring floor itself is tiny (~3%, measured with a no-op callback);
 the cost is our per-event Python callback and the first-time analysis of
 each code block, so:
 
-- code objects whose analysis yields no dependencies (stdlib, the venv,
-  pytest internals) are permanently silenced by returning
-  ``sys.monitoring.DISABLE`` -- CPython honors DISABLE even for
-  globally-set events, so out-of-repo code fires essentially once;
-- in-repo code objects keep firing (attribution to the running test is
-  required) but only pay a dict lookup + identity comparison, with deps
-  re-attributed only when the test changes;
+- every code object fires at most *once per test*: after its dependency
+  is attributed to the running test, the callback returns
+  ``sys.monitoring.DISABLE`` (CPython honors it even for globally-set
+  events) and the code object goes silent; when the next test starts,
+  ``sys.monitoring.restart_events()`` re-arms everything in one call.
+  A code block executing a thousand times inside one test thus costs
+  one event instead of a thousand.  Code objects with no dependencies
+  (stdlib, the venv, pytest internals) are silenced for the bucket too
+  and never analyzed again;
+  caveat: ``restart_events()`` clears the per-code monitoring state of
+  *all* tools, so a co-resident sys.monitoring tool (coverage sysmon,
+  a debugger) would see its per-code state reset at every test start;
 - code blocks without any import bytecode (about three quarters) are
   detected with a byte-level pre-check and skip disassembly entirely;
 - a repository module index (one walk, built lazily) resolves import

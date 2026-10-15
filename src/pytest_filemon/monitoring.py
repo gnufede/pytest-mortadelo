@@ -75,6 +75,13 @@ except KeyError:  # pragma: no cover - future bytecode without import ops
 # adaptive array; there we always disassemble.
 _FAST_IMPORT_PRECHECK = sys.version_info >= (3, 13) and _IMPORT_NAME_OP is not None
 
+# Whether the "silence after attribution, re-arm on bucket change" scheme is
+# available: re-arming needs sys.monitoring.restart_events(), which clears the
+# DISABLE state of every code object in one call.  Without it, disabling a code
+# object after attribution would lose its events for all later tests, so the
+# callback keeps the always-firing behavior instead.
+_REARM = _sys_monitoring is not None and hasattr(_sys_monitoring, "restart_events")
+
 
 def _use_tool(tool_id: int, name: str) -> None:
     # Python 3.13 renamed sys.monitoring.use_tool -> use_tool_id.
@@ -234,9 +241,22 @@ class FileMonitor:
 
     def _update_key(self) -> None:
         if self._phase == "test" and self._nodeid is not None:
-            self._key = ("test", self._nodeid)
+            new_key = ("test", self._nodeid)
         else:
-            self._key = (self._phase,)
+            new_key = (self._phase,)
+        if new_key != self._key:
+            self._key = new_key
+            # Attribution bucket changed (the next test started): re-arm
+            # every silenced code object so its dependency is attributed to
+            # the new test on its next start.  Note that restart_events()
+            # clears the per-code state of *all* tools -- acceptable for our
+            # use, but a co-resident sys.monitoring tool (coverage sysmon, a
+            # debugger) would see its per-code state reset as well.
+            if self._active and _REARM:
+                try:
+                    _sys_monitoring.restart_events()
+                except Exception:  # pragma: no cover - defensive
+                    pass
 
     # -- lifecycle -----------------------------------------------------
 
@@ -319,6 +339,12 @@ class FileMonitor:
                 return _sys_monitoring.DISABLE
             self._bucket(deps)
             cell[1] = self._key
+            # Attributed to the current bucket: silence this code object
+            # until the bucket changes (the next test start re-arms everything
+            # via restart_events()).  A code block that runs a thousand times
+            # inside one test now fires exactly once for it.
+            if _REARM:
+                return _sys_monitoring.DISABLE
             return None
         except Exception:  # pragma: no cover - defensive
             return None
@@ -343,7 +369,7 @@ class FileMonitor:
         if deps:
             self._bucket(deps)
             cell[1] = self._key
-            return None
+            return _sys_monitoring.DISABLE if _REARM else None
         # No dependencies ever: silence this code object for good.
         return _sys_monitoring.DISABLE
 
