@@ -1,12 +1,12 @@
 """The pytest plugin: wires the monitor, the git store and selection together.
 
-Lifecycle (``pytest --filemon``):
+Lifecycle (``pytest --less``):
 
 1. ``pytest_load_initial_conftests`` -- activate the sys.monitoring tool as
    early as possible (before any conftest is imported) so import-time
    dependencies are captured.  Options are not parsed yet at this point, so
-   the raw command line / ``PYTEST_FILEMON`` env var are peeked at.
-2. ``pytest_configure`` -- decide whether filemon is enabled, find the git
+   the raw command line / ``PYTEST_LESS`` env var are peeked at.
+2. ``pytest_configure`` -- decide whether less is enabled, find the git
    root, load the shard for this exact pytest command.
 3. ``pytest_collection`` -- monitor switches to the *collect* phase (test
    module imports); afterwards to the *test* phase.
@@ -36,22 +36,22 @@ _ENV_TRUTHY = ("1", "true", "yes")
 
 
 def _env_enabled() -> bool:
-    return os.environ.get("PYTEST_FILEMON", "").strip().lower() in _ENV_TRUTHY
+    return os.environ.get("PYTEST_LESS", "").strip().lower() in _ENV_TRUTHY
 
 
 def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
     """The (remote, mode) to sync shards with, if any.
 
-    ``PYTEST_FILEMON_SYNC`` takes precedence over the ``filemon_sync`` ini
+    ``PYTEST_LESS_SYNC`` takes precedence over the ``less_sync`` ini
     option.  Both accept a remote name (pull *and* push), ``1``/``true``/
     ``yes`` meaning ``origin``, or ``pull:<remote>`` / ``push:<remote>`` for
     one-directional sync.  ``pull:`` is the CI mode: it consumes shards
     with the same read-only credentials the checkout already uses, needing
     no write token at all.
     """
-    value = os.environ.get("PYTEST_FILEMON_SYNC")
+    value = os.environ.get("PYTEST_LESS_SYNC")
     if value is None:
-        value = config.getini("filemon_sync") or ""
+        value = config.getini("less_sync") or ""
     value = value.strip()
     if not value or value.lower() in ("0", "false", "no"):
         return None
@@ -85,28 +85,28 @@ def _selectors_active(config: pytest.Config) -> bool:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    group = parser.getgroup("filemon", "test impact analysis by file monitoring")
+    group = parser.getgroup("less", "test impact analysis by file monitoring")
     group.addoption(
-        "--filemon",
+        "--less",
         action="store_true",
         default=False,
-        help="Enable filemon TIA: record file-level test dependencies and "
+        help="Enable less: record file-level test dependencies and "
         "select only tests affected by changed files (git diff).",
     )
     group.addoption(
-        "--filemon-force",
+        "--less-force",
         action="store_true",
         default=False,
         help="Run all tests but still record dependencies.",
     )
     group.addoption(
-        "--filemon-clean",
+        "--less-clean",
         action="store_true",
         default=False,
         help="Discard the stored dependency data for this command before running.",
     )
     parser.addini(
-        "filemon_sync",
+        "less_sync",
         help="git remote to sync the dependency shard with (e.g. 'origin'): "
         "pulled before selection, pushed after recording",
         default="",
@@ -120,24 +120,24 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_load_initial_conftests(early_config, parser, args):
     # Options are not parsed yet: peek at the raw command line and the env
     # var.  Activating before conftest loading is what makes import-time
-    # dependency tracking complete.  (``--filemon`` coming from ini addopts
+    # dependency tracking complete.  (``--less`` coming from ini addopts
     # instead of the command line is handled by a late activation fallback in
     # pytest_configure.)
-    if "--filemon" in args or _env_enabled():
+    if "--less" in args or _env_enabled():
         root = git_root(Path.cwd())
         if root is not None:
             monitor = FileMonitor(root)
             if monitor.activate():
                 # Stash on the config (the same instance pytest_configure
                 # receives) instead of a module global.
-                early_config._filemon_early_monitor = monitor
+                early_config._less_early_monitor = monitor
     return (yield)
 
 
 # ---------------------------------------------------------------- state
 
 
-class FilemonState:
+class LessState:
     """Per-run state of the plugin, attached to the config object."""
 
     def __init__(self) -> None:
@@ -170,7 +170,7 @@ class FilemonState:
         self.requested = True
         self.root = git_root(config.rootpath)
         if self.root is None:
-            self.notes.append("filemon: not a git repository; running and recording nothing")
+            self.notes.append("less: not a git repository; running and recording nothing")
             self._drop_early_monitor(early_monitor)
             return
 
@@ -179,18 +179,18 @@ class FilemonState:
         else:
             self._drop_early_monitor(early_monitor)
             if early_monitor is None:
-                # Late activation (e.g. --filemon came from ini addopts):
+                # Late activation (e.g. --less came from ini addopts):
                 # root conftest imports already happened unwatched, so add
                 # the conftest files themselves as import-time deps.
                 self.monitor = FileMonitor(self.root)
                 self.monitor.activate()
                 self.notes.append(
-                    "filemon: monitoring activated late; conftest files added "
+                    "less: monitoring activated late; conftest files added "
                     "as import-time dependencies"
                 )
         if self.monitor is None or not self.monitor.active:
             self.notes.append(
-                "filemon: could not register a sys.monitoring tool "
+                "less: could not register a sys.monitoring tool "
                 "(already in use?); running all tests without recording"
             )
             self.monitor = None
@@ -201,17 +201,17 @@ class FilemonState:
         sync = _sync_remote(config)
         if sync is not None:
             self.sync_remote, self.sync_mode = sync
-        if config.option.filemon_clean:
+        if config.option.less_clean:
             self.store.delete()
-            self.notes.append(f"filemon: cleared stored data for ref {self.store.ref}")
+            self.notes.append(f"less: cleared stored data for ref {self.store.ref}")
         elif self.sync_remote and self.sync_mode in ("pull", "both"):
             # Pull before loading the shard: a newer record on the remote is
-            # used for this run's selection.  (Skipped under --filemon-clean,
+            # used for this run's selection.  (Skipped under --less-clean,
             # so "discard" really discards.)
             try:
-                self.notes.append(f"filemon: {self.store.sync_pull(self.sync_remote)}")
+                self.notes.append(f"less: {self.store.sync_pull(self.sync_remote)}")
             except Exception as e:  # never break the run
-                self.notes.append(f"filemon: sync pull failed ({e!r})")
+                self.notes.append(f"less: sync pull failed ({e!r})")
         data, meta = self.store.load()
         self.shard = load_shard(data, meta)
         self.enabled = True
@@ -248,12 +248,12 @@ class FilemonState:
         if not self.enabled or self.store is None or self.shard is None:
             return
         self.selectors_active = _selectors_active(config)
-        if config.option.filemon_force or self.selectors_active:
+        if config.option.less_force or self.selectors_active:
             return
         try:
             changed = self.store.changed_since(self.shard.base_commit)
         except Exception as e:
-            self.notes.append(f"filemon: could not compute changes ({e!r}); running everything")
+            self.notes.append(f"less: could not compute changes ({e!r}); running everything")
             return
         self.changed = changed
         if changed is None:
@@ -321,9 +321,9 @@ class FilemonState:
                 "no usable stored data for this command; running and recording everything",
             )
             return
-        if config.option.filemon_force:
+        if config.option.less_force:
             self.selection = Selection(
-                collected, [], set(), "--filemon-force: running everything"
+                collected, [], set(), "--less-force: running everything"
             )
             return
         if self.selectors_active:
@@ -423,9 +423,9 @@ class FilemonState:
         self.store.save(data, meta)
         if self.sync_remote and self.sync_mode in ("push", "both"):
             try:
-                self.notes.append(f"filemon: {self.store.sync_push(self.sync_remote)}")
+                self.notes.append(f"less: {self.store.sync_push(self.sync_remote)}")
             except Exception as e:  # never break the run
-                self.notes.append(f"filemon: sync push failed ({e!r})")
+                self.notes.append(f"less: sync push failed ({e!r})")
 
 
 # ---------------------------------------------------------------- hooks
@@ -433,11 +433,11 @@ class FilemonState:
 
 def pytest_configure(config: pytest.Config) -> None:
     option = config.option
-    enabled = bool(getattr(option, "filemon", False)) or _env_enabled()
-    early_monitor = getattr(config, "_filemon_early_monitor", None)
-    config._filemon_early_monitor = None
-    state = FilemonState()
-    config._filemon_state = state
+    enabled = bool(getattr(option, "less", False)) or _env_enabled()
+    early_monitor = getattr(config, "_less_early_monitor", None)
+    config._less_early_monitor = None
+    state = LessState()
+    config._less_state = state
     if not enabled:
         if early_monitor is not None:
             early_monitor.deactivate()
@@ -463,7 +463,7 @@ def pytest_collection(session: pytest.Session):
         try:
             state.plan(session.config)
         except Exception as e:  # never break the run
-            state.notes.append(f"filemon: planning failed ({e!r}); running everything")
+            state.notes.append(f"less: planning failed ({e!r}); running everything")
     if state is not None and state.monitor is not None:
         state.monitor.phase = "collect"
     result = yield
@@ -532,21 +532,21 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus) -> None:
         return
     if exitstatus == pytest.ExitCode.INTERRUPTED:
         state.notes.append(
-            "filemon: run interrupted; tests that never finished will be "
+            "less: run interrupted; tests that never finished will be "
             "re-run next time"
         )
     try:
         state.finish(session.config)
     except Exception as e:  # never break the test run
-        state.notes.append(f"filemon: failed to store dependency data: {e!r}")
+        state.notes.append(f"less: failed to store dependency data: {e!r}")
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     state = _state_from(config)
-    early_monitor = getattr(config, "_filemon_early_monitor", None)
+    early_monitor = getattr(config, "_less_early_monitor", None)
     if early_monitor is not None:
         early_monitor.deactivate()
-        config._filemon_early_monitor = None
+        config._less_early_monitor = None
     if state is not None and state.monitor is not None:
         state.monitor.deactivate()
 
@@ -555,7 +555,7 @@ def pytest_report_header(config: pytest.Config):
     state = _state_from(config)
     if state is None or not state.enabled or state.store is None:
         return None
-    return f"filemon: enabled, shard {state.store.shard} ({state.store.ref})"
+    return f"less: enabled, shard {state.store.shard} ({state.store.ref})"
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config: pytest.Config) -> None:
@@ -563,7 +563,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config: pytest.Config)
     if state is None or not state.requested:
         return
     reporter = terminalreporter
-    reporter.write_sep("=", "filemon")
+    reporter.write_sep("=", "less")
     if state.store is not None:
         reporter.write_line(f"shard: {state.store.shard} ({state.store.ref})")
     if state.selection is not None:
@@ -577,5 +577,5 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config: pytest.Config)
         reporter.write_line(note)
 
 
-def _state_from(config: pytest.Config) -> FilemonState | None:
-    return getattr(config, "_filemon_state", None)
+def _state_from(config: pytest.Config) -> LessState | None:
+    return getattr(config, "_less_state", None)

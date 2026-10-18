@@ -202,7 +202,7 @@ class FileMonitor:
     ):
         self.root = Path(root).resolve()
         # Absolute directories whose files are never recorded as dependencies
-        # (e.g. the pytest_filemon package itself, which would otherwise show
+        # (e.g. the pytest_less package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
         self._exclude_roots = tuple(Path(p).resolve() for p in exclude_roots)
         self._exclude_cache: dict[str, bool] = {}
@@ -290,7 +290,7 @@ class FileMonitor:
             return False
         for tool_id in _candidate_tool_ids():
             try:
-                _use_tool(tool_id, "pytest-filemon")
+                _use_tool(tool_id, "pytest-less")
             except ValueError:
                 continue
             self._tool_id = tool_id

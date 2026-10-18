@@ -1,9 +1,9 @@
-# pytest-filemon
+# pytest-less
 
 Minimal file-level **test impact analysis (TIA)** for pytest, inspired by
 pytest-testmon but deliberately different:
 
-| | pytest-testmon | pytest-filemon |
+| | pytest-testmon | pytest-less |
 |---|---|---|
 | dependency storage | sqlite | JSON shards stored in git refs |
 | dependency resolution | code-block / line level | **file paths**, relative to the repo root |
@@ -17,21 +17,21 @@ Requires **Python 3.12+** (for `sys.monitoring`) and a git repository.
 ## Usage
 
 ```bash
-pip install pytest-filemon
+pip install pytest-less
 
-pytest --filemon              # first run: everything runs, dependencies are recorded
-pytest --filemon              # second run: only tests affected by changes run
+pytest --less              # first run: everything runs, dependencies are recorded
+pytest --less              # second run: only tests affected by changes run
 ```
 
 Options:
 
 | option | effect |
 |---|---|
-| `--filemon` | enable recording + selection |
-| `--filemon-force` | run all tests, but still record dependencies |
-| `--filemon-clean` | discard the stored data for this command before running |
-| `PYTEST_FILEMON=1` | same as `--filemon` (env form; also enables before conftest loading) |
-| `-p no:filemon` | disable the plugin entirely |
+| `--less` | enable recording + selection |
+| `--less-force` | run all tests, but still record dependencies |
+| `--less-clean` | discard the stored data for this command before running |
+| `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
+| `-p no:less` | disable the plugin entirely |
 
 If nothing changed and nothing failed, **zero tests run and pytest exits with
 code 5** ("no tests collected"), just like a `pytest -k nomatch` run.
@@ -70,14 +70,14 @@ code is ever recorded. When the plugin itself is installed inside the tested
 repo (its own dev repo), its files are first-party code and are recorded:
 the hooks and monitor callback execute during every test, so any plugin edit
 conservatively re-runs everything. This is what makes the plugin safe to run
-on its own test suite (`uv run pytest --filemon tests`).
+on its own test suite (`uv run pytest --less tests`).
 
 ### 2. Storage: JSON shards in git refs (never a commit)
 
 For every pytest **command** the data is stored in a dedicated ref:
 
 ```
-refs/filemon/<shard>   →  lightweight commit
+refs/less/<shard>   →  lightweight commit
                             ├── data.json   {"version":1, "tests": {nodeid: [files...]}, "failed": [...]}
                             └── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
 ```
@@ -110,14 +110,14 @@ of a full record run) and pushes it after recording:
 ```toml
 # pyproject.toml
 [tool.pytest.ini_options]
-filemon_sync = "origin"     # any git remote name
+less_sync = "origin"     # any git remote name
 ```
 
 or per-invocation, without touching the repo config:
 
 ```bash
-PYTEST_FILEMON_SYNC=1 pytest --filemon -q tests        # '1' means 'origin'
-PYTEST_FILEMON_SYNC=upstream pytest --filemon -q tests # an explicit remote
+PYTEST_LESS_SYNC=1 pytest --less -q tests        # '1' means 'origin'
+PYTEST_LESS_SYNC=upstream pytest --less -q tests # an explicit remote
 ```
 
 Sync is bidirectional by default; `pull:<remote>` / `push:<remote>` select
@@ -129,10 +129,10 @@ Semantics and safety:
   timestamp is kept (local vs. remote, both directions);
 - sync failures are **non-fatal** and only surface as notes in the run
   summary (offline, no remote configured, missing shard, auth refused);
-  pushes force-push the tiny `refs/filemon/<shard>` only — never a branch;
+  pushes force-push the tiny `refs/less/<shard>` only — never a branch;
 - credentials are never prompted (`GIT_TERMINAL_PROMPT=0`) and remote
   operations time out after 30s, so a test run can never hang on them;
-- `--filemon-clean` skips the pull, so "discard" really discards;
+- `--less-clean` skips the pull, so "discard" really discards;
 - the shard key is the *normalized pytest command*: the machine that
   recorded the data must run a command that normalizes to the same shard
   key (same positional paths and selection arguments; presentation flags
@@ -145,7 +145,7 @@ developers push shards with their code (the runs that record the data), CI
 only pulls them — using the same read-only access the checkout already has:
 
 ```bash
-PYTEST_FILEMON_SYNC=pull:origin pytest --filemon -q tests
+PYTEST_LESS_SYNC=pull:origin pytest --less -q tests
 ```
 
 On GitHub Actions, the default token permissions suffice (nothing to
@@ -154,7 +154,7 @@ authenticates `git fetch`):
 
 ```yaml
 # no 'permissions:' block needed
-- run: PYTEST_FILEMON_SYNC=pull:origin pytest --filemon -q tests
+- run: PYTEST_LESS_SYNC=pull:origin pytest --less -q tests
 ```
 
 To also *push* recorded data back from CI (so fresh clones and other
@@ -162,7 +162,7 @@ machines benefit from CI runs), grant the built-in token write access:
 
 ```yaml
 permissions:
-  contents: write   # pushes refs/filemon/* only; never branches
+  contents: write   # pushes refs/less/* only; never branches
 ```
 
 Notes for the push direction: pushes made with `GITHUB_TOKEN` do not
@@ -172,32 +172,32 @@ racing on the same command resolve as latest-record-wins.
 #### Manual sharing (explicit refspecs)
 
 ```bash
-git push  origin 'refs/filemon/*:refs/filemon/*'
-git fetch  origin 'refs/filemon/*:refs/filemon/*'
-git ls-remote origin 'refs/filemon/*'   # what is on the remote?
+git push  origin 'refs/less/*:refs/less/*'
+git fetch  origin 'refs/less/*:refs/less/*'
+git ls-remote origin 'refs/less/*'   # what is on the remote?
 
 # inspect a shard
-git cat-file blob refs/filemon/<shard>:data.json | python -m json.tool
+git cat-file blob refs/less/<shard>:data.json | python -m json.tool
 ```
 
 To make plain `git pull`/`git fetch` transfer shards automatically, add a
 second fetch refspec:
 
-    git config --add remote.origin.fetch '+refs/filemon/*:refs/filemon/*'
+    git config --add remote.origin.fetch '+refs/less/*:refs/less/*'
 
 For push, note that setting `remote.origin.push` *replaces* the default
 branch-pushing behavior (it does not merge with it), so include both
 refspecs:
 
     git config --add remote.origin.push 'refs/heads/*:refs/heads/*'
-    git config --add remote.origin.push 'refs/filemon/*:refs/filemon/*'
+    git config --add remote.origin.push 'refs/less/*:refs/less/*'
 
 or keep it explicit with an alias:
 
-    git config alias.push-filemon "push origin refs/filemon/*:refs/filemon/*"
+    git config alias.push-less "push origin refs/less/*:refs/less/*"
 
 Host support: verified against plain/self-hosted git servers and against
-github.com itself (a `refs/filemon/*` ref pushed, listed via `ls-remote`,
+github.com itself (a `refs/less/*` ref pushed, listed via `ls-remote`,
 and fetched back intact). If some host or push-ruleset policy rejects
 custom refs, the push simply fails non-fatally (a note in the run summary)
 and everything stays local — pull-only CI is unaffected either way. This
@@ -311,10 +311,10 @@ so it needs network-free local git only.
 ## Layout
 
 ```
-src/pytest_filemon/
+src/pytest_less/
 ├── plugin.py      # pytest hooks, lifecycle, options
 ├── monitoring.py  # sys.monitoring tool: PY_START + import bytecode scan
-├── gitstore.py    # JSON shards behind refs/filemon/<shard>
+├── gitstore.py    # JSON shards behind refs/less/<shard>
 ├── selection.py   # shard parsing + test selection
 └── util.py        # path normalization, command shard key
 ```

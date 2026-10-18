@@ -1,20 +1,20 @@
-"""Shard storage in git: dedicated refs under ``refs/filemon/``, never commits.
+"""Shard storage in git: dedicated refs under ``refs/less/``, never commits.
 
 A shard is stored as a lightweight commit whose tree contains two blobs::
 
     data.json  -- {"version": 1, "tests": {nodeid: [dep, ...]}, "failed": [...]}
     meta.json  -- {"version": 1, "shard": ..., "base_commit": ..., "created": ...}
 
-The ref ``refs/filemon/<shard>`` always points at the latest record for that
+The ref ``refs/less/<shard>`` always points at the latest record for that
 pytest command ("latest wins"; overwriting is just an ``update-ref``).  The
 ref never touches the working tree, HEAD, or any branch, and plain
 ``git push``/``git fetch``/``git clone`` do not transfer it.  Sharing is
-either automatic (``filemon_sync`` / ``PYTEST_FILEMON_SYNC``, see the
+either automatic (``less_sync`` / ``PYTEST_LESS_SYNC``, see the
 README: the plugin pulls the shard before selection and pushes it after
 recording) or manual via an explicit refspec::
 
-    git push   origin 'refs/filemon/*:refs/filemon/*'
-    git fetch   origin 'refs/filemon/*:refs/filemon/*'
+    git push   origin 'refs/less/*:refs/less/*'
+    git fetch   origin 'refs/less/*:refs/less/*'
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class GitStore:
     def __init__(self, root: Path, shard: str):
         self.root = Path(root)
         self.shard = shard
-        self.ref = f"refs/filemon/{shard}"
+        self.ref = f"refs/less/{shard}"
 
     def _git(self, *args: str, stdin: str | None = None, extra_env: dict | None = None) -> str:
         env = None
@@ -129,7 +129,7 @@ class GitStore:
             f"100644 blob {meta_blob}\tmeta.json\n"
         )
         tree = self._git("mktree", stdin=tree_input).strip()
-        message = f"pytest-filemon shard {self.shard}"
+        message = f"pytest-less shard {self.shard}"
         try:
             commit = self._git("commit-tree", tree, "-m", message).strip()
         except subprocess.CalledProcessError:
@@ -141,10 +141,10 @@ class GitStore:
                 "-m",
                 message,
                 extra_env={
-                    "GIT_AUTHOR_NAME": "pytest-filemon",
-                    "GIT_AUTHOR_EMAIL": "filemon@invalid",
-                    "GIT_COMMITTER_NAME": "pytest-filemon",
-                    "GIT_COMMITTER_EMAIL": "filemon@invalid",
+                    "GIT_AUTHOR_NAME": "pytest-less",
+                    "GIT_AUTHOR_EMAIL": "less@invalid",
+                    "GIT_COMMITTER_NAME": "pytest-less",
+                    "GIT_COMMITTER_EMAIL": "less@invalid",
                 },
             ).strip()
         self._git("update-ref", self.ref, commit)
@@ -172,14 +172,14 @@ class GitStore:
         (a missing shard, an unreachable remote or a timeout just means no
         sync, and the run continues with whatever is local).
         """
-        scratch = f"refs/filemon-remote/{self.shard}"
+        scratch = f"refs/less-remote/{self.shard}"
         try:
             run_git(
                 self.root,
                 "fetch",
                 "--quiet",
                 remote,
-                f"+refs/filemon/{self.shard}:{scratch}",
+                f"+refs/less/{self.shard}:{scratch}",
                 timeout=_SYNC_TIMEOUT,
                 extra_env=_SYNC_ENV,
             )
@@ -246,7 +246,7 @@ class GitStore:
     def list_shards(self) -> list[str]:
         """All shard keys recorded in this repository."""
         try:
-            out = run_git(self.root, "for-each-ref", "--format=%(refname)", "refs/filemon/")
+            out = run_git(self.root, "for-each-ref", "--format=%(refname)", "refs/less/")
         except subprocess.CalledProcessError:
             return []
         return [line.rsplit("/", 1)[-1] for line in out.splitlines() if line]

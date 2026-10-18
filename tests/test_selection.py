@@ -1,6 +1,6 @@
 from typing import ClassVar
 
-from pytest_filemon.selection import Shard, load_shard, select_tests
+from pytest_less.selection import Shard, load_shard, select_tests
 
 
 def make_shard(**overrides):

@@ -15,10 +15,10 @@ DRIVER = """
 import json, sys
 from pathlib import Path
 
-sys.path.insert(0, sys.argv[4])       # pytest_filemon source tree
+sys.path.insert(0, sys.argv[4])       # pytest_less source tree
 sys.path.insert(0, sys.argv[1])       # "repo" root, for module resolution
 
-from pytest_filemon.monitoring import FileMonitor
+from pytest_less.monitoring import FileMonitor
 
 root = Path(sys.argv[1])
 phase = sys.argv[2]
@@ -167,7 +167,7 @@ from pathlib import Path
 
 sys.path.insert(0, sys.argv[4])
 sys.path.insert(0, sys.argv[1])   # repo root, for module resolution
-from pytest_filemon.monitoring import FileMonitor
+from pytest_less.monitoring import FileMonitor
 
 root = Path(sys.argv[1])
 calls = {"n": 0}
@@ -232,7 +232,7 @@ class TestModuleIndex:
         return root
 
     def test_index_names_and_exclusions(self, tmp_path):
-        from pytest_filemon.monitoring import _build_module_index
+        from pytest_less.monitoring import _build_module_index
 
         root = self._make_repo(tmp_path)
         idx = _build_module_index(root, (root / "secret",))
@@ -250,7 +250,7 @@ class TestModuleIndex:
     def test_spec_origin_resolves_via_index_without_importlib(self, tmp_path, monkeypatch):
         import importlib.util
 
-        from pytest_filemon.monitoring import FileMonitor
+        from pytest_less.monitoring import FileMonitor
 
         root = self._make_repo(tmp_path)
         monkeypatch.setattr(
@@ -281,7 +281,7 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[4])
 sys.path.insert(0, sys.argv[1])   # repo root, for module resolution
 from sys import monitoring as sm
-from pytest_filemon.monitoring import FileMonitor
+from pytest_less.monitoring import FileMonitor
 
 root = Path(sys.argv[1])
 snippet = Path(sys.argv[3])

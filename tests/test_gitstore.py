@@ -3,7 +3,7 @@ import subprocess
 
 import pytest
 
-from pytest_filemon.gitstore import GitStore
+from pytest_less.gitstore import GitStore
 
 
 def git(path, *args, check=True, stdin=None):
@@ -107,12 +107,12 @@ class TestSync:
         # Push: the remote gets exactly our shard ref.
         self._save(store, {"a": ["x"]}, "2024-01-01T00:00:00+00:00")
         assert "pushed to 'origin'" in store.sync_push("origin")
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == [
-            "refs/filemon/shard1"
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split() == [
+            "refs/less/shard1"
         ]
 
         # Fresh machine (no local ref): remote is adopted.
-        git(repo, "update-ref", "-d", "refs/filemon/shard1")
+        git(repo, "update-ref", "-d", "refs/less/shard1")
         assert "pulled a newer shard" in store.sync_pull("origin")
         data, meta = store.load()
         assert data["tests"] == {"a": ["x"]}
@@ -131,7 +131,7 @@ class TestSync:
         assert data["tests"]["a"] == ["x"]
 
         # The scratch namespace used during pulls is always cleaned up.
-        assert git(repo, "for-each-ref", "--format=%(refname)", "refs/filemon-remote/").stdout.strip() == ""
+        assert git(repo, "for-each-ref", "--format=%(refname)", "refs/less-remote/").stdout.strip() == ""
 
     def test_missing_shard_and_failures_are_non_fatal(self, tmp_path):
         repo, _bare = self._repo_pair(tmp_path)
@@ -216,7 +216,7 @@ class TestShardPersistence:
         store.save({"version": 1, "tests": {}, "failed": []}, {"version": 1})
         # HEAD unchanged, no new branch, working tree untouched.
         branches = git(repo, "for-each-ref", "--format=%(refname)").stdout.split()
-        assert "refs/filemon/deadbeef" in branches
+        assert "refs/less/deadbeef" in branches
         assert "refs/heads/deadbeef" not in branches
         assert len([b for b in branches if b.startswith("refs/heads/")]) == 1
 

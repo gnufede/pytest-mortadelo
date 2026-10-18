@@ -23,10 +23,10 @@ def commit(path, message="commit"):
 
 
 def shard_data(path):
-    """The (single) filemon shard stored in the test repo, as a dict."""
+    """The (single) less shard stored in the test repo, as a dict."""
     refs = [
         line
-        for line in git(path, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.splitlines()
+        for line in git(path, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.splitlines()
         if line
     ]
     assert len(refs) == 1, f"expected exactly one shard ref, got {refs}"
@@ -65,16 +65,16 @@ def project(pytester):
     return pytester
 
 
-def run_filemon(pytester, *args):
-    return pytester.runpytest_subprocess("--filemon", *args)
+def run_less(pytester, *args):
+    return pytester.runpytest_subprocess("--less", *args)
 
 
 class TestRecording:
     def test_first_run_records_everything(self, project):
-        result = run_filemon(project, "-q")
+        result = run_less(project, "-q")
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(
-            ["*filemon*", "shard: *", "selected 2/2 tests: no usable stored data*"]
+            ["*less*", "shard: *", "selected 2/2 tests: no usable stored data*"]
         )
 
         data = shard_data(project.path)
@@ -100,8 +100,8 @@ class TestRecording:
             assert "built-in" not in deps
 
     def test_nothing_changed_skips_collection(self, project):
-        run_filemon(project, "-q")
-        result = run_filemon(project, "-q")
+        run_less(project, "-q")
+        result = run_less(project, "-q")
         # Both test modules were skipped at collection time: nothing was even
         # imported, and pytest reports "no tests ran" (exit 5).
         assert result.ret == 5
@@ -120,16 +120,16 @@ class TestRecording:
     def test_disabled_without_flag_records_nothing(self, project):
         result = project.runpytest_subprocess("-q")
         result.assert_outcomes(passed=2)
-        refs = git(project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout
+        refs = git(project.path, "for-each-ref", "--format=%(refname)", "refs/less/").stdout
         assert refs.strip() == ""
 
 
 class TestSelection:
     def test_changed_helper_selects_only_affected_test(self, project):
-        run_filemon(project, "-v")
+        run_less(project, "-v")
         with open(project.path / "tests" / "lib.py", "a") as f:
             f.write("\ndef extra():\n    return 3\n")
-        result = run_filemon(project, "-v")
+        result = run_less(project, "-v")
         # test_a is selected; test_b's module was never even collected.
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(
@@ -137,10 +137,10 @@ class TestSelection:
         )
 
     def test_changed_helper_selects_only_the_scanned_import_test(self, project):
-        run_filemon(project, "-v")
+        run_less(project, "-v")
         with open(project.path / "tests" / "other.py", "a") as f:
             f.write("\ndef extra():\n    return 3\n")
-        result = run_filemon(project, "-v")
+        result = run_less(project, "-v")
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*test_b.py::test_b PASSED*"])
 
@@ -149,8 +149,8 @@ class TestSelection:
         # pytest_ignore_collect: files given as arguments must still be
         # collected, and their deselected tests must not be double-counted
         # in the report.
-        run_filemon(project, "-q", "tests/test_a.py", "tests/test_b.py")
-        result = run_filemon(project, "-q", "tests/test_a.py", "tests/test_b.py")
+        run_less(project, "-q", "tests/test_a.py", "tests/test_b.py")
+        result = run_less(project, "-q", "tests/test_a.py", "tests/test_b.py")
         result.assert_outcomes(deselected=2)
         assert result.ret == 5
         result.stdout.fnmatch_lines(["selected 0/2 tests:*"])
@@ -160,50 +160,50 @@ class TestSelection:
     def test_failed_tests_always_rerun(self, project):
         # Make test_a fail (lib.ping no longer matches the assertion).
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 2\n")
-        result = run_filemon(project, "-v")
+        result = run_less(project, "-v")
         result.assert_outcomes(passed=1, failed=1)
 
         # lib.py is now "unchanged" for a subsequent run, but test_a failed
         # in the recorded run: it must run again, test_b's file must not even
         # be collected.
-        result = run_filemon(project, "-v")
+        result = run_less(project, "-v")
         result.assert_outcomes(failed=1)
         result.stdout.fnmatch_lines(["*test_a.py::test_a FAILED*"])
 
     def test_new_test_files_always_run(self, project):
-        run_filemon(project, "-q")
+        run_less(project, "-q")
         (project.path / "tests" / "test_new.py").write_text("def test_new():\n    assert True\n")
-        result = run_filemon(project, "-q")
+        result = run_less(project, "-q")
         result.assert_outcomes(passed=1)
 
     def test_conftest_change_reruns_everything(self, project):
-        run_filemon(project, "-q")
+        run_less(project, "-q")
         with open(project.path / "tests" / "conftest.py", "a") as f:
             f.write("\nimport pathlib\n")
-        result = run_filemon(project, "-q")
+        result = run_less(project, "-q")
         result.assert_outcomes(passed=2)
 
     def test_shards_are_keyed_by_command(self, project):
         # Record for the "tests" invocation.
-        run_filemon(project, "-q", "tests")
+        run_less(project, "-q", "tests")
         # Same command: everything deselected (collection skipped).
-        result = run_filemon(project, "-q", "tests")
+        result = run_less(project, "-q", "tests")
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
         # A different invocation: no shard for it, so everything runs.
-        result = run_filemon(project, "-q", "tests/test_a.py")
+        result = run_less(project, "-q", "tests/test_a.py")
         result.assert_outcomes(passed=1)
 
 
 class TestOptions:
     def test_force_runs_all(self, project):
-        run_filemon(project, "-q")
-        result = run_filemon(project, "-q", "--filemon-force")
+        run_less(project, "-q")
+        result = run_less(project, "-q", "--less-force")
         result.assert_outcomes(passed=2)
 
     def test_clean_discards_data(self, project):
-        run_filemon(project, "-q")
-        result = run_filemon(project, "-q", "--filemon-clean")
+        run_less(project, "-q")
+        result = run_less(project, "-q", "--less-clean")
         result.assert_outcomes(passed=2)
 
 
@@ -217,9 +217,9 @@ class _FakeConfig:
 
 class TestSyncRemoteParsing:
     def test_parsing(self, monkeypatch):
-        from pytest_filemon.plugin import _sync_remote
+        from pytest_less.plugin import _sync_remote
 
-        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
         assert _sync_remote(_FakeConfig()) is None
         assert _sync_remote(_FakeConfig("0")) is None
         assert _sync_remote(_FakeConfig("false")) is None
@@ -229,39 +229,39 @@ class TestSyncRemoteParsing:
         # a value that merely contains ':' is a remote name, not a mode
         assert _sync_remote(_FakeConfig("weird:name")) == ("weird:name", "both")
 
-        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
+        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
         assert _sync_remote(_FakeConfig("pull:origin")) == ("origin", "both")  # env wins
-        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "pull:origin")
+        monkeypatch.setenv("PYTEST_LESS_SYNC", "pull:origin")
         assert _sync_remote(_FakeConfig("origin")) == ("origin", "pull")
 
 
 class TestSyncEndToEnd:
-    """Onboarding: PYTEST_FILEMON_SYNC / filemon_sync make the plugin itself
+    """Onboarding: PYTEST_LESS_SYNC / less_sync make the plugin itself
     push and pull the shard, no refspecs needed."""
 
     def test_env_sync_records_pushes_and_pulls_back(self, project, monkeypatch):
-        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
         bare = project.path.parent / (project.path.name + "-remote.git")
         bare.mkdir()
         git(bare, "init", "--bare", "-q")
         git(project.path, "remote", "add", "origin", str(bare))
-        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
+        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
 
         # Run 1: records everything and pushes the shard to the remote.
-        result = project.runpytest_subprocess("--filemon", "-q")
+        result = project.runpytest_subprocess("--less", "-q")
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
 
         # Simulate a fresh clone: no local shard.
         for ref in git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
         ).stdout.split():
             git(project.path, "update-ref", "-d", ref)
 
         # Run 2: pulls the remote shard before selection, so instead of a
         # fresh recording run it deselects everything.
-        result = project.runpytest_subprocess("--filemon", "-q")
+        result = project.runpytest_subprocess("--less", "-q")
         assert result.ret == 5
         result.stdout.fnmatch_lines(
             ["*selected 0/2 tests*", "*pulled a newer shard from 'origin'*"]
@@ -270,47 +270,47 @@ class TestSyncEndToEnd:
     def test_ini_option_enables_sync(self, project, monkeypatch):
         # The env var takes precedence over the ini option: make sure a
         # dogfood run of our own suite with sync enabled doesn't leak in.
-        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
         bare = project.path.parent / (project.path.name + "-remote.git")
         bare.mkdir()
         git(bare, "init", "--bare", "-q")
         git(project.path, "remote", "add", "origin", str(bare))
         (project.path / "pyproject.toml").write_text(
-            "[tool.pytest.ini_options]\nfilemon_sync = \"origin\"\n"
+            "[tool.pytest.ini_options]\nless_sync = \"origin\"\n"
         )
-        result = project.runpytest_subprocess("--filemon", "-q")
+        result = project.runpytest_subprocess("--less", "-q")
         result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
 
 
     def test_pull_only_mode_never_pushes(self, project, monkeypatch):
         """The CI topology: consume shards read-only, no write token needed."""
-        monkeypatch.delenv("PYTEST_FILEMON_SYNC", raising=False)
+        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
         bare = project.path.parent / (project.path.name + "-remote.git")
         bare.mkdir()
         git(bare, "init", "--bare", "-q")
         git(project.path, "remote", "add", "origin", str(bare))
 
         # Seed the remote with a full record (a developer's pushed shard).
-        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "1")
-        project.runpytest_subprocess("--filemon", "-q")
-        seeded = git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split()
+        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
+        project.runpytest_subprocess("--less", "-q")
+        seeded = git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
         assert len(seeded) == 1
 
         # Simulate a fresh clone (CI): no local shard.
         for ref in git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
         ).stdout.split():
             git(project.path, "update-ref", "-d", ref)
 
         # Pull-only run: uses the pushed shard, never writes back.
-        monkeypatch.setenv("PYTEST_FILEMON_SYNC", "pull:origin")
-        result = project.runpytest_subprocess("--filemon", "-q")
+        monkeypatch.setenv("PYTEST_LESS_SYNC", "pull:origin")
+        result = project.runpytest_subprocess("--less", "-q")
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*pulled a newer shard from 'origin'*"])
         assert "pushed" not in result.stdout.str()
         # The remote was not touched.
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/filemon/").stdout.split() == seeded
+        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split() == seeded
 
 
 class TestSelfHosting:
@@ -318,18 +318,18 @@ class TestSelfHosting:
     process: per-config state and dynamic sys.monitoring tool ids must keep the
     nested run independent of the outer one (and vice versa)."""
 
-    def test_inprocess_nested_filemon_run(self, project):
+    def test_inprocess_nested_less_run(self, project):
         # In-process (not subprocess): the inner session shares this process
-        # and, when the outer suite is itself run with --filemon, a monitor.
-        result = project.runpytest("--filemon", "-q")
+        # and, when the outer suite is itself run with --less, a monitor.
+        result = project.runpytest("--less", "-q")
         result.assert_outcomes(passed=2)
-        result = project.runpytest("--filemon", "-q")
+        result = project.runpytest("--less", "-q")
         # Nothing changed in the project repo: deselect everything.
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
         # The nested run stored its shard in the project repo, not ours.
         refs = git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
         ).stdout.split()
         assert len(refs) == 1
 
@@ -339,27 +339,27 @@ class TestSelectorsDisableSelection:
 
     def test_explicit_node_id_runs_despite_no_changes(self, project):
         nodeid = "tests/test_a.py::test_a"
-        run_filemon(project, "-q", nodeid)
-        result = run_filemon(project, "-q", nodeid)
+        run_less(project, "-q", nodeid)
+        result = run_less(project, "-q", nodeid)
         # Unaffected by file changes, but explicitly requested: must run.
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*selectors*running everything*"])
 
     def test_k_selector_disables_selection(self, project):
-        run_filemon(project, "-q", "-k", "test_a or test_b")
-        result = run_filemon(project, "-q", "-k", "test_a or test_b")
+        run_less(project, "-q", "-k", "test_a or test_b")
+        result = run_less(project, "-q", "-k", "test_a or test_b")
         # Nothing changed, so without the selector rule both would be
         # deselected; explicitly selected tests must run.
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(["*selectors*running everything*"])
 
     def test_selector_run_still_records(self, project):
-        run_filemon(project, "-q")
-        run_filemon(project, "-q", "-k", "test_a or test_b")
+        run_less(project, "-q")
+        run_less(project, "-q", "-k", "test_a or test_b")
         # The selector run is a different command (different shard), but it
         # still collected and recorded everything it ran.
         refs = git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/filemon/"
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
         ).stdout.split()
         assert len(refs) == 2  # one shard per command
         merged: dict = {}

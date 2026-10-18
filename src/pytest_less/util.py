@@ -125,9 +125,9 @@ def normalize_arg(arg: str, root: Path) -> str:
 
 
 # Arguments that must NOT influence the shard key: the plugin's own flags
-# (so --filemon-force/--filemon-clean update the same shard as a normal run)
+# (so --less-force/--less-clean update the same shard as a normal run)
 # and pytest's volatile --basetemp (unique per pytester run).
-_NON_KEY_FLAGS = {"--filemon", "--filemon-force", "--filemon-clean"}
+_NON_KEY_FLAGS = {"--less", "--less-force", "--less-clean"}
 
 
 # Arguments that never change which tests are collected or executed, only

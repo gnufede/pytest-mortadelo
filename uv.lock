@@ -64,7 +64,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pytest-filemon"
+name = "pytest-less"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
