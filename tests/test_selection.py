@@ -2,8 +2,8 @@
 
 from typing import ClassVar
 
-from pytest_filemon.blocks import MODULE_BLOCK, WILDCARD, parse_blocks
-from pytest_filemon.selection import (
+from pytest_less.blocks import MODULE_BLOCK, WILDCARD, parse_blocks
+from pytest_less.selection import (
     Shard,
     load_shard,
     select_tests,

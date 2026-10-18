@@ -24,7 +24,7 @@ Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
 Non-Python data files are tracked through an optional ``sys.addaudithook``
-subscription on the ``open`` event (enabled with ``--filemon-data-files``):
+subscription on the ``open`` event (enabled with ``--less-data-files``):
 every in-repo file opened while the monitor is active is bucketed like code
 dependencies -- per test during a test, into the shared import-time bucket
 before collection.  Python source and bytecode opens are deliberately *not*
@@ -216,7 +216,7 @@ class FileMonitor:
         self._data_files = data_files
         self._audit_installed = False
         # Absolute directories whose files are never recorded as dependencies
-        # (e.g. the pytest_filemon package itself, which would otherwise show
+        # (e.g. the pytest_less package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
         self._exclude_roots = tuple(Path(p).resolve() for p in exclude_roots)
         self._exclude_cache: dict[str, bool] = {}
@@ -313,7 +313,7 @@ class FileMonitor:
             return False
         for tool_id in _candidate_tool_ids():
             try:
-                _use_tool(tool_id, "pytest-filemon")
+                _use_tool(tool_id, "pytest-less")
             except ValueError:
                 continue
             self._tool_id = tool_id

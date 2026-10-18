@@ -1,5 +1,5 @@
 
-from pytest_filemon.util import command_key, to_repo_rel
+from pytest_less.util import command_key, to_repo_rel
 
 
 class TestToRepoRel:
@@ -120,8 +120,8 @@ class TestCommandKey:
     def test_plugin_and_volatile_flags_excluded(self, tmp_path):
         root = tmp_path
         base = ["tests", "-q"]
-        assert command_key(["--filemon", *base, "--basetemp=/tmp/x1"], root) == command_key(
-            ["--filemon-force", *base, "--basetemp", "/tmp/x2"], root
+        assert command_key(["--less", *base, "--basetemp=/tmp/x1"], root) == command_key(
+            ["--less-force", *base, "--basetemp", "/tmp/x2"], root
         )
         assert command_key(base, root) == command_key(base, root)
 

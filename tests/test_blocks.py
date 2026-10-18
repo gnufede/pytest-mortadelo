@@ -2,7 +2,7 @@
 
 import textwrap
 
-from pytest_filemon.blocks import (
+from pytest_less.blocks import (
     MODULE_BLOCK,
     WILDCARD,
     BlockCache,
