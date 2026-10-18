@@ -18,7 +18,8 @@ runs at import does.
 Dependencies are ``Block`` triples ``(repo-relative file, block id, content
 hash)``.  A ``WILDCARD`` block id means "any change to this file re-runs"
 (the file-level fallback for code objects we cannot map to a block:
-redefined names, dynamically compiled code, unparseable files).
+redefined names, dynamically compiled code, unparseable files, and
+non-Python data files recorded through the ``open`` audit hook).
 
 Compared to pytest-testmon's block analysis: testmon maps *coverage lines*
 to blocks identified by (name, line range); we map the executing *code

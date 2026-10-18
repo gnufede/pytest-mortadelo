@@ -30,6 +30,7 @@ Options:
 | `--filemon` | enable recording + selection |
 | `--filemon-force` | run all tests, but still record dependencies |
 | `--filemon-clean` | discard the stored data for this command before running |
+| `--filemon-data-files` | also record non-Python files opened by tests (audit hook) as file-level deps; ini: `filemon_data_files = true` |
 | `PYTEST_FILEMON=1` | same as `--filemon` (env form; also enables before conftest loading) |
 | `-p no:filemon` | disable the plugin entirely |
 
@@ -71,6 +72,20 @@ repo (its own dev repo), its files are first-party code and are recorded:
 the hooks and monitor callback execute during every test, so any plugin edit
 conservatively re-runs everything. This is what makes the plugin safe to run
 on its own test suite (`uv run pytest --filemon tests`).
+
+**Data files** (opt-in, `--filemon-data-files` / `filemon_data_files`): a
+`sys.addaudithook` subscription on the `open` event records every in-repo
+non-Python file opened while the monitor is active — fixtures, templates,
+profiles, `.proto`/`.dat`/`.sql` assets — bucketed exactly like code
+dependencies (per test during a test, shared import-time bucket before
+collection). They are stored as file-level wildcard deps: any content change
+re-runs the opener(s). Without this flag, editing a data file that only
+tests read selects nothing — a red suite with a green CI. Trade-offs: "opened"
+≠ "depended on" (tests that open files speculatively widen, in the safe
+direction); Python source/bytecode opens are excluded on purpose (they are
+tracked at block precision by `PY_START`, and a wildcard dep on them would
+throw that precision away); `.so` loading via `dlopen` emits no `open` event
+and remains untracked.
 
 ### 2. Storage: JSON shards in git refs (never a commit)
 
@@ -293,6 +308,9 @@ conservative model working as designed.
 - Session-fixture teardowns that run after the last test may be attributed
   to that test.
 - Line-level coverage is intentionally not tracked.
+- Non-Python files are only tracked with `--filemon-data-files` (opt-in);
+  without it, a change to a data file selects nothing. `dlopen`ed `.so`
+  libraries emit no `open` event and are never recorded.
 
 ## Development
 

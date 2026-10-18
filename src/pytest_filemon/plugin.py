@@ -176,12 +176,38 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Discard the stored dependency data for this command before running.",
     )
+    group.addoption(
+        "--filemon-data-files",
+        action="store_true",
+        default=False,
+        help="Also record non-Python files opened during a test (sys audit "
+        "hook on 'open') as file-level dependencies, closing the data-file "
+        "blind spot (fixtures, templates, profiles). Part of the shard key: "
+        "toggling it starts a fresh record run.",
+    )
     parser.addini(
         "filemon_sync",
         help="git remote to sync the dependency shard with (e.g. 'origin'): "
         "pulled before selection, pushed after recording",
         default="",
     )
+    parser.addini(
+        "filemon_data_files",
+        help="like --filemon-data-files: record non-Python files opened by "
+        "tests as file-level dependencies",
+        type="bool",
+        default=False,
+    )
+
+
+def _data_files_enabled(config) -> bool:
+    """Whether data-file tracking is on (ini or parsed CLI option)."""
+    try:
+        if config.getini("filemon_data_files"):
+            return True
+    except Exception:  # pragma: no cover - ini not registered (embedders)
+        pass
+    return bool(getattr(config.option, "filemon_data_files", False))
 
 
 # ---------------------------------------------------------------- early activation
@@ -205,7 +231,12 @@ def pytest_load_initial_conftests(early_config, parser, args):
         else:
             root = git_root(Path.cwd())
             if root is not None:
-                monitor = FileMonitor(root)
+                # Options are not parsed yet: peek the raw flag; the ini is
+                # registered (and readable) at this point.
+                data_files = (
+                    "--filemon-data-files" in args or _data_files_enabled(early_config)
+                )
+                monitor = FileMonitor(root, data_files=data_files)
                 if monitor.activate():
                     # Stash on the config (the same instance
                     # pytest_configure receives) instead of a module global.
@@ -293,7 +324,9 @@ class FilemonState:
                 # and --filemon from ini addopts): root conftest imports
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
-                self.monitor = FileMonitor(self.root)
+                self.monitor = FileMonitor(
+                    self.root, data_files=_data_files_enabled(config)
+                )
                 self.monitor.activate()
                 self.notes.append(
                     "filemon: monitoring activated late; conftest files added "

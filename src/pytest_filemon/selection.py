@@ -4,7 +4,8 @@ A dependency is a ``Block`` triple ``(file, block id, hash)``.  A changed
 file does not automatically affect a test: the file is re-parsed and only
 stale blocks (missing, or with a different content hash) re-run their
 dependents.  A ``WILDCARD`` block id (dynamic code, redefined names, v1
-shards, unparseable files) means "any change to this file re-runs".
+shards, unparseable files, audit-recorded data files) means "any change
+to this file re-runs".
 
 Tests are selected when they have no recorded data, failed in the recorded
 run, depend on a stale block, or (via the shared ``import_deps``) when any

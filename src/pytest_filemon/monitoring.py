@@ -23,6 +23,14 @@ Dependencies are bucketed by execution phase, which the plugin drives:
 Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
+Non-Python data files are tracked through an optional ``sys.addaudithook``
+subscription on the ``open`` event (enabled with ``--filemon-data-files``):
+every in-repo file opened while the monitor is active is bucketed like code
+dependencies -- per test during a test, into the shared import-time bucket
+before collection.  Python source and bytecode opens are deliberately *not*
+recorded here: they are tracked at block precision by PY_START, and a
+file-level wildcard dep on them would throw that precision away.
+
 Performance notes (the hot path runs once per code block start -- millions of
 times per suite; profiling numbers from the sqlalchemy benchmark):
 
@@ -199,9 +207,14 @@ class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
     def __init__(
-        self, root: Path, exclude_roots: tuple[Path, ...] = ()
+        self, root: Path, exclude_roots: tuple[Path, ...] = (),
+        *, data_files: bool = False,
     ):
         self.root = Path(root).resolve()
+        # Whether non-Python files opened by tests are recorded as
+        # file-level dependencies (audit-hook bolt-on; opt-in).
+        self._data_files = data_files
+        self._audit_installed = False
         # Absolute directories whose files are never recorded as dependencies
         # (e.g. the pytest_filemon package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
@@ -317,6 +330,12 @@ class FileMonitor:
             self._release_tool()
             return False
         self._active = True
+        if self._data_files and not self._audit_installed:
+            # Audit hooks cannot be unregistered: install at most once per
+            # monitor instance.  A deactivated monitor's leftover hook
+            # no-ops via the ``_active`` check below.
+            sys.addaudithook(self._on_audit)
+            self._audit_installed = True
         return True
 
     def deactivate(self) -> None:
@@ -342,6 +361,58 @@ class FileMonitor:
             _free_tool(self._tool_id)
         except ValueError:  # pragma: no cover
             pass
+
+    # -- data-file tracking (audit hook) ---------------------------------
+
+    # Repository-relative locations that are never dependencies: VCS
+    # internals and pytest's own cache (the latter is written on every
+    # run and would otherwise pin "the last test that ran" forever).
+    _AUDIT_SKIP_PREFIXES = (".git/", ".pytest_cache/", "__pycache__/")
+
+    def _on_audit(self, event, args) -> None:
+        """``open`` audit hook: record non-Python in-repo files as deps.
+
+        A data file has no code structure, so it is recorded as a
+        file-level wildcard dep ``(rel, "*", "*")``: any content change
+        re-runs the tests (or, outside a test, everything) that opened it.
+        git only reports content changes, so mtime-only churn never
+        reaches selection.
+        """
+        if event != "open" or not self._active or not self._data_files:
+            return
+        try:
+            path = args[0] if args else None
+            if isinstance(path, str):
+                fname = path
+            elif isinstance(path, (bytes, os.PathLike)):
+                try:
+                    fname = os.fspath(path)
+                except TypeError:
+                    return
+                if not isinstance(fname, str):
+                    fname = os.fsdecode(fname)
+            else:
+                return  # int fd or exotic object: no path to record
+            # Reject-first on the suffix: opens in a test run are
+            # overwhelmingly Python source/bytecode, and those are already
+            # tracked at block precision by PY_START -- recording them
+            # here as file-level wildcards would throw that precision
+            # away (every body edit would re-run the test).
+            if fname.endswith((".py", ".pyc", ".pyo")):
+                return
+            rel = self.repo_rel(fname)  # memoized; None outside the repo
+            if rel is None:
+                return
+            if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
+                return
+            if self._exclude_roots and self._is_excluded(fname):
+                return
+            # GIL note: set.add is atomic; bucket attribution under
+            # concurrent threads follows the current test (documented
+            # over/under-attribution caveat, same as the code tracker).
+            self._bucket(((rel, WILDCARD, WILDCARD),))
+        except Exception:
+            pass  # an audit hook must never break the open() it observes
 
     # -- event handling --------------------------------------------------
 
