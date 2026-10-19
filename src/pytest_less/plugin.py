@@ -34,9 +34,10 @@ from .selection import (
     DATA_VERSION,
     Selection,
     Shard,
+    affected_reason,
+    build_context,
     load_shard,
     select_tests,
-    stale_dep,
 )
 from .util import _EXCLUDED_SEGMENTS, command_key, git_root, to_repo_rel
 
@@ -105,7 +106,28 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
         if f.endswith(".py")
         and not _EXCLUDED_SEGMENTS.intersection(Path(f).parts)
     }
+    if candidates and _spawning_possible(meta):
+        # An unrecorded .py file changed and some recorded test may have
+        # spawned a process: the Tier-A subprocess rule could select tests,
+        # and deciding that needs data.json (the spawning list).  Fall to
+        # the slow path instead of guessing from the meta cache.
+        return changed, False, False
     return changed, True, not candidates
+
+
+def _spawning_possible(meta) -> bool:
+    """Whether some recorded test might be subject to the subprocess rule.
+
+    meta mirrors data.json's ``spawning`` key.  Absent (shard from before
+    Tier A) or null (collect-phase spawn / unknown) means "every test
+    spawns" -- conservatively possible.  An empty list (the common case)
+    means no recorded test ever spawned a process: with no spawners the
+    rule cannot fire, and the fast path stays eligible.
+    """
+    spawning = meta.get("spawning")
+    if not isinstance(spawning, list):
+        return True
+    return any(isinstance(n, str) for n in spawning)
 
 
 def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
@@ -185,6 +207,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "blind spot (fixtures, templates, profiles). Part of the shard key: "
         "toggling it starts a fresh record run.",
     )
+    group.addoption(
+        "--less-cosmetic",
+        action="store_true",
+        default=False,
+        help="Ignore docstring-only edits when hashing blocks (comments are "
+        "ignored anyway): prose-only changes select nothing. Off by default "
+        "because code can read __doc__ (Ley 1 escape hatch). Part of the "
+        "shard key: toggling it starts a fresh record run.",
+    )
     parser.addini(
         "less_sync",
         help="git remote to sync the dependency shard with (e.g. 'origin'): "
@@ -198,6 +229,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         type="bool",
         default=False,
     )
+    parser.addini(
+        "less_cosmetic",
+        help="like --less-cosmetic: ignore docstring-only edits when "
+        "hashing blocks (prose, not behavior -- beware code reading __doc__)",
+        type="bool",
+        default=False,
+    )
 
 
 def _data_files_enabled(config) -> bool:
@@ -208,6 +246,16 @@ def _data_files_enabled(config) -> bool:
     except Exception:  # pragma: no cover - ini not registered (embedders)
         pass
     return bool(getattr(config.option, "less_data_files", False))
+
+
+def _cosmetic_enabled(config) -> bool:
+    """Whether the cosmetic (docstring) filter is on (ini or CLI option)."""
+    try:
+        if config.getini("less_cosmetic"):
+            return True
+    except Exception:  # pragma: no cover - ini not registered (embedders)
+        pass
+    return bool(getattr(config.option, "less_cosmetic", False))
 
 
 # ---------------------------------------------------------------- early activation
@@ -231,12 +279,13 @@ def pytest_load_initial_conftests(early_config, parser, args):
         else:
             root = git_root(Path.cwd())
             if root is not None:
-                # Options are not parsed yet: peek the raw flag; the ini is
+                # Options are not parsed yet: peek the raw flags; the ini is
                 # registered (and readable) at this point.
                 data_files = (
                     "--less-data-files" in args or _data_files_enabled(early_config)
                 )
-                monitor = FileMonitor(root, data_files=data_files)
+                cosmetic = "--less-cosmetic" in args or _cosmetic_enabled(early_config)
+                monitor = FileMonitor(root, data_files=data_files, cosmetic=cosmetic)
                 if monitor.activate():
                     # Stash on the config (the same instance
                     # pytest_configure receives) instead of a module global.
@@ -325,7 +374,9 @@ class LessState:
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
                 self.monitor = FileMonitor(
-                    self.root, data_files=_data_files_enabled(config)
+                    self.root,
+                    data_files=_data_files_enabled(config),
+                    cosmetic=_cosmetic_enabled(config),
                 )
                 self.monitor.activate()
                 self.notes.append(
@@ -430,20 +481,26 @@ class LessState:
         if changed is None:
             return
         self.new_maps = self._new_maps(changed)
-        # If any shared import-time dependency went stale, every test runs:
-        # nothing is skippable.
-        if any(stale_dep(b, changed, self.new_maps) for b in self.shard.import_deps):
+        # Widening facts shared with select_tests (same builder, same
+        # predicate -- a test can never run under one and be skipped under
+        # the other).  If a shared import-time dependency went stale, or a
+        # dynamic-marker file widens to *all* tests, nothing is skippable.
+        ctx = build_context(self.shard, changed, self.new_maps)
+        if ctx.import_stale or ctx.dynamic_global:
             return
         # Which files still have at least one test that will run?  A test
-        # runs if it previously failed or any of its recorded blocks went
-        # stale in the changed files.
+        # runs if it previously failed or the shared affected-test predicate
+        # says so (stale block, dynamic widening, subprocess rule).
         file_tests: dict[str, list[str]] = {}
         for nodeid in self.shard.tests:
             file_tests.setdefault(nodeid.split("::")[0], []).append(nodeid)
         for file, nodeids in file_tests.items():
             if any(
                 nodeid in self.shard.failed
-                or any(stale_dep(b, changed, self.new_maps) for b in self.shard.tests[nodeid])
+                or affected_reason(
+                    nodeid, self.shard.tests[nodeid], self.shard, ctx
+                )
+                is not None
                 for nodeid in nodeids
             ):
                 continue
@@ -688,6 +745,27 @@ class LessState:
                 tests.setdefault(nodeid, set())
                 self.failed.add(nodeid)
 
+        # Subprocess marks (Tier A): this run's observations replace old
+        # marks for tests that actually ran (a finished test that spawned
+        # nothing prunes its previous mark); tests that did not run inherit
+        # their previous belief -- unknown history (old shard) conservatively
+        # means "spawns" until the test is observed once.  A collect-phase
+        # spawn collapses the whole list to None = every test spawns; a
+        # later clean record heals it back to a precise set.
+        if monitor.spawn_shared:
+            spawning: set[str] | None = None
+        else:
+            new_spawn = set(monitor.spawn_tests)
+            known = set(old_tests) | set(self.item_map)
+            old_spawn = old_shard.spawning if old_shard is not None else None
+            if old_spawn is None:
+                spawning = new_spawn | (known - self.finished)
+            else:
+                spawning = new_spawn | (old_spawn - self.finished)
+            # Prune marks of tests that no longer exist (deleted tests
+            # would otherwise persist in the list forever).
+            spawning &= set(tests)
+
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
         table: dict[Block, int] = {}
@@ -701,6 +779,7 @@ class LessState:
                 table[block] = i
             return i
 
+        spawn_json = sorted(spawning) if spawning is not None else None
         data = {
             "version": DATA_VERSION,
             "blocks": [list(b) for b in ordered],  # filled below
@@ -710,6 +789,9 @@ class LessState:
             },
             "import_deps": sorted({index(b) for b in import_blocks}),
             "failed": sorted(self.failed),
+            # Tests that spawned a process (None = unknown/shared: all of
+            # them).  Drives the Tier-A subprocess rule at selection.
+            "spawning": spawn_json,
         }
         data["blocks"] = [list(b) for b in ordered]
         dep_files: set[str] = {b[0] for b in import_blocks}
@@ -726,6 +808,10 @@ class LessState:
             "failed": sorted(self.failed),
             "nodeids": sorted(tests),
             "dep_files": sorted(dep_files),
+            # Mirror of data.json's spawning key: lets the fast-path probe
+            # see when the subprocess rule might fire (see
+            # _spawning_possible).
+            "spawning": spawn_json,
         }
         self.store.save(data, meta)
         if self.sync_remote and self.sync_mode in ("push", "both"):

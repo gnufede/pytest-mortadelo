@@ -31,6 +31,16 @@ before collection.  Python source and bytecode opens are deliberately *not*
 recorded here: they are tracked at block precision by PY_START, and a
 file-level wildcard dep on them would throw that precision away.
 
+The same always-installed audit hook records *subprocess boundaries*
+(Tier A of the e2b fix): a process spawned during a test marks that test as
+a spawner, which selection widens to "runs on any unexplained production
+change" (the child may execute code the parent's recording never saw).
+Spawns are only attributed during the collect and test phases: during
+pytest's own startup (phase ``import``) our *own* git subprocesses run --
+attributing those would mark every test a spawner and destroy precision.
+A collect-phase spawn conservatively becomes a shared (all-tests) mark; a
+spawn during the run's teardown (phase ``done``) is ignored.
+
 Performance notes (the hot path runs once per code block start -- millions of
 times per suite; profiling numbers from the sqlalchemy benchmark):
 
@@ -209,6 +219,7 @@ class FileMonitor:
     def __init__(
         self, root: Path, exclude_roots: tuple[Path, ...] = (),
         *, data_files: bool = False,
+        cosmetic: bool = False,
     ):
         self.root = Path(root).resolve()
         # Whether non-Python files opened by tests are recorded as
@@ -231,8 +242,14 @@ class FileMonitor:
         self.import_deps: set[Block] = set()
         self.collect_deps: set[Block] = set()
         self.test_deps: dict[str, set[Block]] = {}
-        # Block analysis (one AST parse per file, lazily).
-        self._blocks = BlockCache(self.root)
+        # Subprocess boundary (Tier A): tests that spawned a process during
+        # their run, plus a shared mark for collect-phase spawns (affects
+        # every test -- same policy as the import-time bucket).
+        self.spawn_tests: set[str] = set()
+        self.spawn_shared = False
+        # Block analysis (one AST parse per file, lazily).  ``cosmetic``
+        # strips docstrings before hashing (--less-cosmetic).
+        self._blocks = BlockCache(self.root, cosmetic=cosmetic)
         # Internals.
         self._active = False
         self._tool_id: int | None = None
@@ -330,10 +347,14 @@ class FileMonitor:
             self._release_tool()
             return False
         self._active = True
-        if self._data_files and not self._audit_installed:
+        if not self._audit_installed:
             # Audit hooks cannot be unregistered: install at most once per
-            # monitor instance.  A deactivated monitor's leftover hook
-            # no-ops via the ``_active`` check below.
+            # monitor instance.  Always installed (not only for
+            # --less-data-files): the subprocess-boundary events (Tier A)
+            # are recorded unconditionally.  Without data-files the hook
+            # rejects ``open`` on a string comparison and returns.
+            # A deactivated monitor's leftover hook no-ops via the
+            # ``_active`` check below.
             sys.addaudithook(self._on_audit)
             self._audit_installed = True
         return True
@@ -369,50 +390,95 @@ class FileMonitor:
     # run and would otherwise pin "the last test that ran" forever).
     _AUDIT_SKIP_PREFIXES = (".git/", ".pytest_cache/", "__pycache__/")
 
-    def _on_audit(self, event, args) -> None:
-        """``open`` audit hook: record non-Python in-repo files as deps.
+    # Audit events that mean "a new process was created or an image
+    # exec'd" (Tier-A subprocess boundary).  Some names may not exist on
+    # every Python version; an event that never fires is harmless -- we
+    # only compare, never register by name.
+    _SPAWN_EVENTS = frozenset(
+        {
+            "subprocess.Popen",
+            "os.system",
+            "os.fork",
+            "os.forkpty",
+            "os.posix_spawn",
+            "os.spawn",
+            "pty.spawn",
+            "os.exec",
+        }
+    )
 
-        A data file has no code structure, so it is recorded as a
-        file-level wildcard dep ``(rel, "*", "*")``: any content change
-        re-runs the tests (or, outside a test, everything) that opened it.
-        git only reports content changes, so mtime-only churn never
-        reaches selection.
+    def _on_audit(self, event, args) -> None:
+        """Single always-installed audit hook: two concerns.
+
+        * ``open`` (only when ``--less-data-files``): record non-Python
+          in-repo files as file-level wildcard deps -- a data file has no
+          code structure, so ``(rel, "*", "*")`` means "any content change
+          re-runs the tests (or, outside a test, everything) that opened
+          it".  git only reports content changes, so mtime-only churn never
+          reaches selection.  The suffix reject-first filter runs before
+          any path resolution: without data-files this branch is one string
+          comparison.
+        * spawn events (always): attribute process creation to the running
+          test / collect phase (see the class docstring for the phase
+          policy and its rationale).
         """
-        if event != "open" or not self._active or not self._data_files:
-            return
-        try:
-            path = args[0] if args else None
-            if isinstance(path, str):
-                fname = path
-            elif isinstance(path, (bytes, os.PathLike)):
-                try:
-                    fname = os.fspath(path)
-                except TypeError:
+        if event == "open":
+            if not self._active or not self._data_files:
+                return
+            try:
+                path = args[0] if args else None
+                if isinstance(path, str):
+                    fname = path
+                elif isinstance(path, (bytes, os.PathLike)):
+                    try:
+                        fname = os.fspath(path)
+                    except TypeError:
+                        return
+                    if not isinstance(fname, str):
+                        fname = os.fsdecode(fname)
+                else:
+                    return  # int fd or exotic object: no path to record
+                # Reject-first on the suffix: opens in a test run are
+                # overwhelmingly Python source/bytecode, and those are already
+                # tracked at block precision by PY_START -- recording them
+                # here as file-level wildcards would throw that precision
+                # away (every body edit would re-run the test).
+                if fname.endswith((".py", ".pyc", ".pyo")):
                     return
-                if not isinstance(fname, str):
-                    fname = os.fsdecode(fname)
-            else:
-                return  # int fd or exotic object: no path to record
-            # Reject-first on the suffix: opens in a test run are
-            # overwhelmingly Python source/bytecode, and those are already
-            # tracked at block precision by PY_START -- recording them
-            # here as file-level wildcards would throw that precision
-            # away (every body edit would re-run the test).
-            if fname.endswith((".py", ".pyc", ".pyo")):
+                rel = self.repo_rel(fname)  # memoized; None outside the repo
+                if rel is None:
+                    return
+                if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
+                    return
+                if self._exclude_roots and self._is_excluded(fname):
+                    return
+                # GIL note: set.add is atomic; bucket attribution under
+                # concurrent threads follows the current test (documented
+                # over/under-attribution caveat, same as the code tracker).
+                self._bucket(((rel, WILDCARD, WILDCARD),))
+            except Exception:
+                pass  # an audit hook must never break the open() it observes
+            return
+        if event in self._SPAWN_EVENTS:
+            if not self._active:
                 return
-            rel = self.repo_rel(fname)  # memoized; None outside the repo
-            if rel is None:
-                return
-            if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
-                return
-            if self._exclude_roots and self._is_excluded(fname):
-                return
-            # GIL note: set.add is atomic; bucket attribution under
-            # concurrent threads follows the current test (documented
-            # over/under-attribution caveat, same as the code tracker).
-            self._bucket(((rel, WILDCARD, WILDCARD),))
-        except Exception:
-            pass  # an audit hook must never break the open() it observes
+            try:
+                if self._phase == "test" and self._nodeid is not None:
+                    # The spawning test must re-run on any unexplained
+                    # production change: its child may execute code this
+                    # recording never saw (Tier A / e2b).
+                    self.spawn_tests.add(self._nodeid)
+                elif self._phase == "collect":
+                    # During test-module import: affects everything loaded
+                    # around it -- conservative shared (all-tests) mark.
+                    self.spawn_shared = True
+                # phase "import": pytest's own startup -- and with it our
+                # own git subprocesses during setup/planning, which must
+                # not mark every test a spawner.  User conftest spawns at
+                # startup are therefore not attributed (documented scope).
+                # phase "done": recording is over.
+            except Exception:
+                pass  # an audit hook must never break the event it observes
 
     # -- event handling --------------------------------------------------
 

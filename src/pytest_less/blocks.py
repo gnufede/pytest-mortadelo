@@ -26,6 +26,12 @@ to blocks identified by (name, line range); we map the executing *code
 object* directly via ``co_qualname`` (precise, immune to code motion) and
 treat the module skeleton explicitly as the import-time dependency of every
 importer.
+
+Two cross-cutting analyses ride along on every parse: *dynamic markers*
+(reflective constructs such as computed ``getattr`` or ``__getattr__``
+definitions, which selection uses to widen marker-bearing files back to
+file level) and the *cosmetic normalization* (``--less-cosmetic``: docstrings
+stripped before hashing, so prose-only edits do not invalidate blocks).
 """
 
 from __future__ import annotations
@@ -45,6 +51,78 @@ Block = tuple[str, str, str]
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
+# Dynamic-access markers (the "dynscan" safety net): call sites and method
+# definitions whose *targets cannot be resolved statically.  A file
+# containing one of these is potentially wired by reflective edges the
+# recorded run may not have seen (unstable dispatch, exec'd code), so
+# selection widens a semantic change in such a file back to file level
+# (see selection.dynamic_widenings).  Format: ``name@Lline``.
+_DYNAMIC_CALLS = frozenset({"eval", "exec", "__import__", "import_module"})
+_DYNAMIC_ATTR_CALLS = frozenset({"getattr", "setattr", "delattr"})
+_DYNAMIC_METHODS = frozenset({"__getattr__", "__getattribute__"})
+
+
+def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
+    """Reflective/dynamic constructs in *tree*, as ``name@Lline`` strings.
+
+    Deliberately ignores *statically resolvable* access: ``getattr(x, "lit")``
+    names its attribute, so it cannot hide an unseen edge; a computed second
+    argument (anything but a string constant) is flagged.  ``__getattr__`` /
+    ``__getattribute__`` definitions are flagged wholesale: every attribute
+    read on the object may dispatch to code no recording saw execute.
+    """
+    markers: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
+                else None
+            )
+            if name in _DYNAMIC_CALLS:
+                markers.add(f"{name}@L{node.lineno}")
+            elif name in _DYNAMIC_ATTR_CALLS:
+                # Second arg a plain string literal: statically resolvable.
+                if len(node.args) >= 2:
+                    arg = node.args[1]
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        continue
+                markers.add(f"{name}@L{node.lineno}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in _DYNAMIC_METHODS:
+                markers.add(f"{node.name}@L{node.lineno}")
+    return tuple(sorted(markers))
+
+
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    """Remove docstrings from every module/class/function in *tree* (in place).
+
+    The cosmetic edit filter (``--less-cosmetic``): a docstring is prose, not
+    behavior -- for code that never reads ``__doc__``.  Only true docstrings
+    (a bare string as the first body statement, the ``ast.get_docstring``
+    definition) are removed; string values elsewhere are behavior and stay.
+    Comments and whitespace are already invisible to ``ast.dump``, so this is
+    the entire textual surface the hash needs to ignore.  Annotations are
+    deliberately *kept*: typing changes are observable.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                rest = body[1:]
+                # A function whose entire body is its docstring still needs
+                # a statement to be valid Python (hashes only, never run).
+                node.body = rest or [ast.Pass()]
+    return tree
+
 
 def _stub_bodies(tree: ast.AST) -> ast.AST:
     """Replace every function/method body in *tree* with a single ``pass``."""
@@ -61,16 +139,21 @@ class FileBlocks:
     maps to the skeleton hash.  ``spans`` is the list of
     ``(first line incl. decorators, last line, qualified name)`` used as the
     fallback for code objects without a resolvable qualname.  ``resolve``
-    maps a code object to its block.
+    maps a code object to its block.  ``markers`` lists the file's dynamic
+    constructs (see :func:`find_dynamic_markers`), empty for ordinary code.
     """
 
-    __slots__ = ("blocks", "spans")
+    __slots__ = ("blocks", "markers", "spans")
 
     def __init__(
-        self, blocks: dict[str, str], spans: list[tuple[int, int, str]]
+        self,
+        blocks: dict[str, str],
+        spans: list[tuple[int, int, str]],
+        markers: tuple[str, ...] = (),
     ) -> None:
         self.blocks = blocks
         self.spans = spans
+        self.markers = markers
 
     def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
         """Map a code object to ``(block id, hash)``; None if unresolvable."""
@@ -91,12 +174,20 @@ class FileBlocks:
         return None
 
 
-def parse_blocks(source: str) -> FileBlocks | None:
-    """Analyze Python source; None if it does not parse."""
+def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
+    """Analyze Python source; None if it does not parse.
+
+    With *cosmetic*, docstrings are stripped from the tree before hashing:
+    a docstring-only edit then produces identical hashes for every block
+    (``--less-cosmetic``; comments are invisible to ``ast.dump`` anyway).
+    """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
+    markers = find_dynamic_markers(tree)
+    if cosmetic:
+        _strip_docstrings(tree)
 
     blocks: dict[str, str] = {}
     spans: list[tuple[int, int, str]] = []
@@ -148,14 +239,15 @@ def parse_blocks(source: str) -> FileBlocks | None:
 
     visit(tree, "", False)
     blocks[MODULE_BLOCK] = _hash(ast.dump(_stub_bodies(tree), include_attributes=False))
-    return FileBlocks(blocks, spans)
+    return FileBlocks(blocks, spans, markers)
 
 
 class BlockCache:
     """Lazily parses repo files into :class:`FileBlocks` (one parse per file)."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, cosmetic: bool = False):
         self.root = root
+        self.cosmetic = cosmetic
         self._cache: dict[str, FileBlocks | None] = {}
 
     def file_blocks(self, rel: str) -> FileBlocks | None:
@@ -167,7 +259,7 @@ class BlockCache:
             except OSError:
                 self._cache[rel] = None
             else:
-                self._cache[rel] = parse_blocks(source)
+                self._cache[rel] = parse_blocks(source, cosmetic=self.cosmetic)
         return self._cache[rel]
 
     def module_dep(self, rel: str) -> Block:

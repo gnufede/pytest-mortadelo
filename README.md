@@ -31,6 +31,7 @@ Options:
 | `--less-force` | run all tests, but still record dependencies |
 | `--less-clean` | discard the stored data for this command before running |
 | `--less-data-files` | also record non-Python files opened by tests (audit hook) as file-level deps; ini: `less_data_files = true` |
+| `--less-cosmetic` | ignore docstring-only edits when hashing blocks (comments already ignored); ini: `less_cosmetic = true` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `-p no:less` | disable the plugin entirely |
 
@@ -87,13 +88,28 @@ tracked at block precision by `PY_START`, and a wildcard dep on them would
 throw that precision away); `.so` loading via `dlopen` emits no `open` event
 and remains untracked.
 
+**Subprocess boundaries (always on):** the same always-installed audit hook
+also watches process-creation events (`subprocess.Popen`, `os.system`,
+`os.fork`, `os.posix_spawn`, `pty.spawn`, ...). A spawn during a test marks
+that test as a *spawner* in the shard (`spawning: [nodeid, ...]`); a spawn
+during collection marks all of them conservatively (`spawning: null`).
+Spawns during pytest's own startup are **not** attributed — our own git
+subprocesses run in that phase, and attributing them would mark every test a
+spawner. At selection, a spawner runs whenever any changed `.py` file is
+stale *or was never recorded*: a test whose child process reads repo code
+has dependencies no parent-side event can see (the classic e2b blind spot:
+edit the child-only `worker.py`, watch the test fail with "0 tests
+selected"). Shards recorded before this feature have no `spawning` key and
+treat every test as a spawner until one record run derives the list.
+Child reads of *data* files remain `--less-data-files` territory.
+
 ### 2. Storage: JSON shards in git refs (never a commit)
 
 For every pytest **command** the data is stored in a dedicated ref:
 
 ```
 refs/less/<shard>   →  lightweight commit
-                            ├── data.json   {"version":1, "tests": {nodeid: [files...]}, "failed": [...]}
+                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "spawning":[...]}
                             └── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
 ```
 
@@ -241,7 +257,28 @@ working tree) ∪ (untracked files)`. A test runs when:
 - it has **no** recorded data (new test, or the previous run never finished
   it — e.g. it was interrupted),
 - it **failed** in the recorded run, or
-- one of its dependencies is in `changed`.
+- one of its dependencies is in `changed` (a *stale block*: the file's
+  current block table no longer has the recorded content hash),
+- one of the **shared import-time** dependencies went stale (that is the
+  whole-suite fan-out for conftest/import-time edits — block-granular:
+  only blocks that actually executed at import time count),
+- a changed file **containing a dynamic marker** (computed `getattr`,
+  `eval`/`exec`, `__getattr__` definitions, ...) also has a stale block:
+  the file is widened to file level and every test that touched it re-runs
+  (reported as `N widened by dynamic markers`) — reflective edges are the
+  one place a recording can disagree with the next run, so this widens on
+  purpose. The staleness gate keeps cosmetic edits from widening, and
+- the test is a **spawner** and some changed `.py` file is stale or was
+  never recorded (the subprocess rule above; reported as `N selected by
+  the subprocess rule`).
+
+Every widening is printed in the run summary — selection never widens
+silently. **Cosmetic edits** (`--less-cosmetic`): block hashes are computed
+from a docstring-stripped AST, so a docstring-only change produces no stale
+block and selects nothing (comments and formatting are ignored regardless;
+annotations are kept — typing changes are observable). Without the flag,
+docstrings are behavior: a prose edit re-runs the tests that executed the
+documented block.
 
 Everything else is deselected — or, when its whole file is unaffected, its
 file is never collected. If the recorded data is missing/unreadable, or the
@@ -300,8 +337,23 @@ conservative model working as designed.
 - **pytest-xdist is not supported.** The monitor is process-global and the
   shard is written once per run; with multiple workers the last writer wins
   and selection happens per worker.
-- Dependencies are **files**, not code blocks; a change to a file a test
-  merely shares with unrelated code re-runs that test (conservative).
+- Dependencies are code blocks; precision is bounded by the block unit — a
+  hot, branchy method fans out to every test that executed *any* part of it
+  (an edit inside one branch re-runs tests exercising another). Deliberate:
+  finer units need line-level recording, which is the storage curve that
+  killed line-level formats (IMPROVEMENTS item 11 has the full analysis).
+- The subprocess rule (Tier A) tracks `.py` only, and only attributes
+  spawns during the collect/test phases — a process spawned by a conftest
+  *at startup* is not tracked (its in-process effects still are, via the
+  import-time bucket), and child reads of data files need
+  `--less-data-files`-adjacent tracking we do not do for children. Tier B
+  (monitor in the child) is the precise version, not built.
+- The dynamic-marker widening only considers changed files with a *stale
+  recorded block*; it cannot widen edits for which no recording exists at
+  all (nothing stale → nothing widened — the causal-closure argument).
+- Docstrings are behavior by default; `--less-cosmetic` opts into ignoring
+  them and is unsafe for `__doc__`-reading code (`help()`, doctest
+  collection, docstring-built registries) — hence opt-in.
 - Thread attribution: code executed by threads spawned by a test is
   attributed to the test running at that moment; tests are assumed to run
   sequentially.
