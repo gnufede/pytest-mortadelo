@@ -21,11 +21,10 @@ hash)``.  A ``WILDCARD`` block id means "any change to this file re-runs"
 redefined names, dynamically compiled code, unparseable files, and
 non-Python data files recorded through the ``open`` audit hook).
 
-Compared to pytest-testmon's block analysis: testmon maps *coverage lines*
-to blocks identified by (name, line range); we map the executing *code
-object* directly via ``co_qualname`` (precise, immune to code motion) and
-treat the module skeleton explicitly as the import-time dependency of every
-importer.
+Blocks are identified by mapping the executing *code object* directly via
+``co_qualname`` (precise, immune to code motion, no coverage-line mapping),
+and we treat the module skeleton explicitly as the import-time dependency
+of every importer.
 
 Two cross-cutting analyses ride along on every parse: *dynamic markers*
 (reflective constructs such as computed ``getattr`` or ``__getattr__``

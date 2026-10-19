@@ -1,16 +1,15 @@
 # pytest-less
 
-Minimal file-level **test impact analysis (TIA)** for pytest, inspired by
-pytest-testmon but deliberately different:
+Minimal **test impact analysis (TIA)** for pytest.
 
-| | pytest-testmon | pytest-less |
-|---|---|---|
-| dependency storage | sqlite | JSON shards stored in git refs |
-| dependency resolution | code-block / line level | **code blocks** (qualified name + AST hash) and module skeletons for imports |
-| coverage collection | coverage.py | a custom `sys.monitoring` tool using **PY_START** events (no per-line tracking) |
-| dynamic imports | — | conservative bytecode scan for import opcodes inside every executed code block |
-| import-time dependencies | — | everything imported before tests start is a dependency of *every* test |
-| change detection | mtime / sqlite / VCS | **git diff** between the recorded base commit and the current working tree |
+| | pytest-less |
+|---|---|
+| dependency storage | JSON shards stored in git refs |
+| dependency resolution | **code blocks** (qualified name + AST hash) and module skeletons for imports |
+| dependency collection | a custom `sys.monitoring` tool using **PY_START** events (no per-line tracking) |
+| dynamic imports | conservative bytecode scan for import opcodes inside every executed code block |
+| import-time dependencies | everything imported before tests start is a dependency of *every* test |
+| change detection | **git diff** between the recorded base commit and the current working tree |
 
 Requires **Python 3.12+** (for `sys.monitoring`) and a git repository.
 
@@ -240,7 +239,7 @@ repository dogfoods the whole loop in CI (`.github/workflows/ci.yml`).
 
 Before collection starts, the changed-file set is computed and test files
 whose recorded tests are **all** unaffected are not even *collected* (their
-modules are never imported) — the same optimization testmon applies via
+modules are never imported) — done via
 ``pytest_ignore_collect``.  This is safe because a test always depends on
 its own module file: any edit (including adding a test) selects the file's
 tests, and a brand-new file has no recorded tests and is always collected.
@@ -249,8 +248,7 @@ pytest exempts command-line paths -- "init paths" -- from
 ``pytest_ignore_collect``.)
 
 When explicit test selectors are in play (``-k``, ``-m``, ``--lf``/``--ff``,
-or a ``file.py::test`` argument), selection is disabled entirely (matching
-testmon's forced ``--testmon-noselect``): an explicitly requested but
+or a ``file.py::test`` argument), selection is disabled entirely: an explicitly requested but
 unaffected test must never be silently skipped.
 
 `changed = (files differing between the shard's base commit and the current

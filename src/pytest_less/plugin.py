@@ -161,8 +161,7 @@ def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
 def _selectors_active(config: pytest.Config) -> bool:
     """Whether test selectors (-k, -m, --lf/--ff, explicit node ids) are in play.
 
-    When they are, selection is disabled entirely (like testmon's forced
-    ``--testmon-noselect``): otherwise an explicitly requested but unaffected
+    When they are, selection is disabled entirely: otherwise an explicitly requested but unaffected
     test would be silently deselected -- or, with collection skipping, its
     file would not even be collected.
     """
@@ -879,7 +878,7 @@ def pytest_collection(session: pytest.Session):
 def pytest_ignore_collect(collection_path, config):
     """Skip collecting test files whose recorded tests are all unaffected.
 
-    testmon-style optimization: unchanged, fully-deselected test modules are
+    Optimization: unchanged, fully-deselected test modules are
     not even imported.  Safe because a test always depends on its own module
     file: any edit (including adding tests) selects the file's tests, and a
     brand-new file has no recorded tests and is always collected.
