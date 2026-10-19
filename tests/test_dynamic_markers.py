@@ -10,7 +10,7 @@ selection time* (no shard format change): a file that both contains a
 dynamic construct *and* has a stale recorded block is widened to file level
 -- every test that touched the file re-runs.  The staleness gate matters:
 it is what keeps the widening from firing on cosmetic edits (a docstring
-change under --less-cosmetic produces no stale block, so Ley 2 never
+change under the (default) cosmetic filter produces no stale block, so Ley 2 never
 punches through Ley 1), and it only opens when some test really did execute
 the changed code -- the case where other, reflective tests may reach it
 through edges the recording never saw.
@@ -97,7 +97,6 @@ def make_shard(tests, import_deps=None) -> Shard:
         tests={nid: set(deps) for nid, deps in tests.items()},
         import_deps=set(import_deps or ()),
         failed=set(),
-        spawning=set(),
     )
 
 
@@ -266,24 +265,21 @@ class TestDynamicE2E:
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
     def test_docstring_edit_in_marker_file_stays_cosmetic(self, dynamic_project):
-        # The interlock: with --less-cosmetic a prose-only edit produces no
-        # stale block, so the widening gate never opens (Ley 2 without
-        # weakening Ley 1).
-        run_less(dynamic_project, "-q", "--less-cosmetic").assert_outcomes(
-            passed=3
-        )
+        # The interlock: with the (default) cosmetic filter a prose-only edit
+        # produces no stale block, so the widening gate never opens (Ley 2
+        # without weakening Ley 1).
+        run_less(dynamic_project, "-q").assert_outcomes(passed=3)
         write_lib(dynamic_project, "old", docstring='"A much better description."')
-        result = run_less(dynamic_project, "-q", "--less-cosmetic")
+        result = run_less(dynamic_project, "-q")
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
     def test_docstring_edit_without_cosmetic_selects_executor(self, dynamic_project):
-        # Documents the conservative default: prose is behavior until
-        # --less-cosmetic says otherwise.  dispatch's hash changed (the
-        # docstring) -> test_use via staleness, and the marker widening
-        # pulls in test_helper's file-mate too.
-        run_less(dynamic_project, "-q").assert_outcomes(passed=3)
+        # With --less-no-cosmetic prose is behavior.  dispatch's hash
+        # changed (the docstring) -> test_use via staleness, and the marker
+        # widening pulls in test_helper's file-mate too.
+        run_less(dynamic_project, "-q", "--less-no-cosmetic").assert_outcomes(passed=3)
         write_lib(dynamic_project, "old", docstring='"A much better description."')
-        result = run_less(dynamic_project, "-q")
+        result = run_less(dynamic_project, "-q", "--less-no-cosmetic")
         result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
         result.assert_outcomes(passed=2)

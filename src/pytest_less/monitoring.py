@@ -31,10 +31,13 @@ before collection.  Python source and bytecode opens are deliberately *not*
 recorded here: they are tracked at block precision by PY_START, and a
 file-level wildcard dep on them would throw that precision away.
 
-The same always-installed audit hook records *subprocess boundaries*
-(Tier A of the e2b fix): a process spawned during a test marks that test as
-a spawner, which selection widens to "runs on any unexplained production
-change" (the child may execute code the parent's recording never saw).
+The same always-installed audit hook records *subprocess boundaries*: a
+process spawned during a test marks that test as a spawner.  Coverage cannot
+follow the child, so collection for that test stops, its dependencies are
+never written, and it re-runs every time.  Code compiled from a string
+(``eval``/``exec``/``compile``) and reflective entry points such as
+``importlib.import_module`` mark the running test *dynamic*: it re-runs when
+a changed ``.py`` file is stale or was never recorded.
 Spawns are only attributed during the collect and test phases: during
 pytest's own startup (phase ``import``) our *own* git subprocesses run --
 attributing those would mark every test a spawner and destroy precision.
@@ -62,7 +65,7 @@ import os
 import sys
 from pathlib import Path
 
-from .blocks import WILDCARD, Block, BlockCache
+from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 try:
@@ -76,6 +79,23 @@ except ImportError:  # pragma: no cover - Python < 3.12
 # dynamic so that several monitors can coexist in one process (e.g. our
 # own plugin running on our own tests via an in-process pytester, where the
 # outer monitor already holds an id).
+# Reflective stdlib entry points: starting one of these in a test means the
+# test reaches code (or files) *by computed name*, which the dependency
+# recording can only follow for what actually ran.  Matched by
+# (qualified name -> file basename) on out-of-repo code objects at their
+# first start; the hit becomes the DYNAMIC_DEP pseudo-dependency.
+_REFLECTIVE_ENTRY_POINTS = {
+    "import_module": ("__init__.py",),  # importlib
+    "reload": ("__init__.py",),  # importlib
+    "spec_from_file_location": ("util.py",),  # importlib.util
+    # runpy/pkgutil may be frozen (co_filename "<frozen runpy>") on 3.13+.
+    "run_module": ("runpy.py", "<frozen runpy>"),
+    "run_path": ("runpy.py", "<frozen runpy>"),
+    "iter_modules": ("pkgutil.py", "<frozen pkgutil>"),
+    "walk_packages": ("pkgutil.py", "<frozen pkgutil>"),
+    "entry_points": ("__init__.py",),  # importlib.metadata
+}
+
 _PREFERRED_TOOL_IDS = (4, 3)
 _ALL_TOOL_IDS = tuple(range(6))
 
@@ -219,11 +239,11 @@ class FileMonitor:
     def __init__(
         self, root: Path, exclude_roots: tuple[Path, ...] = (),
         *, data_files: bool = False,
-        cosmetic: bool = False,
+        cosmetic: bool = True,
     ):
         self.root = Path(root).resolve()
         # Whether non-Python files opened by tests are recorded as
-        # file-level dependencies (audit-hook bolt-on; opt-in).
+        # file-level dependencies (audit-hook bolt-on; on by default).
         self._data_files = data_files
         self._audit_installed = False
         # Absolute directories whose files are never recorded as dependencies
@@ -242,13 +262,17 @@ class FileMonitor:
         self.import_deps: set[Block] = set()
         self.collect_deps: set[Block] = set()
         self.test_deps: dict[str, set[Block]] = {}
-        # Subprocess boundary (Tier A): tests that spawned a process during
+        # Subprocess boundary: tests that spawned a process during
         # their run, plus a shared mark for collect-phase spawns (affects
         # every test -- same policy as the import-time bucket).
         self.spawn_tests: set[str] = set()
         self.spawn_shared = False
+        # Tests that ran code compiled from a string (eval/exec/compile,
+        # generated classes) -- see ``_on_audit``.  Reflective stdlib entry
+        # points are collected through the DYNAMIC_DEP pseudo-dependency.
+        self.dynamic_tests: set[str] = set()
         # Block analysis (one AST parse per file, lazily).  ``cosmetic``
-        # strips docstrings before hashing (--less-cosmetic).
+        # strips docstrings before hashing (on by default).
         self._blocks = BlockCache(self.root, cosmetic=cosmetic)
         # Internals.
         self._active = False
@@ -350,7 +374,7 @@ class FileMonitor:
         if not self._audit_installed:
             # Audit hooks cannot be unregistered: install at most once per
             # monitor instance.  Always installed (not only when
-            # data-file tracking is on): the subprocess-boundary events (Tier A)
+            # data-file tracking is on): the subprocess-boundary events
             # are recorded unconditionally.  Without data-files the hook
             # rejects ``open`` on a string comparison and returns.
             # A deactivated monitor's leftover hook no-ops via the
@@ -391,7 +415,7 @@ class FileMonitor:
     _AUDIT_SKIP_PREFIXES = (".git/", ".pytest_cache/", "__pycache__/")
 
     # Audit events that mean "a new process was created or an image
-    # exec'd" (Tier-A subprocess boundary).  Some names may not exist on
+    # exec'd" (subprocess boundary).  Some names may not exist on
     # every Python version; an event that never fires is harmless -- we
     # only compare, never register by name.
     _SPAWN_EVENTS = frozenset(
@@ -421,6 +445,10 @@ class FileMonitor:
         * spawn events (always): attribute process creation to the running
           test / collect phase (see the class docstring for the phase
           policy and its rationale).
+        * ``compile`` (always, test phase only): code compiled from a string
+          (``eval``/``exec``/``compile``, generated classes) has a
+          ``<...>`` filename and is invisible to the dependency recording --
+          the running test is marked dynamic.
         """
         if event == "open":
             if not self._active or not self._data_files:
@@ -459,14 +487,36 @@ class FileMonitor:
             except Exception:
                 pass  # an audit hook must never break the open() it observes
             return
+        if event == "compile":
+            # ``_busy``: our own block analysis parses source (``ast.parse``
+            # compiles with the filename "<unknown>") from inside a test.
+            if (
+                self._phase == "test"
+                and self._active
+                and not self._busy
+                and self._nodeid is not None
+            ):
+                try:
+                    filename = args[1]
+                    if isinstance(filename, bytes):
+                        filename = os.fsdecode(filename)
+                    if (
+                        isinstance(filename, str)
+                        and filename.startswith("<")
+                        and not filename.startswith("<frozen")
+                    ):
+                        self.dynamic_tests.add(self._nodeid)
+                except Exception:
+                    pass
+            return
         if event in self._SPAWN_EVENTS:
             if not self._active:
                 return
             try:
                 if self._phase == "test" and self._nodeid is not None:
-                    # The spawning test must re-run on any unexplained
-                    # production change: its child may execute code this
-                    # recording never saw (Tier A / e2b).
+                    # Coverage cannot follow a child process: stop recording
+                    # this test (see ``_bucket``) and force it to re-run
+                    # every time -- it is never given dependencies.
                     self.spawn_tests.add(self._nodeid)
                 elif self._phase == "collect":
                     # During test-module import: affects everything loaded
@@ -578,8 +628,12 @@ class FileMonitor:
     def _bucket(self, deps) -> None:
         phase = self._phase
         if phase == "test":
-            if self._nodeid is not None:
-                self.test_deps.setdefault(self._nodeid, set()).update(deps)
+            nodeid = self._nodeid
+            # A test that spawned a process is no longer recorded: its
+            # dependencies would be incomplete, so collection stops and the
+            # recorder drops it (it is simply re-run next time).
+            if nodeid is not None and nodeid not in self.spawn_tests:
+                self.test_deps.setdefault(nodeid, set()).update(deps)
         elif phase == "collect":
             self.collect_deps.update(deps)
         elif phase == "import":
@@ -596,7 +650,15 @@ class FileMonitor:
         if own is None:
             # Code outside the repository cannot import repository modules
             # in any way we care about; skip the (relatively expensive)
-            # scan.
+            # scan.  The one exception: reflective stdlib entry points are
+            # remembered (as a pseudo-dependency) so the test that reached
+            # code by computed name can be marked dynamic.
+            names = _REFLECTIVE_ENTRY_POINTS.get(code.co_qualname)
+            if names is not None and (
+                os.path.basename(code.co_filename) in names
+                or code.co_filename in names
+            ):
+                return frozenset({DYNAMIC_DEP})
             return frozenset()
         deps: set[Block] = set()
         fb = self._blocks.file_blocks(own)

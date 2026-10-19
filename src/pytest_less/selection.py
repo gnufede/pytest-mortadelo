@@ -9,18 +9,27 @@ to this file re-runs".
 
 Tests are selected when they have no recorded data, failed in the recorded
 run, depend on a stale block, or (via the shared ``import_deps``) when any
-import-time dependency of every test went stale.  Three widening rules sit
-on top of that:
+import-time dependency of every test went stale.  Widening rules sit on top
+of that:
 
 * **dynamic markers** -- a changed file that both *contains* reflective
   constructs (computed ``getattr``, ``__getattr__``, ``eval``/``exec``, ...)
   *and* has a stale block is widened back to file level: the recorded run
   may not hold every edge reflective dispatch creates (Ley 1 net).
-* **subprocess spawns (Tier A)** -- a test that spawned a process is
-  selected when any changed ``.py`` file is stale or was never recorded at
-  all: the child may have executed code the parent's recording never saw
-  (the e2b blind spot).  ``spawning is None`` (old shards, or a spawn
-  during collection) conservatively treats every test as a spawner.
+* **subprocess spawns** -- coverage cannot follow a child process, so a
+  test that spawned one is *never given dependencies* and always re-runs
+  (``always`` lists them).  ``spawn_unknown`` (old shards, or a spawn
+  during collection, where the culprit test is unknown) falls back to the
+  weaker rule: every test is selected when a changed ``.py`` file is stale
+  or was never recorded at all.
+* **runtime-dynamic tests** -- tests that ran string-compiled code or went
+  through a reflective entry point (``importlib.import_module``, ...) at
+  test time (``dynamic``) are selected under that same "stale or never
+  recorded .py changed" condition.
+* **docstring readers** -- the cosmetic filter hides docstring-only edits
+  from the block hashes; a changed file whose docstrings differ from the
+  recorded ones still selects the tests that touched it *if* they also ran
+  a file that reads docstrings as data (``doc_readers``).
 * everything else is block-precise; each widening is reported in the run
   summary, never silent.
 """
@@ -48,10 +57,20 @@ class Shard:
     # executed before the first test: conftests, plugins, module-level calls)
     import_deps: set[Block]
     failed: set[str]
-    # Tests observed spawning a process during their run.  None = unknown
-    # (shard recorded before Tier A, or a spawn during collection): every
-    # test is conservatively treated as a spawner.
-    spawning: set[str] | None = None
+    # Tests observed spawning a process during their run: they carry no
+    # dependencies and re-run every time.
+    always: set[str] = field(default_factory=set)
+    # True when the spawners are unknown (shard recorded before this
+    # feature, or a spawn during collection): every test is conservatively
+    # treated as a spawner under the "stale or unrecorded .py" rule.
+    spawn_unknown: bool = False
+    # Tests that ran string-compiled code / reflective entry points.  None =
+    # unknown (old shard): every test is conservatively treated as dynamic.
+    dynamic: set[str] | None = field(default_factory=set)
+    # Per-file docstring hash at record time, and the files that read
+    # docstrings as data (the cosmetic filter's safety net).
+    docs: dict[str, str] = field(default_factory=dict)
+    doc_readers: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -115,14 +134,38 @@ def load_shard(data, meta) -> Shard | None:
         if not isinstance(raw_failed, list):
             return None
         failed = {f for f in raw_failed if isinstance(f, str)}
-        # Tier-A subprocess marks.  Absent (shard recorded before Tier A),
-        # null (a spawn during collection: every test may be affected) or
-        # corrupt -> None: conservatively treat all tests as spawners.
-        # The next record run re-derives the precise list and self-heals.
-        if "spawning" in data and isinstance(data["spawning"], list):
-            spawning: set[str] | None = {s for s in data["spawning"] if isinstance(s, str)}
-        else:
-            spawning = None
+        # Subprocess marks.  ``always``: tests that spawned a process (no
+        # dependencies, re-run every time).  Absent ``always`` (shard from
+        # before this feature) or ``spawn_unknown`` (a spawn during
+        # collection: the culprit is unknown) -> conservatively treat all
+        # tests as spawners.  The next full record run self-heals.
+        raw_always = data.get("always")
+        always = (
+            {a for a in raw_always if isinstance(a, str)}
+            if isinstance(raw_always, list)
+            else set()
+        )
+        spawn_unknown = not isinstance(raw_always, list) or bool(
+            data.get("spawn_unknown")
+        )
+        raw_dynamic = data.get("dynamic")
+        dynamic: set[str] | None = (
+            {d for d in raw_dynamic if isinstance(d, str)}
+            if isinstance(raw_dynamic, list)
+            else None
+        )
+        raw_docs = data.get("docs")
+        docs = (
+            {k: v for k, v in raw_docs.items() if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(raw_docs, dict)
+            else {}
+        )
+        raw_readers = data.get("doc_readers")
+        doc_readers = (
+            {r for r in raw_readers if isinstance(r, str)}
+            if isinstance(raw_readers, list)
+            else set()
+        )
         base_commit = meta.get("base_commit")
         if base_commit is not None and not isinstance(base_commit, str):
             return None
@@ -133,7 +176,11 @@ def load_shard(data, meta) -> Shard | None:
         tests=tests,
         import_deps=import_deps,
         failed=failed,
-        spawning=spawning,
+        always=always,
+        spawn_unknown=spawn_unknown,
+        dynamic=dynamic,
+        docs=docs,
+        doc_readers=doc_readers,
     )
 
 
@@ -171,6 +218,9 @@ class _Context:
     dynamic_files: set[str]  # marker-bearing files with a stale block
     dynamic_global: bool  # ... of which one is in the shared import bucket
     spawn_active: bool  # some changed .py is stale or was never recorded
+    import_files: set[str] = field(default_factory=set)
+    # Changed files whose docstrings differ from the recorded ones.
+    doc_changed: set[str] = field(default_factory=set)
     _memo: dict[Block, bool] = field(default_factory=dict)
 
     def stale(self, dep: Block) -> bool:
@@ -215,7 +265,7 @@ def build_context(
 
     # Dynamic-marker widening: reflective construct + a real (stale) change
     # in the same file.  Cosmetic/format-only changes produce no stale block
-    # and do not widen (interlock with --less-cosmetic).  A marker file
+    # and do not widen (interlock with the cosmetic filter).  A marker file
     # everyone imported widens to *all* tests (file-level semantics: any
     # test could reach code through an edge the recording never saw).
     dynamic_files = {
@@ -227,6 +277,13 @@ def build_context(
     spawn_active = bool(changed_py) and bool(
         (changed_py & stale_files) | (changed_py - recorded)
     )
+    doc_changed = {
+        rel
+        for rel, recorded_hash in shard.docs.items()
+        if rel in changed
+        and (fb := maps.get(rel)) is not None
+        and fb.doc_hash != recorded_hash
+    }
     return _Context(
         changed=changed,
         maps=maps,
@@ -234,6 +291,8 @@ def build_context(
         dynamic_files=dynamic_files,
         dynamic_global=bool(dynamic_files & import_files),
         spawn_active=spawn_active,
+        import_files=import_files,
+        doc_changed=doc_changed,
     )
 
 
@@ -245,14 +304,23 @@ def affected_reason(
     The single predicate shared by collection planning and selection, so a
     test can never run under one and be skipped under the other.
     """
+    if nodeid in shard.always:
+        return "always"
     if ctx.import_stale:
         return "import"
     if any(ctx.stale(b) for b in deps):
         return "stale"
     if ctx.dynamic_global or any(b[0] in ctx.dynamic_files for b in deps):
         return "dynamic"
-    if ctx.spawn_active and (shard.spawning is None or nodeid in shard.spawning):
-        return "spawn"
+    if ctx.spawn_active:
+        if shard.spawn_unknown:
+            return "spawn"
+        if shard.dynamic is None or nodeid in shard.dynamic:
+            return "runtime"
+    if ctx.doc_changed:
+        files = {b[0] for b in deps} | ctx.import_files
+        if files & ctx.doc_changed and files & shard.doc_readers:
+            return "doc"
     return None
 
 
@@ -288,9 +356,14 @@ def select_tests(
     selected: list[str] = []
     deselected: list[str] = []
     n_affected = n_failed = n_new = n_dynamic = n_spawn = 0
+    n_always = n_runtime = n_doc = 0
+    always = shard.always
     for nodeid in collected:
         deps = shard.tests.get(nodeid)
-        if deps is None:
+        if nodeid in always:
+            selected.append(nodeid)
+            n_always += 1
+        elif deps is None:
             selected.append(nodeid)
             n_new += 1
         elif nodeid in shard.failed:
@@ -306,6 +379,10 @@ def select_tests(
                 n_dynamic += 1
             elif why == "spawn":
                 n_spawn += 1
+            elif why == "runtime":
+                n_runtime += 1
+            elif why == "doc":
+                n_doc += 1
             else:
                 n_affected += 1
     base = (shard.base_commit or "?")[:8]
@@ -320,6 +397,12 @@ def select_tests(
             f"; {n_dynamic} widened by dynamic markers in "
             f"{sorted(ctx.dynamic_files)}"
         )
+    if n_always:
+        reason += f"; {n_always} always re-run (spawn subprocesses)"
     if n_spawn:
         reason += f"; {n_spawn} selected by the subprocess rule"
+    if n_runtime:
+        reason += f"; {n_runtime} selected as runtime-dynamic (exec/import_module/...)"
+    if n_doc:
+        reason += f"; {n_doc} selected by docstring readers"
     return Selection(selected, deselected, set(changed), reason)

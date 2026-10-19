@@ -30,7 +30,7 @@ Options:
 | `--less-force` | run all tests, but still record dependencies |
 | `--less-clean` | discard the stored data for this command before running |
 | `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
-| `--less-cosmetic` | ignore docstring-only edits when hashing blocks (comments already ignored); ini: `less_cosmetic = true` |
+| `--less-no-cosmetic` | hash docstrings as behavior (by default comments *and* docstrings are ignored); ini: `less_cosmetic = false`; automatically off under `--doctest-modules` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `-p no:less` | disable the plugin entirely |
 
@@ -90,17 +90,35 @@ and remains untracked.
 
 **Subprocess boundaries (always on):** the same always-installed audit hook
 also watches process-creation events (`subprocess.Popen`, `os.system`,
-`os.fork`, `os.posix_spawn`, `pty.spawn`, ...). A spawn during a test marks
-that test as a *spawner* in the shard (`spawning: [nodeid, ...]`); a spawn
-during collection marks all of them conservatively (`spawning: null`).
-Spawns during pytest's own startup are **not** attributed — our own git
-subprocesses run in that phase, and attributing them would mark every test a
-spawner. At selection, a spawner runs whenever any changed `.py` file is
-stale *or was never recorded*: a test whose child process reads repo code
-has dependencies no parent-side event can see (the classic e2b blind spot:
-edit the child-only `worker.py`, watch the test fail with "0 tests
-selected"). Shards recorded before this feature have no `spawning` key and
-treat every test as a spawner until one record run derives the list.
+`os.fork`, `os.posix_spawn`, `pty.spawn`, ...). Coverage cannot follow a
+child process, so when a test spawns one the monitor **stops collecting for
+that test, writes no dependencies for it, and lists it in the shard's
+`always` key: it re-runs every time** (reported as `N always re-run (spawn
+subprocesses)`; a recorded spawner also rules out the no-change fast path).
+The classic e2b blind spot — edit the child-only `worker.py`, watch the test
+fail with "0 tests selected" — cannot happen. A test that stops spawning is
+recorded normally again on its next run. A spawn during *collection* has an
+unknown culprit: the shard is flagged `spawn_unknown` and falls back to the
+weaker rule (every test runs when a changed `.py` file is stale or was never
+recorded). Shards recorded before this feature behave the same until a full
+record run heals them. Spawns during pytest's own startup are **not**
+attributed — our own git subprocesses run in that phase, and attributing them
+would mark every test a spawner.
+**Reflection and dynamic code (always on):** whatever `getattr`/`setattr`/
+`import_module` *reaches* still executes, so `PY_START` records it. What a
+recording cannot know is what a **computed name** would reach next time. Two
+runtime signals mark a test *dynamic*: code compiled from a string
+(`eval`/`exec`/`compile`, generated classes — audit event `compile` with a
+`<...>` filename) and reflective entry points (`importlib.import_module`,
+`importlib.reload`, `runpy.run_*`, `pkgutil.walk_packages`/`iter_modules`,
+`importlib.util.spec_from_file_location`, `importlib.metadata.entry_points`).
+Both are only attributed during a test (module-level `namedtuple`/dataclass at
+import time reaches no unseen edge). A dynamic test keeps its precise
+dependencies, and is *also* selected whenever a changed `.py` file is stale or
+was never recorded (reported as `N selected as runtime-dynamic`). The static
+markers (below) still cover the constructs with no runtime signal
+(`getattr`/`setattr` with computed names, `__getattr__`).
+
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
 
@@ -110,7 +128,7 @@ For every pytest **command** the data is stored in a dedicated ref:
 
 ```
 refs/less/<shard>   →  lightweight commit
-                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "spawning":[...]}
+                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "docs":{file:hash}, "doc_readers":[...]}
                             └── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
 ```
 
@@ -268,92 +286,49 @@ working tree) ∪ (untracked files)`. A test runs when:
   (reported as `N widened by dynamic markers`) — reflective edges are the
   one place a recording can disagree with the next run, so this widens on
   purpose. The staleness gate keeps cosmetic edits from widening, and
-- the test is a **spawner** and some changed `.py` file is stale or was
-  never recorded (the subprocess rule above; reported as `N selected by
-  the subprocess rule`).
+- the test is a **spawner** (`always`): it runs every time (`N always re-run`);
+  under `spawn_unknown`, every test runs when a changed `.py` file is stale
+  or was never recorded (`N selected by the subprocess rule`),
+- the test is **runtime-dynamic** and some changed `.py` file is stale or
+  was never recorded (`N selected as runtime-dynamic`), or
+- the test ran a **docstring reader** and a file it touched has changed
+  docstrings (`N selected by docstring readers`, see cosmetic edits below).
 
 Every widening is printed in the run summary — selection never widens
-silently. **Cosmetic edits** (`--less-cosmetic`): block hashes are computed
-from a docstring-stripped AST, so a docstring-only change produces no stale
-block and selects nothing (comments and formatting are ignored regardless;
-annotations are kept — typing changes are observable). Without the flag,
-docstrings are behavior: a prose edit re-runs the tests that executed the
-documented block.
+silently. **Cosmetic edits** (on by default): block hashes are computed from a
+docstring-stripped AST, so a comment or docstring-only change produces no
+stale block and selects nothing (comments and formatting are invisible to the
+AST regardless; annotations are kept — typing changes are observable).
+Docstrings are only *prose* for code that never reads them, so each shard also
+records a per-file docstring hash and the files that read docstrings as data
+(`__doc__`, `getdoc`, `cleandoc`, `doctest`, `pydoc`, `help`): a docstring-only
+edit still re-runs the tests that touched the changed file **and** ran a
+docstring reader. The filter turns itself off under `--doctest-modules` /
+`--doctest-glob` (docstrings are test input); `--less-no-cosmetic` /
+`less_cosmetic = false` opts out manually.
 
-Everything else is deselected — or, when its whole file is unaffected, its
-file is never collected. If the recorded data is missing/unreadable, or the
-base commit no longer exists (e.g. after a rebase), everything runs.
-
-Performance (sqlalchemy `test/orm`, 11,313 tests, Python 3.13, serial):
-recording costs ~1.3× a plain run (~16s on top of a 52s suite).  The
-sys.monitoring floor itself is tiny (~3%, measured with a no-op callback);
-the cost is our per-event Python callback and the first-time analysis of
-each code block, so:
-
-- every code object fires at most *once per test*: after its dependency
-  is attributed to the running test, the callback returns
-  ``sys.monitoring.DISABLE`` (CPython honors it even for globally-set
-  events) and the code object goes silent; when the next test starts,
-  ``sys.monitoring.restart_events()`` re-arms everything in one call.
-  A code block executing a thousand times inside one test thus costs
-  one event instead of a thousand.  Code objects with no dependencies
-  (stdlib, the venv, pytest internals) are silenced for the bucket too
-  and never analyzed again;
-  caveat: ``restart_events()`` clears the per-code monitoring state of
-  *all* tools, so a co-resident sys.monitoring tool (coverage sysmon,
-  a debugger) would see its per-code state reset at every test start;
-- code blocks without any import bytecode (about three quarters) are
-  detected with a byte-level pre-check and skip disassembly entirely;
-- a repository module index (one walk, built lazily) resolves import
-  names to files without calling ``find_spec`` -- which not only avoids
-  hundreds of microseconds per resolution but also removes its side
-  effect of importing parent packages.  That side effect previously cost
-  real correctness: module trees first imported *inside* our resolution
-  had their one-time PY_START events swallowed, silently dropping
-  dependencies (on sqlalchemy, whole ``orm`` submodules went unrecorded).
-  Resolving from the index imports nothing, so import-time dependency
-  tracking is now complete.  The index over-approximates importability,
-  which is safe in the conservative direction: a scan-resolved dep can
-  only ever be an *extra* dep, because an import that actually executes
-  is always captured directly by the imported module's own PY_START;
-- file→repo-relative-path resolution (LRU cache), exclusion checks, and
-  per-(module, level, file) import resolutions are each computed once
-  and memoized.
-
-A no-change rerun takes ~0.5s: an early hook probe decides from
-meta.json (the recorded node ids, failures, and the dependency file
-universe) that nothing can be stale, so the monitor is never armed,
-the dependency blob is never read, and recorded test modules are not
-even imported. Editing a test file re-runs only that file's affected
-tests.
-Note that in packages with an eager ``__init__`` (sqlalchemy's
-``sqlalchemy.orm`` imports most of the package at import time), every
-eagerly imported module is legitimately an import-time dependency of
-every test: changing those files re-runs everything.  That is the
-conservative model working as designed.
-
-## Limitations (by design)
-
-- **pytest-xdist is not supported.** The monitor is process-global and the
-  shard is written once per run; with multiple workers the last writer wins
-  and selection happens per worker.
 - Dependencies are code blocks; precision is bounded by the block unit — a
   hot, branchy method fans out to every test that executed *any* part of it
   (an edit inside one branch re-runs tests exercising another). Deliberate:
   finer units need line-level recording, which is the storage curve that
   killed line-level formats (IMPROVEMENTS item 11 has the full analysis).
-- The subprocess rule (Tier A) tracks `.py` only, and only attributes
-  spawns during the collect/test phases — a process spawned by a conftest
-  *at startup* is not tracked (its in-process effects still are, via the
-  import-time bucket), and child reads of data files are not
-  tracked (data-file tracking covers the pytest process only). Tier B
-  (monitor in the child) is the precise version, not built.
+- Spawners always re-run — the price of fail-safe: a suite whose tests
+  shell out heavily (this repo's own pytester tests: ~half the suite) gets
+  little skipping from them. Spawns made by a conftest *at startup* are not
+  tracked (their in-process effects still are, via the import-time bucket),
+  and child reads of data files are not tracked (data-file tracking covers
+  the pytest process only). Monitoring inside the child would be the
+  precise version; it is not built.
 - The dynamic-marker widening only considers changed files with a *stale
   recorded block*; it cannot widen edits for which no recording exists at
   all (nothing stale → nothing widened — the causal-closure argument).
-- Docstrings are behavior by default; `--less-cosmetic` opts into ignoring
-  them and is unsafe for `__doc__`-reading code (`help()`, doctest
-  collection, docstring-built registries) — hence opt-in.
+- The cosmetic filter's docstring-reader net is static and file-level: a
+  library that reads docstrings on your behalf (e.g. a CLI framework building
+  help text from `__doc__`) is invisible to it — opt out with
+  `--less-no-cosmetic` if your tests depend on that.
+- Reflection with no runtime signal (`getattr`/`setattr` with a computed
+  name, `__getattr__`) is only covered by the static markers: a stale block in
+  a marker-bearing file widens to the whole file.
 - Thread attribution: code executed by threads spawned by a test is
   attributed to the test running at that moment; tests are assumed to run
   sequentially.

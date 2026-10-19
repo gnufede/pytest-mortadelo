@@ -29,8 +29,11 @@ of every importer.
 Two cross-cutting analyses ride along on every parse: *dynamic markers*
 (reflective constructs such as computed ``getattr`` or ``__getattr__``
 definitions, which selection uses to widen marker-bearing files back to
-file level) and the *cosmetic normalization* (``--less-cosmetic``: docstrings
-stripped before hashing, so prose-only edits do not invalidate blocks).
+file level) and the *cosmetic normalization* (on by default: docstrings
+stripped before hashing, so prose-only edits do not invalidate blocks; comments
+are invisible to the AST anyway).  A per-file docstring hash plus a
+"reads docstrings" flag back it with a safety net for code that treats
+``__doc__`` as data.
 """
 
 from __future__ import annotations
@@ -45,6 +48,12 @@ WILDCARD = "*"
 
 # A dependency: (repo-relative file, block id, content hash).
 Block = tuple[str, str, str]
+
+# Pseudo-dependency emitted when a *reflective stdlib entry point* starts
+# executing in a test (``importlib.import_module``, ``runpy.run_module``,
+# ``pkgutil.walk_packages``, ...).  It never reaches a shard: the recorder
+# turns it into the test's "dynamic" mark and strips it.
+DYNAMIC_DEP: Block = ("<dynamic>", "runtime", "*")
 
 
 def _hash(text: str) -> str:
@@ -96,11 +105,54 @@ def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
     return tuple(sorted(markers))
 
 
+# Docstring readers: code that treats a docstring as *data* (help text,
+# doctest, registries built from ``__doc__``).  With the cosmetic filter on,
+# a docstring-only edit is invisible to the block hashes; tests that executed
+# a file containing one of these references are re-run anyway.
+_DOC_ATTRS = frozenset({"__doc__", "getdoc", "cleandoc", "getcomments"})
+_DOC_MODULES = frozenset({"doctest", "pydoc"})
+
+
+def find_doc_readers(tree: ast.AST) -> bool:
+    """Whether *tree* references docstrings as data (see ``_DOC_ATTRS``)."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _DOC_ATTRS:
+            return True
+        if isinstance(node, ast.Name) and (
+            node.id in _DOC_ATTRS or node.id == "help"
+        ):
+            return True
+        if isinstance(node, ast.Import):
+            if any(a.name.split(".")[0] in _DOC_MODULES for a in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _DOC_MODULES:
+                return True
+            if any(a.name in _DOC_ATTRS for a in node.names):
+                return True
+    return False
+
+
+def docstrings_hash(tree: ast.AST) -> str:
+    """Hash of every docstring in *tree* (before any stripping)."""
+    docs = [
+        ast.get_docstring(node, clean=False)
+        for node in ast.walk(tree)
+        if isinstance(
+            node,
+            (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+        )
+    ]
+    return _hash(repr(docs))
+
+
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
     """Remove docstrings from every module/class/function in *tree* (in place).
 
-    The cosmetic edit filter (``--less-cosmetic``): a docstring is prose, not
-    behavior -- for code that never reads ``__doc__``.  Only true docstrings
+    The cosmetic edit filter (on by default): a docstring is prose, not
+    behavior -- for code that never reads ``__doc__`` (files that do are
+    flagged by :func:`find_doc_readers` and keep their docstring edits
+    selecting).  Only true docstrings
     (a bare string as the first body statement, the ``ast.get_docstring``
     definition) are removed; string values elsewhere are behavior and stay.
     Comments and whitespace are already invisible to ``ast.dump``, so this is
@@ -142,17 +194,23 @@ class FileBlocks:
     constructs (see :func:`find_dynamic_markers`), empty for ordinary code.
     """
 
-    __slots__ = ("blocks", "markers", "spans")
+    __slots__ = ("blocks", "doc_hash", "markers", "reads_docs", "spans")
 
     def __init__(
         self,
         blocks: dict[str, str],
         spans: list[tuple[int, int, str]],
         markers: tuple[str, ...] = (),
+        doc_hash: str = "",
+        reads_docs: bool = False,
     ) -> None:
         self.blocks = blocks
         self.spans = spans
         self.markers = markers
+        # Hash of all docstrings of the file, and whether the file reads
+        # docstrings as data: the safety net of the cosmetic filter.
+        self.doc_hash = doc_hash
+        self.reads_docs = reads_docs
 
     def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
         """Map a code object to ``(block id, hash)``; None if unresolvable."""
@@ -178,13 +236,15 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
 
     With *cosmetic*, docstrings are stripped from the tree before hashing:
     a docstring-only edit then produces identical hashes for every block
-    (``--less-cosmetic``; comments are invisible to ``ast.dump`` anyway).
+    (comments are invisible to ``ast.dump`` anyway).
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
     markers = find_dynamic_markers(tree)
+    reads_docs = find_doc_readers(tree)
+    doc_hash = docstrings_hash(tree)
     if cosmetic:
         _strip_docstrings(tree)
 
@@ -238,7 +298,7 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
 
     visit(tree, "", False)
     blocks[MODULE_BLOCK] = _hash(ast.dump(_stub_bodies(tree), include_attributes=False))
-    return FileBlocks(blocks, spans, markers)
+    return FileBlocks(blocks, spans, markers, doc_hash, reads_docs)
 
 
 class BlockCache:

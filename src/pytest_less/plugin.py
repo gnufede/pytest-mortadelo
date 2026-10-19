@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from .blocks import Block
+from .blocks import DYNAMIC_DEP, Block
 from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import (
@@ -99,6 +99,10 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
         f for f in meta["dep_files"] if isinstance(f, str)
     }:
         return changed, False, False
+    if _always_rerun(meta):
+        # Tests that spawned a process carry no dependencies and must run
+        # every time: there is no "nothing to do" shortcut.
+        return changed, False, False
     dep_files = {f for f in meta["dep_files"] if isinstance(f, str)}
     candidates = {
         f
@@ -106,28 +110,41 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
         if f.endswith(".py")
         and not _EXCLUDED_SEGMENTS.intersection(Path(f).parts)
     }
-    if candidates and _spawning_possible(meta):
-        # An unrecorded .py file changed and some recorded test may have
-        # spawned a process: the Tier-A subprocess rule could select tests,
-        # and deciding that needs data.json (the spawning list).  Fall to
+    if candidates and (_spawning_possible(meta) or _dynamic_possible(meta)):
+        # An unrecorded .py file changed and the subprocess / runtime-dynamic
+        # rules could select tests: deciding that needs data.json.  Fall to
         # the slow path instead of guessing from the meta cache.
         return changed, False, False
     return changed, True, not candidates
 
 
-def _spawning_possible(meta) -> bool:
-    """Whether some recorded test might be subject to the subprocess rule.
+def _always_rerun(meta) -> bool:
+    """Whether some recorded test must run every time (it spawned a process)."""
+    always = meta.get("always")
+    return isinstance(always, list) and any(isinstance(n, str) for n in always)
 
-    meta mirrors data.json's ``spawning`` key.  Absent (shard from before
-    Tier A) or null (collect-phase spawn / unknown) means "every test
-    spawns" -- conservatively possible.  An empty list (the common case)
-    means no recorded test ever spawned a process: with no spawners the
-    rule cannot fire, and the fast path stays eligible.
+
+def _spawning_possible(meta) -> bool:
+    """Whether the weak subprocess rule (unknown spawners) might fire.
+
+    meta mirrors data.json's ``always`` / ``spawn_unknown`` keys.  A shard
+    from before this feature (no ``always``) or one with ``spawn_unknown``
+    set means "every test may spawn" -- conservatively possible.
     """
-    spawning = meta.get("spawning")
-    if not isinstance(spawning, list):
+    return not isinstance(meta.get("always"), list) or bool(meta.get("spawn_unknown"))
+
+
+def _dynamic_possible(meta) -> bool:
+    """Whether the runtime-dynamic rule might fire for some recorded test.
+
+    Absent ``dynamic`` (old shard) means unknown -> possible; an empty list
+    (the common case) means no recorded test ran string-compiled or
+    reflective code, so the fast path stays eligible.
+    """
+    dynamic = meta.get("dynamic")
+    if not isinstance(dynamic, list):
         return True
-    return any(isinstance(n, str) for n in spawning)
+    return any(isinstance(n, str) for n in dynamic)
 
 
 def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
@@ -207,13 +224,15 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "starts a fresh record run.",
     )
     group.addoption(
-        "--less-cosmetic",
+        "--less-no-cosmetic",
         action="store_true",
         default=False,
-        help="Ignore docstring-only edits when hashing blocks (comments are "
-        "ignored anyway): prose-only changes select nothing. Off by default "
-        "because code can read __doc__ (Ley 1 escape hatch). Part of the "
-        "shard key: toggling it starts a fresh record run.",
+        help="Hash docstrings as behavior. By default only code matters: "
+        "comments (invisible to the AST) and docstrings are ignored, so "
+        "prose-only edits select nothing -- except for tests that ran code "
+        "reading docstrings as data (__doc__, getdoc, doctest, help). "
+        "Automatically off under --doctest-modules/--doctest-glob. Part of "
+        "the shard key: toggling it starts a fresh record run.",
     )
     parser.addini(
         "less_sync",
@@ -230,10 +249,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "less_cosmetic",
-        help="like --less-cosmetic: ignore docstring-only edits when "
-        "hashing blocks (prose, not behavior -- beware code reading __doc__)",
+        help="set to false to hash docstrings as behavior (on by default: "
+        "docstring-only edits select nothing, except for tests that ran "
+        "docstring-reading code)",
         type="bool",
-        default=False,
+        default=True,
     )
 
 
@@ -255,14 +275,36 @@ def _data_files_enabled(config) -> bool:
     return True
 
 
-def _cosmetic_enabled(config) -> bool:
-    """Whether the cosmetic (docstring) filter is on (ini or CLI option)."""
+def _doctest_args(args) -> bool:
+    """Whether the raw command line collects doctests (docstrings are tests)."""
+    return any(
+        a == "--doctest-modules" or a.startswith("--doctest-glob") for a in args
+    )
+
+
+def _cosmetic_enabled(config, args=()) -> bool:
+    """Whether the cosmetic (docstring) filter is on.
+
+    On by default (an opt-out feature): disable with --less-no-cosmetic or
+    `less_cosmetic = false`.  Docstrings are test input under pytest's
+    doctest collection, so the filter is also off then.  Like
+    :func:`_data_files_enabled`, this is called before options are parsed
+    (raw *args* are peeked by the early hook) and again after.
+    """
+    if getattr(config.option, "less_no_cosmetic", False):
+        return False
+    if getattr(config.option, "doctestmodules", False) or getattr(
+        config.option, "doctestglob", None
+    ):
+        return False
+    if _doctest_args(args):
+        return False
     try:
-        if config.getini("less_cosmetic"):
-            return True
+        if config.getini("less_cosmetic") is False:
+            return False
     except Exception:  # pragma: no cover - ini not registered (embedders)
         pass
-    return bool(getattr(config.option, "less_cosmetic", False))
+    return True
 
 
 # ---------------------------------------------------------------- early activation
@@ -293,7 +335,9 @@ def pytest_load_initial_conftests(early_config, parser, args):
                     "--less-no-data-files" not in args
                     and _data_files_enabled(early_config)
                 )
-                cosmetic = "--less-cosmetic" in args or _cosmetic_enabled(early_config)
+                cosmetic = "--less-no-cosmetic" not in args and _cosmetic_enabled(
+                    early_config, args
+                )
                 monitor = FileMonitor(root, data_files=data_files, cosmetic=cosmetic)
                 if monitor.activate():
                     # Stash on the config (the same instance
@@ -681,15 +725,19 @@ class LessState:
                 "updated, dependencies left as recorded"
             )
             return
+        monitor = self.monitor
+        if monitor is not None:
+            # Recording is over.  Close the window *before* our own git
+            # calls below: otherwise they would be attributed to the last
+            # test as a subprocess spawn.
+            monitor.phase = "done"
+            monitor.current_nodeid = None
         if self.fast:
             # Something ran (a new test, or a previously failed one):
             # lazily load the full data now to preserve everything else.
             self.shard = load_shard(self.store.load_data(), self._meta)
-        monitor = self.monitor
         if monitor is None:
             return
-        monitor.phase = "done"
-        monitor.current_nodeid = None
 
         # Partition collect-phase blocks: those executed in test-module
         # files belong to that module's tests only; everything else is a
@@ -754,26 +802,57 @@ class LessState:
                 tests.setdefault(nodeid, set())
                 self.failed.add(nodeid)
 
-        # Subprocess marks (Tier A): this run's observations replace old
-        # marks for tests that actually ran (a finished test that spawned
-        # nothing prunes its previous mark); tests that did not run inherit
-        # their previous belief -- unknown history (old shard) conservatively
-        # means "spawns" until the test is observed once.  A collect-phase
-        # spawn collapses the whole list to None = every test spawns; a
-        # later clean record heals it back to a precise set.
-        if monitor.spawn_shared:
-            spawning: set[str] | None = None
+        # Spawners: coverage cannot follow a child process, so a test that
+        # spawned one gets *no dependencies* (an empty entry, never stale)
+        # and is listed in ``always``: selection re-runs it every time.
+        for nodeid in monitor.spawn_tests:
+            if nodeid in self.item_map:
+                tests[nodeid] = set()
+        # Reflective entry points leave a pseudo-dependency: turn it into the
+        # test's "dynamic" mark and keep it out of the shard.
+        dynamic_now = set(monitor.dynamic_tests)
+        for nodeid, deps in monitor.test_deps.items():
+            if DYNAMIC_DEP in deps:
+                dynamic_now.add(nodeid)
+        import_blocks.discard(DYNAMIC_DEP)
+        for deps in tests.values():
+            deps.discard(DYNAMIC_DEP)
+
+        # Marks are replaced by this run's observations for tests that
+        # actually ran; tests that did not run inherit their previous belief.
+        # Unknown history (an old shard) stays unknown until every
+        # previously recorded test has been observed once.
+        alive = set(tests) | set(self.item_map)
+        observed = self.finished
+        old_always = old_shard.always if old_shard is not None else set()
+        always = (set(monitor.spawn_tests) | (old_always - observed)) & alive
+        unobserved_old = (set(old_tests) & alive) - observed
+        spawn_unknown = monitor.spawn_shared or (
+            old_shard is not None and old_shard.spawn_unknown and bool(unobserved_old)
+        )
+        old_dynamic = old_shard.dynamic if old_shard is not None else set()
+        dynamic: set[str] | None
+        if old_dynamic is None and unobserved_old:
+            dynamic = None  # still unknown for the tests that did not run
         else:
-            new_spawn = set(monitor.spawn_tests)
-            known = set(old_tests) | set(self.item_map)
-            old_spawn = old_shard.spawning if old_shard is not None else None
-            if old_spawn is None:
-                spawning = new_spawn | (known - self.finished)
-            else:
-                spawning = new_spawn | (old_spawn - self.finished)
-            # Prune marks of tests that no longer exist (deleted tests
-            # would otherwise persist in the list forever).
-            spawning &= set(tests)
+            dynamic = (dynamic_now | ((old_dynamic or set()) - observed)) & set(tests)
+
+        # Docstring safety net (cosmetic filter): per-file docstring hashes
+        # and the files that read docstrings as data.
+        doc_files: set[str] = {b[0] for b in import_blocks}
+        for deps in tests.values():
+            doc_files.update(b[0] for b in deps)
+        docs: dict[str, str] = {}
+        doc_readers: list[str] = []
+        for rel in sorted(doc_files):
+            if not rel.endswith(".py"):
+                continue
+            fb = monitor.file_blocks(rel)
+            if fb is None:
+                continue
+            docs[rel] = fb.doc_hash
+            if fb.reads_docs:
+                doc_readers.append(rel)
 
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
@@ -788,7 +867,6 @@ class LessState:
                 table[block] = i
             return i
 
-        spawn_json = sorted(spawning) if spawning is not None else None
         data = {
             "version": DATA_VERSION,
             "blocks": [list(b) for b in ordered],  # filled below
@@ -798,9 +876,17 @@ class LessState:
             },
             "import_deps": sorted({index(b) for b in import_blocks}),
             "failed": sorted(self.failed),
-            # Tests that spawned a process (None = unknown/shared: all of
-            # them).  Drives the Tier-A subprocess rule at selection.
-            "spawning": spawn_json,
+            # Tests that spawned a process: no dependencies, re-run every
+            # time.  ``spawn_unknown``: the culprit of a collect-phase spawn
+            # (or an old shard's history) is unknown -> weak rule for all.
+            "always": sorted(always),
+            "spawn_unknown": spawn_unknown,
+            # Tests that ran string-compiled / reflective code (None =
+            # unknown) -> re-run when a .py file is stale or unrecorded.
+            "dynamic": sorted(dynamic) if dynamic is not None else None,
+            # Cosmetic-filter safety net.
+            "docs": docs,
+            "doc_readers": doc_readers,
         }
         data["blocks"] = [list(b) for b in ordered]
         dep_files: set[str] = {b[0] for b in import_blocks}
@@ -817,10 +903,11 @@ class LessState:
             "failed": sorted(self.failed),
             "nodeids": sorted(tests),
             "dep_files": sorted(dep_files),
-            # Mirror of data.json's spawning key: lets the fast-path probe
-            # see when the subprocess rule might fire (see
-            # _spawning_possible).
-            "spawning": spawn_json,
+            # Mirrors of data.json's subprocess / dynamic marks: let the
+            # fast-path probe see when those rules might fire.
+            "always": sorted(always),
+            "spawn_unknown": spawn_unknown,
+            "dynamic": sorted(dynamic) if dynamic is not None else None,
         }
         self.store.save(data, meta)
         if self.sync_remote and self.sync_mode in ("push", "both"):

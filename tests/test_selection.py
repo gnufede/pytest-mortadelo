@@ -24,9 +24,6 @@ def make_shard(**overrides):
         },
         import_deps={dep("tests/conftest.py", MODULE_BLOCK)},
         failed=set(),
-        # Observed non-spawners (Tier A): the subprocess rule must stay
-        # inert in these precision tests unless a case opts in.
-        spawning=set(),
     )
     for key, value in overrides.items():
         setattr(shard, key, value)
