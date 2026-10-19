@@ -32,6 +32,7 @@ Options:
 | `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
 | `--less-no-cosmetic` | hash docstrings as behavior (by default comments *and* docstrings are ignored); ini: `less_cosmetic = false`; automatically off under `--doctest-modules` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
+| `PYTEST_LESS_PARSE_CACHE=0` | disable the `parse.json` read/write (cold-run measurements, debugging a suspected cache bug); the stored blob is carried over untouched |
 | `-p no:less` | disable the plugin entirely |
 
 If nothing changed and nothing failed, **zero tests run and pytest exits with
@@ -80,14 +81,15 @@ non-Python file opened while the monitor is active — fixtures, templates,
 profiles, `.proto`/`.dat`/`.sql` assets — bucketed exactly like code
 dependencies (per test during a test, shared import-time bucket before
 collection). They are stored as file-level wildcard deps: any content change
-re-runs the opener(s). Without this flag, editing a data file that only
+re-runs the opener(s). Without this tracking, editing a data file that only
 tests read selects nothing — a red suite with a green CI. Trade-offs: "opened"
 ≠ "depended on" (tests that open files speculatively widen, in the safe
 direction); Python source/bytecode opens are excluded on purpose (they are
 tracked at block precision by `PY_START`, and a wildcard dep on them would
-throw that precision away); files opened through `os.open`, `FileIO`, `mmap`
-or a C extension (including `.so` loading via `dlopen`) are not seen and
-remain untracked. No `sys.addaudithook` is used anywhere: an audit hook is a
+throw that precision away); files opened through `FileIO`, `mmap` or a C
+extension (including `.so` loading via `dlopen`) are not seen and remain
+untracked. `builtins.open`, `io.open` and `os.open` are wrapped. No
+`sys.addaudithook` is used anywhere: an audit hook is a
 Python call for *every* audit event in the process, and `builtins.id` alone
 fires 22M times in sqlalchemy's ORM suite (~7s of pure dispatch for a hook
 that cared about under a thousand events), whereas wrapping the few functions
@@ -168,10 +170,11 @@ refs/less/<shard>   →  lightweight commit
   entry is just a miss — whatever the working tree looked like when it was
   written (dirty, reverted, another branch). The blob is only valid for the
   same Python minor version, cosmetic setting and analysis version
-  (`PARSE_CACHE_VERSION`, bumped whenever hashing changes), is loaded on first
-  use (never on the no-change fast path), and is carried over by object id
-  when nothing new was parsed. Because it lives in the shard it travels with
-  `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
+  (`PARSE_CACHE_VERSION`, bumped whenever hashing changes), is loaded before
+  the monitor is armed (never on the no-change fast path) so import-time
+  parses already hit it, can be disabled with `PYTEST_LESS_PARSE_CACHE=0`,
+  and is carried over by object id when nothing new was parsed. Because it
+  lives in the shard it travels with `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
   dependency set. A cold first record parses everything, as before.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.

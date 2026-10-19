@@ -1,4 +1,4 @@
-"""Data-file tracking via the ``open`` audit hook (on by default).
+"""Data-file tracking via the ``open`` / ``os.open`` wrappers (on by default).
 
 Non-Python files opened by tests become file-level wildcard deps, closing
 the data-file blind spot: without tracking, editing a fixture that only
@@ -196,3 +196,48 @@ class TestImportTimeDataFile:
         result = run_less(shared_project, "-q")
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
+
+
+@pytest.fixture
+def osopen_project(pytester):
+    """A repo whose only test reads a data file through ``os.open``.
+
+    ``os.open`` is a separate entry point from ``builtins.open``/``io.open``:
+    libraries that want a raw file descriptor bypass the other wrappers, so a
+    test using it must still get a wildcard dependency on the data file.
+    """
+    tests = pytester.path / "tests"
+    tests.mkdir()
+    (tests / "conftest.py").touch()
+    (tests / "fixture.dat").write_text("payload-v1\n")
+    (tests / "test_osread.py").write_text(
+        "import os\n"
+        "\n"
+        "def test_osread():\n"
+        "    path = os.path.join(os.path.dirname(__file__), 'fixture.dat')\n"
+        "    fd = os.open(path, os.O_RDONLY)\n"
+        "    try:\n"
+        "        assert os.read(fd, 16)\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+    )
+    (pytester.path / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+    git(pytester.path, "init", "-q")
+    git(pytester.path, "config", "user.email", "test@example.com")
+    git(pytester.path, "config", "user.name", "Test")
+    commit(pytester.path, "initial")
+    return pytester
+
+
+class TestOsOpenDataFile:
+    def test_os_open_data_file_is_a_wildcard_dep(self, osopen_project):
+        run_less(osopen_project, "-q").assert_outcomes(passed=1)
+        tests, _ = decode_shard(shard_data(osopen_project.path))
+        assert "tests/fixture.dat:*" in dep_ids(
+            tests["tests/test_osread.py::test_osread"]
+        )
+
+        (osopen_project.path / "tests" / "fixture.dat").write_text("payload-v2\n")
+        result = run_less(osopen_project, "-q")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*selected 1/1 tests*"])

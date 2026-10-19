@@ -48,6 +48,17 @@ def _env_enabled() -> bool:
     return os.environ.get("PYTEST_LESS", "").strip().lower() in _ENV_TRUTHY
 
 
+def _parse_cache_enabled() -> bool:
+    """Whether the shard's parse cache may be read and written.
+
+    ``PYTEST_LESS_PARSE_CACHE=0`` disables it, for cold-run measurements
+    and for debugging a suspected cache bug.  While disabled the stored
+    ``parse.json`` blob is carried over untouched (it is not even read).
+    """
+    value = os.environ.get("PYTEST_LESS_PARSE_CACHE", "").strip().lower()
+    return value not in ("0", "false", "no")
+
+
 def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
     """The (remote, mode) to sync shards with, if any.
 
@@ -341,13 +352,15 @@ def pytest_load_initial_conftests(early_config, parser, args):
                 # Parse cache (shard blob, content-hash keyed): loaded now,
                 # before the tool is armed, so the git call is not observed
                 # and import-time parses already hit it.
-                parse_cache = ParseCache(
-                    GitStore(
-                        root, command_key(early_config.invocation_params.args, root)
-                    ).load_parse,
-                    cosmetic=cosmetic,
-                )
-                parse_cache.preload()
+                parse_cache = None
+                if _parse_cache_enabled():
+                    parse_cache = ParseCache(
+                        GitStore(
+                            root, command_key(early_config.invocation_params.args, root)
+                        ).load_parse,
+                        cosmetic=cosmetic,
+                    )
+                    parse_cache.preload()
                 monitor = FileMonitor(
                     root,
                     data_files=data_files,
@@ -442,8 +455,10 @@ class LessState:
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
                 cosmetic = _cosmetic_enabled(config)
-                parse_cache = ParseCache(self.store.load_parse, cosmetic=cosmetic)
-                parse_cache.preload()
+                parse_cache = None
+                if _parse_cache_enabled():
+                    parse_cache = ParseCache(self.store.load_parse, cosmetic=cosmetic)
+                    parse_cache.preload()
                 self.monitor = FileMonitor(
                     self.root,
                     data_files=_data_files_enabled(config),

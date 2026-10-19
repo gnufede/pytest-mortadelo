@@ -23,11 +23,11 @@ Dependencies are bucketed by execution phase, which the plugin drives:
 Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
-Non-Python data files are tracked by wrapping ``open`` (on by default;
-``--less-no-data-files`` opts out): every in-repo file opened while the monitor
-is active is bucketed like code dependencies -- per test during a test, into
-the shared import-time bucket before collection.  Python source and bytecode
-opens are deliberately *not* recorded here: they are tracked at block
+Non-Python data files are tracked by wrapping ``open``/``os.open`` (on by
+default; ``--less-no-data-files`` opts out): every in-repo file opened while
+the monitor is active is bucketed like code dependencies -- per test during a
+test, into the shared import-time bucket before collection.  Python source and
+bytecode opens are deliberately *not* recorded here: they are tracked at block
 precision by PY_START, and a file-level wildcard dep on them would throw that
 precision away.
 
@@ -501,9 +501,13 @@ class FileMonitor:
 
             # ``builtins.open`` and ``io.open`` are the same object; wrap
             # both bindings (pathlib and most libraries go through one of
-            # them at call time).
+            # them at call time).  ``os.open`` is a separate entry point used
+            # directly by plenty of code (and by libraries that want a raw
+            # fd), so it needs its own wrapper: without it those reads are
+            # invisible and an edited data file selects nothing.
             wrap(builtins, "open", open_wrapper)
             wrap(io, "open", open_wrapper)
+            wrap(os, "open", open_wrapper)
 
     def _remove_interceptors(self) -> None:
         while self._undo:

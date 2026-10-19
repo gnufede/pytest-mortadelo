@@ -244,3 +244,36 @@ class TestEndToEnd:
         run_less(project, "-q")  # reruns the failed test (monitor-less update)
         after = git(project.path, "rev-parse", f"{ref}:parse.json").stdout
         assert before == after
+
+
+class TestKillSwitch:
+    """``PYTEST_LESS_PARSE_CACHE=0``: no read, no write, blob untouched."""
+
+    @staticmethod
+    def _ref(project):
+        return git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
+        ).stdout.split()[0]
+
+    def test_first_record_stores_no_parse_blob(self, project, monkeypatch):
+        monkeypatch.setenv("PYTEST_LESS_PARSE_CACHE", "0")
+        run_less(project, "-q").assert_outcomes(passed=2)
+        ref = self._ref(project)
+        with pytest.raises(subprocess.CalledProcessError):
+            git(project.path, "cat-file", "-e", f"{ref}:parse.json")
+
+    def test_no_read_no_write_and_existing_blob_is_carried_over(
+        self, project, monkeypatch
+    ):
+        run_less(project, "-q").assert_outcomes(passed=2)  # warm the cache
+        ref = self._ref(project)
+        before = git(project.path, "rev-parse", f"{ref}:parse.json").stdout.strip()
+
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        monkeypatch.setenv("PYTEST_LESS_PARSE_CACHE", "0")
+        result = run_less(project, "-v")
+        result.assert_outcomes(passed=1)
+        # The cache is neither consulted nor reported while disabled.
+        assert parse_note(result) is None
+        after = git(project.path, "rev-parse", f"{ref}:parse.json").stdout.strip()
+        assert after == before
