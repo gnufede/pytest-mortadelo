@@ -441,6 +441,9 @@ class ParseCache:
         self._had_blob = False
         self.entries: dict[str, dict] = {}
         self.fresh: dict[str, dict] = {}
+        # rel -> hash of the bytes whose analysis this run actually used
+        # (a hit or a fresh parse): what the block hashes were derived from.
+        self.used: dict[str, str] = {}
 
     def _header(self) -> dict:
         return {
@@ -476,14 +479,17 @@ class ParseCache:
         if entry is None or entry.get("h") != digest:
             return None
         try:
-            return _file_from_json(entry)
+            fb = _file_from_json(entry)
         except Exception:  # corrupt / foreign entry: a miss, never a crash
             return None
+        self.used[rel] = digest
+        return fb
 
     def store(self, rel: str, digest: str, fb: FileBlocks) -> None:
         entry = _file_to_json(fb)
         entry["h"] = digest
         self.fresh[rel] = entry
+        self.used[rel] = digest
 
     def dump(self, keep: set[str]) -> dict | None:
         """The cache to persist (entries for *keep* only), or None when the

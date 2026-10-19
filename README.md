@@ -9,7 +9,7 @@ Minimal **test impact analysis (TIA)** for pytest.
 | dependency collection | a custom `sys.monitoring` tool using **PY_START** events (no per-line tracking) |
 | dynamic imports | conservative bytecode scan for import opcodes inside every executed code block |
 | import-time dependencies | everything imported before tests start is a dependency of *every* test |
-| change detection | **git diff** between the recorded base commit and the current working tree |
+| change detection | **file fingerprints** recorded with the shard (size, mtime, content hash) — no git in the common case; `git diff` is the fallback |
 
 Requires **Python 3.12+** (for `sys.monitoring`) and a git repository.
 
@@ -148,6 +148,7 @@ For every pytest **command** the data is stored in a dedicated ref:
 refs/less/<shard>   →  lightweight commit
                             ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "doc_readers":[...], "bdocs":[hash per block-table entry]}
                             ├── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
+                            ├── files.json  {"v":1, "at":ns, "files":{file:[size, mtime_ns, hash]}, "dirs":{dir:[subdirs]}}
                             └── parse.json  {"v":1, "py":"3.13", "cosmetic":true, "files":{file:{"h":content-hash, "b":{block:[hash,docs-hash]}, "s":spans, "m":markers, "r":reads-docs}}}
 ```
 
@@ -205,16 +206,52 @@ refs/less/<shard>   →  lightweight commit
   other way round. `PYTEST_LESS_GIT_BACKEND=subprocess` forces the fallback,
   and CI runs the whole suite both ways on Python 3.12 and 3.13.
 
-  Change detection stays on git on purpose: `git diff --name-only <base>` and
-  `ls-files --others --exclude-standard` encode the index, stat caches, renames
-  and every flavour of `.gitignore`, and a reimplementation that misses a change
-  means a missed test. The two queries run **concurrently**, so their latency is
-  the slower one, not the sum. `changed_since` and `load_meta` are memoized on
-  the run's single `GitStore` (invalidated by save / delete / sync pull), and
-  planning and selection share one context. Result: a cold record spawns **no**
-  git process and a run that selects nothing spawns 2 (it used to spawn 14 and
-  23); because nothing new was learned it does not rewrite the shard. Tests pin
-  the budget.
+  Change detection does not use git in the common case either (next bullet).
+  `load_meta` and the fingerprints are memoized on the run's single `GitStore`
+  (invalidated by save / delete / sync pull), and planning and selection share
+  one context. Result: a cold record, a no-change rerun, a run that selects
+  nothing, and an edit that re-records all spawn **no** git process (they used
+  to spawn 14, 10, 23 and 23). Tests pin the budget. A run that selects nothing
+  learned nothing new, so it does not rewrite the shard.
+- **File fingerprints (`files.json`).** `git diff <base>` plus `git ls-files
+  --others` answer a question selection does not actually have: they report
+  every file that differs from a commit, and the second one scans the whole
+  checkout (790 ms on a 10k-file repository with 46k untracked files; 363 ms
+  for the pair). What selection needs is narrower — *do the files this shard
+  depends on still look like they did when it was recorded?* — so the shard
+  stores a snapshot: `[size, mtime_ns, content hash]` for every dependency file
+  and every `.py` file in a **watched** directory (each directory holding a
+  dependency, and all its ancestors up to the root), plus those directories'
+  subdirectory names. A run `stat`s the recorded files and lists the watched
+  directories (26 ms for 3,250 files on that repository):
+  - same size, same mtime, and an mtime older than the snapshot by more than 2 s
+    → unchanged; anything else is settled by hashing the bytes. A `touch`, a
+    checkout that rewrites identical content, or a shard recorded on another
+    machine (every mtime differs) is **not** a change, and a file modified
+    inside the racy 2 s window is never trusted on stat alone (git's
+    "racily clean" rule). A dependency that changed while it was being parsed
+    is stored with mtime `-1`, so the next run always re-hashes it.
+  - a `.py` file that is not in the snapshot, or a subdirectory that is not in
+    the listing, is *new*. Only then is git asked — once, about those paths
+    alone (`ls-files --cached --others --exclude-standard -- <paths>`), so
+    ignore rules stay git's job while the cost no longer scales with the size of
+    the checkout. Hidden directories, `__pycache__`, `*.egg-info` and the usual
+    environment directories are never reported as new.
+  - it needs no base commit: rebasing or amending does not invalidate the shard
+    (previously "cannot compute changes since the recorded base commit; running
+    everything"), a file that is **untracked** is no longer "changed" on every
+    run, and a file recorded **dirty** and later reverted is noticed (a diff
+    against `HEAD` cannot see it).
+  - shards without `files.json` (recorded before this), a snapshot it cannot
+    read, git being unable to answer the scoped question, and
+    `PYTEST_LESS_GIT_BACKEND=subprocess` all use `git diff` against the shard's
+    base commit as before. A randomized differential test checks the two agree
+    on edits, touches, deletions, new and ignored files, and reverts.
+  - rewriting a shard reuses the previous snapshot's hashes for files whose size
+    and (old enough) mtime did not change, so it costs stats, not reads.
+  - A run that stops early (`-x`, `--maxfail`) marks the tests it selected but
+    never ran as must-rerun: the snapshot is refreshed by that run, so a test
+    that kept its old block hashes would otherwise look fresh.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 
@@ -321,7 +358,7 @@ custom refs, the push simply fails non-fatally (a note in the run summary)
 and everything stays local — pull-only CI is unaffected either way. This
 repository dogfoods the whole loop in CI (`.github/workflows/ci.yml`).
 
-### 3. Selection: git diff + collection skipping
+### 3. Selection: file fingerprints + collection skipping
 
 Before collection starts, the changed-file set is computed and test files
 whose recorded tests are **all** unaffected are not even *collected* (their
@@ -337,8 +374,9 @@ When explicit test selectors are in play (``-k``, ``-m``, ``--lf``/``--ff``,
 or a ``file.py::test`` argument), selection is disabled entirely: an explicitly requested but
 unaffected test must never be silently skipped.
 
-`changed = (files differing between the shard's base commit and the current
-working tree) ∪ (untracked files)`. A test runs when:
+`changed` = the dependency files (and the `.py` files beside them) that differ
+from the shard's recorded fingerprints, plus new project `.py` files (see
+*File fingerprints* above). A test runs when:
 
 - it has **no** recorded data (new test, or the previous run never finished
   it — e.g. it was interrupted),

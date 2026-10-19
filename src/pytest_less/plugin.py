@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from .blocks import DYNAMIC_DEP, WILDCARD, Block, ParseCache
+from .fingerprint import build_snapshot
 from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import (
@@ -126,7 +127,7 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
     ):
         return None, False, False
     try:
-        changed = store.changed_since(meta.get("base_commit"))
+        changed = store.changed_files(meta.get("base_commit"))
     except Exception:
         return None, False, False
     if changed is None:
@@ -240,7 +241,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Enable less: record file-level test dependencies and "
-        "select only tests affected by changed files (git diff).",
+        "select only tests affected by changed files (file fingerprints).",
     )
     group.addoption(
         "--less-force",
@@ -594,7 +595,7 @@ class LessState:
         if config.option.less_force or self.selectors_active:
             return
         try:
-            changed = self.store.changed_since(self.shard.base_commit)
+            changed = self.store.changed_files(self.shard.base_commit)
         except Exception as e:
             self.notes.append(f"less: could not compute changes ({e!r}); running everything")
             return
@@ -868,9 +869,19 @@ class LessState:
             if file in self.skip_collect_files:
                 tests[nodeid] = set(old_deps)
             # else: the file was collected but the test is gone -> drop
-        if interrupted:
+        if self.selection is not None:
+            selected_ids = set(self.selection.selected)
+        else:
+            selected_ids = set(self.item_map)
+        stopped_early = bool(self.finished) and bool(
+            {n for n in selected_ids if n in self.item_map} - self.finished
+        )
+        if interrupted or stopped_early:
             # A test that was collected but did not finish has an unknown
-            # result: it must re-run.  With valid old deps it would otherwise
+            # result: it must re-run.  (Also when the run simply stopped --
+            # ``-x`` / ``--maxfail``: the file fingerprints below are
+            # refreshed, so a selected-but-unrun test that kept its old
+            # hashes would otherwise look fresh forever.)  With valid old deps it would otherwise
             # be deselected forever ("no stale block"), and without any
             # recorded history it would be omitted entirely -- letting its
             # file be collection-skipped, silently never running again.
@@ -1028,7 +1039,13 @@ class LessState:
                 self.notes.append(
                     f"less: parse cache: {hits} hit(s), {parsed} file(s) parsed"
                 )
-        self.store.save(data, meta, parse=parse)
+        # Fingerprints of what the shard now describes: the next run's change
+        # detection compares against them instead of asking git.
+        digests = monitor.parse_cache.used if monitor.parse_cache is not None else {}
+        snapshot = build_snapshot(
+            self.root, dep_files, digests, previous=self.store.load_files()
+        )
+        self.store.save(data, meta, parse=parse, files=snapshot)
         if self.sync_remote and self.sync_mode in ("push", "both"):
             try:
                 self.notes.append(f"less: {self.store.sync_push(self.sync_remote)}")

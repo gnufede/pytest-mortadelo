@@ -654,20 +654,30 @@ class TestSelectorsDisableSelection:
         }
 
 
+def run_outside(project, *args):
+    """Run ``pytest --less`` without ``runpytest_subprocess``, which creates a
+    numbered ``runpytest-N/`` directory *inside* the repository on every call --
+    each of which is (correctly) a new-directory event."""
+    import sys
+
+    return project.run(sys.executable, "-m", "pytest", "--less", *args)
+
+
 class TestGitSpawnBudget:
     """Every git call is a process spawn: a few ms on a quiet machine, a
-    quarter of a second where endpoint scanning slows exec.  The same
-    questions used to be asked 2-3 times over (23 spawns for a run that
-    selected nothing); refs, blobs, HEAD, the toplevel and the shard write are
-    now in-process (gitobjects), leaving only the two change-detection queries
-    -- which run concurrently.  Pin it."""
+    quarter of a second where endpoint scanning slows exec.  Refs, blobs,
+    HEAD, the toplevel and the shard write are in-process (gitobjects), and
+    change detection compares file fingerprints (fingerprint.py) instead of
+    asking ``git diff`` / ``git ls-files --others`` -- 98 + 790 ms on a
+    10k-file repository.  Git is only asked, once and about those paths
+    alone, when a *new* file or directory appears.  Pin it."""
 
     @pytest.fixture
     def counted(self, project, tmp_path, monkeypatch):
         import os
         import shutil
 
-        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)  # budget of the fast path
+        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)  # the fast path
         real = shutil.which("git")
         log = tmp_path / "gitcalls.log"
         shim = tmp_path / "shim"
@@ -686,44 +696,53 @@ class TestGitSpawnBudget:
 
     def test_a_cold_record_spawns_no_git_at_all(self, project, counted):
         counted()
-        result = run_less(project, "-q")
+        result = run_outside(project, "-q")
         result.assert_outcomes(passed=2)
         assert counted() == []
 
-    def test_no_change_rerun(self, project, counted):
-        run_less(project, "-q")
+    def test_no_change_rerun_spawns_no_git(self, project, counted):
+        run_outside(project, "-q")
         counted()  # discard the record run
-        result = run_less(project, "-q")
+        result = run_outside(project, "-q")
         assert result.ret == 5
-        calls = counted()
-        assert len(calls) <= 2, calls  # diff + ls-files
+        assert counted() == []
 
-    def test_run_that_selects_nothing_does_not_rewrite_the_shard(self, project, counted):
-        run_less(project, "-q")
+    def test_run_that_selects_nothing_spawns_no_git_and_rewrites_nothing(
+        self, project, counted
+    ):
+        run_outside(project, "-q")
         counted()
         # other.py is a dead-branch dependency: editing it stales nothing.
         (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
-        result = run_less(project, "-q")
+        result = run_outside(project, "-q")
         assert result.ret == 5
-        calls = counted()
-        assert len(calls) <= 2, calls
-        assert not [c for c in calls if "hash-object" in c or "commit-tree" in c]
+        assert counted() == []
 
-    def test_changed_files_are_asked_for_once(self, project, counted):
-        run_less(project, "-q")
-        counted()
-        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
-        run_less(project, "-q")
-        calls = counted()
-        assert len([c for c in calls if " diff " in f" {c} "]) == 1
-        assert len([c for c in calls if " ls-files " in f" {c} "]) == 1
-        assert len(calls) == 2, calls  # no toplevel / cat-file / rev-parse
-
-    def test_a_run_that_records_writes_without_spawning(self, project, counted):
-        run_less(project, "-q")
+    def test_an_edit_that_runs_tests_and_re_records_spawns_no_git(self, project, counted):
+        run_outside(project, "-q")
         counted()
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
-        result = run_less(project, "-q")
+        result = run_outside(project, "-q")
         result.assert_outcomes(passed=1)
+        assert counted() == []
+
+    def test_a_new_file_costs_one_scoped_query(self, project, counted):
+        run_outside(project, "-q")
+        counted()
+        (project.path / "tests" / "extra.py").write_text("X = 1\n")
+        run_outside(project, "-q")
         calls = counted()
-        assert len(calls) <= 2, calls  # the shard write added none
+        assert len(calls) == 1, calls
+        assert " ls-files " in f" {calls[0]} " and "tests/extra.py" in calls[0]
+
+    def test_an_ignored_new_file_is_confirmed_once_and_not_reported(self, project, counted):
+        (project.path / ".gitignore").write_text(
+            ".pytest_cache/\n__pycache__/\ngenerated_*.py\n"
+        )
+        commit(project.path, "ignore generated")
+        run_outside(project, "-q")
+        counted()
+        (project.path / "tests" / "generated_version.py").write_text("V = 1\n")
+        result = run_outside(project, "-q")
+        assert result.ret == 5  # ignored: no candidate, nothing selected
+        assert len(counted()) == 1

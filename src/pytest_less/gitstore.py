@@ -1,10 +1,11 @@
 """Shard storage in git: dedicated refs under ``refs/less/``, never commits.
 
-A shard is stored as a lightweight commit whose tree contains three blobs::
+A shard is stored as a lightweight commit whose tree contains up to four blobs::
 
     data.json  -- {"version": 2, "blocks": [...], "tests": {...}, "failed": [...], ...}
     meta.json  -- {"version": 1, "shard": ..., "base_commit": ..., "created": ...}
     parse.json -- per-file parse results keyed by content hash (optional)
+    files.json -- file fingerprints: change detection without ``git diff`` (optional)
 
 The ref ``refs/less/<shard>`` always points at the latest record for that
 pytest command ("latest wins"; overwriting is just an ``update-ref``).  The
@@ -27,6 +28,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
+from .fingerprint import detect_changes
 from .gitobjects import Repo, Unsupported, backend_enabled
 from .util import run_git
 
@@ -154,6 +156,59 @@ class GitStore:
             self._memo[key] = set(changed)
         return changed
 
+    def project_files(self, paths: list[str]) -> set[str] | None:
+        """Files git considers part of the project under *paths*: tracked, or
+        untracked and not ignored.  ``None`` if git cannot answer.
+
+        The only git query the fingerprint path ever makes, and only about
+        paths that are new since the shard was recorded -- so the cost no
+        longer grows with the size of the checkout.
+        """
+        found: set[str] = set()
+        for start in range(0, len(paths), 400):
+            chunk = paths[start:start + 400]
+            try:
+                out = run_git(
+                    self.root,
+                    "--literal-pathspecs",
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    *chunk,
+                )
+            except (subprocess.CalledProcessError, OSError):
+                return None
+            found.update(p for p in out.split("\0") if p)
+        return found
+
+    def changed_files(self, base_commit: str | None) -> set[str] | None:
+        """Files that matter and differ from what the shard was recorded with.
+
+        Prefers the shard's own fingerprints (:mod:`fingerprint`): no git in
+        the common case, independent of any base commit (a rebase or amend
+        does not invalidate anything), and correct for files that are
+        untracked or dirty at record time.  Shards without fingerprints,
+        ``PYTEST_LESS_GIT_BACKEND=subprocess``, and anything the fingerprints
+        cannot decide fall back to ``git diff`` against *base_commit*.
+        """
+        key = ("changes", base_commit)
+        if self._memoize and key in self._memo:
+            cached = self._memo[key]
+            return None if cached is None else set(cached)
+        result = None
+        if backend_enabled():
+            snapshot = self.load_files()
+            if snapshot is not None:
+                result = detect_changes(self.root, snapshot, self.project_files)
+        if result is None:
+            result = self.changed_since(base_commit)
+        if self._memoize:
+            self._memo[key] = None if result is None else set(result)
+        return result
+
     # -- shard persistence -------------------------------------------------
 
     def _read_blob(self, name: str) -> bytes | None:
@@ -196,6 +251,15 @@ class GitStore:
         """Load only data.json (the potentially large dependency blob)."""
         return self._read_json("data.json")
 
+    def load_files(self) -> dict | None:
+        """Load files.json (the fingerprints); memoized like the meta."""
+        if self._memoize and "files" in self._memo:
+            return self._memo["files"]
+        snapshot = self._read_json("files.json")
+        if self._memoize:
+            self._memo["files"] = snapshot
+        return snapshot
+
     def load_parse(self) -> dict | None:
         """Load parse.json (per-file parse results keyed by content hash)."""
         return self._read_json("parse.json")
@@ -206,11 +270,18 @@ class GitStore:
             return None, None
         return self.load_data(), self.load_meta()
 
-    def save(self, data: dict, meta: dict, parse: dict | None = None) -> None:
+    def save(
+        self,
+        data: dict,
+        meta: dict,
+        parse: dict | None = None,
+        files: dict | None = None,
+    ) -> None:
         """Store the shard as a fresh lightweight commit and move the ref.
 
-        *parse* is the new parse.json content; ``None`` carries the existing
-        blob over untouched (by object id: it is not even read).
+        *parse* and *files* are the new parse.json / files.json content;
+        ``None`` carries the existing blob over untouched (by object id: it
+        is not even read).
 
         Written in-process (zlib + sha1 + a ref lock: 39ms for 12 MB against
         165ms and six spawns through ``hash-object`` / ``mktree`` /
@@ -219,49 +290,66 @@ class GitStore:
         """
         if self._repo is not None:
             try:
-                self._save_in_process(data, meta, parse)
-                self._memo.pop("meta", None)
+                self._save_in_process(data, meta, parse, files)
+                self._forget_ref_state()
                 return
             except _FALLBACK:
                 pass
-        self._save_with_git(data, meta, parse)
+        self._save_with_git(data, meta, parse, files)
+        self._forget_ref_state()
 
-    def _save_in_process(self, data: dict, meta: dict, parse: dict | None) -> None:
+    def _forget_ref_state(self) -> None:
+        """Drop everything memoized from the ref's contents (the working-tree
+        answers of ``changed_since`` stay valid; ``changed_files`` is judged
+        against the shard's fingerprints, so it goes too)."""
+        for key in list(self._memo):
+            if key in ("meta", "files") or (
+                isinstance(key, tuple) and key[0] == "changes"
+            ):
+                del self._memo[key]
+
+    def _save_in_process(
+        self, data: dict, meta: dict, parse: dict | None, snapshot: dict | None
+    ) -> None:
         files = {
             "data.json": json.dumps(data).encode(),
             "meta.json": json.dumps(meta).encode(),
         }
         reuse: dict[str, str] = {}
-        if parse is not None:
-            files["parse.json"] = json.dumps(parse).encode()
-        else:
-            # Carry the stored blob over by id (it may even be packed).
-            existing = self._repo.blob_sha_in_ref(self.ref, "parse.json")
-            if existing:
-                reuse["parse.json"] = existing
+        for name, content in (("parse.json", parse), ("files.json", snapshot)):
+            if content is not None:
+                files[name] = json.dumps(content).encode()
+            else:
+                # Carry the stored blob over by id (it may even be packed).
+                existing = self._repo.blob_sha_in_ref(self.ref, name)
+                if existing:
+                    reuse[name] = existing
         self._repo.write_shard(
             self.ref, files, f"pytest-less shard {self.shard}", reuse=reuse
         )
 
-    def _save_with_git(self, data: dict, meta: dict, parse: dict | None) -> None:
+    def _save_with_git(
+        self, data: dict, meta: dict, parse: dict | None, snapshot: dict | None
+    ) -> None:
         data_blob = self._git(
             "hash-object", "-w", "--stdin", stdin=json.dumps(data)
         ).strip()
         meta_blob = self._git(
             "hash-object", "-w", "--stdin", stdin=json.dumps(meta)
         ).strip()
-        if parse is not None:
-            parse_blob = self._git(
-                "hash-object", "-w", "--stdin", stdin=json.dumps(parse)
-            ).strip()
-        else:
-            parse_blob = self._ref_sha(f"{self.ref}:parse.json")
-        tree_input = (
-            f"100644 blob {data_blob}\tdata.json\n"
-            f"100644 blob {meta_blob}\tmeta.json\n"
+        optional: dict[str, str | None] = {}
+        for name, content in (("parse.json", parse), ("files.json", snapshot)):
+            if content is not None:
+                optional[name] = self._git(
+                    "hash-object", "-w", "--stdin", stdin=json.dumps(content)
+                ).strip()
+            else:
+                optional[name] = self._ref_sha(f"{self.ref}:{name}")
+        entries = {"data.json": data_blob, "meta.json": meta_blob}
+        entries.update({n: sha for n, sha in optional.items() if sha})
+        tree_input = "".join(
+            f"100644 blob {sha}\t{name}\n" for name, sha in sorted(entries.items())
         )
-        if parse_blob:
-            tree_input += f"100644 blob {parse_blob}\tparse.json\n"
         tree = self._git("mktree", stdin=tree_input).strip()
         message = f"pytest-less shard {self.shard}"
         try:
@@ -282,7 +370,6 @@ class GitStore:
                 },
             ).strip()
         self._git("update-ref", self.ref, commit)
-        self._memo.pop("meta", None)
 
     def delete(self) -> bool:
         """Delete the shard ref. Returns False if there was nothing to delete."""
@@ -294,7 +381,7 @@ class GitStore:
             return False
         try:
             run_git(self.root, "update-ref", "-d", self.ref)
-            self._memo.pop("meta", None)
+            self._forget_ref_state()
             return True
         except subprocess.CalledProcessError:
             return False
@@ -337,7 +424,7 @@ class GitStore:
             self._delete_ref_quiet(scratch)
             return f"shard on '{remote}' is not newer than local; keeping local"
         run_git(self.root, "update-ref", self.ref, scratch)
-        self._memo.pop("meta", None)
+        self._forget_ref_state()
         self._delete_ref_quiet(scratch)
         return f"pulled a newer shard from '{remote}'"
 
