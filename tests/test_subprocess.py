@@ -9,7 +9,7 @@ is stale *or was never recorded at all* -- the child may have executed code
 this recording never saw.
 
 Scope, deliberately: .py files only (child *code* execution; child reads of
-data files remain the --less-data-files escape hatch), attributed during
+child reads of data files are not tracked), attributed during
 collect/test phases (pytest's own startup git subprocesses live in the
 import phase and must not mark every test a spawner).
 """

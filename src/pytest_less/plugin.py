@@ -199,13 +199,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Discard the stored dependency data for this command before running.",
     )
     group.addoption(
-        "--less-data-files",
+        "--less-no-data-files",
         action="store_true",
         default=False,
-        help="Also record non-Python files opened during a test (sys audit "
-        "hook on 'open') as file-level dependencies, closing the data-file "
-        "blind spot (fixtures, templates, profiles). Part of the shard key: "
-        "toggling it starts a fresh record run.",
+        help="Disable data-file tracking (on by default): non-Python files "
+        "opened during a test are recorded as file-level dependencies via "
+        "the sys audit hook on 'open'. Part of the shard key: toggling it "
+        "starts a fresh record run.",
     )
     group.addoption(
         "--less-cosmetic",
@@ -224,10 +224,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
     parser.addini(
         "less_data_files",
-        help="like --less-data-files: record non-Python files opened by "
-        "tests as file-level dependencies",
+        help="set to false to disable data-file tracking (on by default): "
+        "non-Python files opened by tests recorded as file-level deps",
         type="bool",
-        default=False,
+        default=True,
     )
     parser.addini(
         "less_cosmetic",
@@ -239,13 +239,21 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 
 def _data_files_enabled(config) -> bool:
-    """Whether data-file tracking is on (ini or parsed CLI option)."""
+    """Whether data-file tracking is on.
+
+    On by default (an opt-out feature): disable with --less-no-data-files
+    or `less_data_files = false` in the ini.  Options are not parsed yet
+    when the early hook calls this, hence the getattr for the CLI flag and
+    the raw-args peek by the caller.
+    """
+    if getattr(config.option, "less_no_data_files", False):
+        return False
     try:
-        if config.getini("less_data_files"):
-            return True
+        if config.getini("less_data_files") is False:
+            return False
     except Exception:  # pragma: no cover - ini not registered (embedders)
         pass
-    return bool(getattr(config.option, "less_data_files", False))
+    return True
 
 
 def _cosmetic_enabled(config) -> bool:
@@ -280,9 +288,11 @@ def pytest_load_initial_conftests(early_config, parser, args):
             root = git_root(Path.cwd())
             if root is not None:
                 # Options are not parsed yet: peek the raw flags; the ini is
-                # registered (and readable) at this point.
+                # registered (and readable) at this point.  Data-file
+                # tracking is on by default (--less-no-data-files opts out).
                 data_files = (
-                    "--less-data-files" in args or _data_files_enabled(early_config)
+                    "--less-no-data-files" not in args
+                    and _data_files_enabled(early_config)
                 )
                 cosmetic = "--less-cosmetic" in args or _cosmetic_enabled(early_config)
                 monitor = FileMonitor(root, data_files=data_files, cosmetic=cosmetic)

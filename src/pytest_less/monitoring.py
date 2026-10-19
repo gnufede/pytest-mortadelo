@@ -24,7 +24,7 @@ Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
 Non-Python data files are tracked through an optional ``sys.addaudithook``
-subscription on the ``open`` event (enabled with ``--less-data-files``):
+subscription on the ``open`` event (on by default; ``--less-no-data-files`` opts out):
 every in-repo file opened while the monitor is active is bucketed like code
 dependencies -- per test during a test, into the shared import-time bucket
 before collection.  Python source and bytecode opens are deliberately *not*
@@ -349,8 +349,8 @@ class FileMonitor:
         self._active = True
         if not self._audit_installed:
             # Audit hooks cannot be unregistered: install at most once per
-            # monitor instance.  Always installed (not only for
-            # --less-data-files): the subprocess-boundary events (Tier A)
+            # monitor instance.  Always installed (not only when
+            # data-file tracking is on): the subprocess-boundary events (Tier A)
             # are recorded unconditionally.  Without data-files the hook
             # rejects ``open`` on a string comparison and returns.
             # A deactivated monitor's leftover hook no-ops via the
@@ -410,7 +410,7 @@ class FileMonitor:
     def _on_audit(self, event, args) -> None:
         """Single always-installed audit hook: two concerns.
 
-        * ``open`` (only when ``--less-data-files``): record non-Python
+        * ``open`` (unless ``--less-no-data-files``): record non-Python
           in-repo files as file-level wildcard deps -- a data file has no
           code structure, so ``(rel, "*", "*")`` means "any content change
           re-runs the tests (or, outside a test, everything) that opened

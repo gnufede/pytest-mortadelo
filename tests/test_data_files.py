@@ -1,8 +1,9 @@
-"""Data-file tracking via the ``open`` audit hook (``--less-data-files``).
+"""Data-file tracking via the ``open`` audit hook (on by default).
 
 Non-Python files opened by tests become file-level wildcard deps, closing
-the data-file blind spot: without the flag, editing a fixture that only
-tests read selects nothing (a red suite behind a green CI).  Python source
+the data-file blind spot: without tracking, editing a fixture that only
+tests read selects nothing (a red suite behind a green CI).  Opt out with
+``--less-no-data-files`` or ``less_data_files = false``.  Python source
 opens must NOT be recorded that way -- they are tracked at block precision,
 and a wildcard dep on them would throw that precision away.
 """
@@ -53,7 +54,7 @@ def data_project(pytester):
 
 
 def record(project, *extra):
-    result = run_less(project, "-q", "--less-data-files", *extra)
+    result = run_less(project, "-q", *extra)
     result.assert_outcomes(passed=3)
     return result
 
@@ -74,7 +75,7 @@ class TestDataFileSelection:
         (data_project.path / "tests" / "fixture.txt").write_text(
             "payload-v2-with-different-content\n"
         )
-        result = run_less(data_project, "-v", "--less-data-files")
+        result = run_less(data_project, "-v")
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
         result.stdout.fnmatch_lines(["*test_read.py::test_read PASSED*"])
@@ -95,25 +96,38 @@ class TestDataFileSelection:
 
         with open(data_project.path / "tests" / "sample.py", "a") as f:
             f.write("\ndef added():\n    return 2\n")
-        result = run_less(data_project, "-q", "--less-data-files")
+        result = run_less(data_project, "-q")
         assert result.ret == 5  # nothing selected, nothing ran
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
-    def test_opt_out_by_default_is_blind_to_data_files(self, data_project):
-        # Documents the default: without the flag the e1 blind spot exists.
+    def test_tracking_is_on_by_default(self, data_project):
+        # No flag at all: the data file is a dep and selects its reader.
         result = run_less(data_project, "-q")
         result.assert_outcomes(passed=3)
+        tests, _ = decode_shard(shard_data(data_project.path))
+        assert "tests/fixture.txt:*" in dep_ids(tests["tests/test_read.py::test_read"])
 
         (data_project.path / "tests" / "fixture.txt").write_text(
             "payload-v2-with-different-content\n"
         )
         result = run_less(data_project, "-q")
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
+
+    def test_cli_opt_out_is_blind_to_data_files(self, data_project):
+        # --less-no-data-files restores the old opt-out behavior (and uses
+        # its own shard: the flag is part of the command key).
+        record(data_project, "--less-no-data-files")
+        result = run_less(data_project, "-q", "--less-no-data-files")
+        assert result.ret == 5  # nothing selected, nothing ran
+        tests, _ = decode_shard(shard_data(data_project.path))
+        assert "tests/fixture.txt:*" not in dep_ids(
+            tests["tests/test_read.py::test_read"]
+        )
 
     def test_no_change_rerun_still_takes_the_fast_path(self, data_project):
         record(data_project)
-        result = run_less(data_project, "-q", "--less-data-files")
+        result = run_less(data_project, "-q")
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
         # The data file must be part of the fast path's dep_files oracle:
@@ -134,17 +148,20 @@ class TestDataFileSelection:
         )
         assert "tests/fixture.txt" in meta["dep_files"]
 
-    def test_ini_enables_data_tracking(self, data_project):
-        data_project.makeini("[pytest]\nless_data_files = true\n")
-        result = run_less(data_project, "-q")
-        result.assert_outcomes(passed=3)
+    def test_ini_opt_out_disables_tracking(self, data_project):
+        data_project.makeini("[pytest]\nless_data_files = false\n")
+        record(data_project)
+        tests, _ = decode_shard(shard_data(data_project.path))
+        assert "tests/fixture.txt:*" not in dep_ids(
+            tests["tests/test_read.py::test_read"]
+        )
 
         (data_project.path / "tests" / "fixture.txt").write_text(
             "payload-v2-with-different-content\n"
         )
         result = run_less(data_project, "-q")
-        result.assert_outcomes(passed=1)
-        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
 
 @pytest.fixture
@@ -169,13 +186,13 @@ def shared_project(pytester):
 
 class TestImportTimeDataFile:
     def test_open_before_first_test_is_shared_by_every_test(self, shared_project):
-        result = run_less(shared_project, "-q", "--less-data-files")
+        result = run_less(shared_project, "-q")
         result.assert_outcomes(passed=2)
 
         _, import_deps = decode_shard(shard_data(shared_project.path))
         assert "tests/shared.cfg:*" in dep_ids(import_deps)
 
         (shared_project.path / "tests" / "shared.cfg").write_text("flag=2\n")
-        result = run_less(shared_project, "-q", "--less-data-files")
+        result = run_less(shared_project, "-q")
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(["*selected 2/2 tests*"])

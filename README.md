@@ -30,7 +30,7 @@ Options:
 | `--less` | enable recording + selection |
 | `--less-force` | run all tests, but still record dependencies |
 | `--less-clean` | discard the stored data for this command before running |
-| `--less-data-files` | also record non-Python files opened by tests (audit hook) as file-level deps; ini: `less_data_files = true` |
+| `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
 | `--less-cosmetic` | ignore docstring-only edits when hashing blocks (comments already ignored); ini: `less_cosmetic = true` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `-p no:less` | disable the plugin entirely |
@@ -74,7 +74,8 @@ the hooks and monitor callback execute during every test, so any plugin edit
 conservatively re-runs everything. This is what makes the plugin safe to run
 on its own test suite (`uv run pytest --less tests`).
 
-**Data files** (opt-in, `--less-data-files` / `less_data_files`): a
+**Data files** (on by default; opt out via `--less-no-data-files` or
+`less_data_files = false`): a
 `sys.addaudithook` subscription on the `open` event records every in-repo
 non-Python file opened while the monitor is active — fixtures, templates,
 profiles, `.proto`/`.dat`/`.sql` assets — bucketed exactly like code
@@ -101,7 +102,8 @@ has dependencies no parent-side event can see (the classic e2b blind spot:
 edit the child-only `worker.py`, watch the test fail with "0 tests
 selected"). Shards recorded before this feature have no `spawning` key and
 treat every test as a spawner until one record run derives the list.
-Child reads of *data* files remain `--less-data-files` territory.
+Child reads of *data* files are not tracked (data-file tracking covers
+the pytest process only).
 
 ### 2. Storage: JSON shards in git refs (never a commit)
 
@@ -345,8 +347,8 @@ conservative model working as designed.
 - The subprocess rule (Tier A) tracks `.py` only, and only attributes
   spawns during the collect/test phases — a process spawned by a conftest
   *at startup* is not tracked (its in-process effects still are, via the
-  import-time bucket), and child reads of data files need
-  `--less-data-files`-adjacent tracking we do not do for children. Tier B
+  import-time bucket), and child reads of data files are not
+  tracked (data-file tracking covers the pytest process only). Tier B
   (monitor in the child) is the precise version, not built.
 - The dynamic-marker widening only considers changed files with a *stale
   recorded block*; it cannot widen edits for which no recording exists at
@@ -360,7 +362,8 @@ conservative model working as designed.
 - Session-fixture teardowns that run after the last test may be attributed
   to that test.
 - Line-level coverage is intentionally not tracked.
-- Non-Python files are only tracked with `--less-data-files` (opt-in);
+- Non-Python data files are tracked by default (opt out with
+  `--less-no-data-files`);
   without it, a change to a data file selects nothing. `dlopen`ed `.so`
   libraries emit no `open` event and are never recorded.
 
