@@ -115,24 +115,43 @@ class GitStore:
         except (subprocess.CalledProcessError, json.JSONDecodeError):
             return None
 
+    def load_parse(self) -> dict | None:
+        """Load parse.json (per-file parse results keyed by content hash)."""
+        try:
+            return json.loads(self._git("cat-file", "blob", f"{self.ref}:parse.json"))
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            return None
+
     def load(self) -> tuple[dict | None, dict | None]:
         """Load the latest shard, or (None, None) if absent/unreadable."""
         if self._ref_sha(self.ref) is None:
             return None, None
         return self.load_data(), self.load_meta()
 
-    def save(self, data: dict, meta: dict) -> None:
-        """Store the shard as a fresh lightweight commit and move the ref."""
+    def save(self, data: dict, meta: dict, parse: dict | None = None) -> None:
+        """Store the shard as a fresh lightweight commit and move the ref.
+
+        *parse* is the new parse.json content; ``None`` carries the existing
+        blob over untouched (by object id: it is not even read).
+        """
         data_blob = self._git(
             "hash-object", "-w", "--stdin", stdin=json.dumps(data)
         ).strip()
         meta_blob = self._git(
             "hash-object", "-w", "--stdin", stdin=json.dumps(meta)
         ).strip()
+        if parse is not None:
+            parse_blob = self._git(
+                "hash-object", "-w", "--stdin", stdin=json.dumps(parse)
+            ).strip()
+        else:
+            parse_blob = self._ref_sha(f"{self.ref}:parse.json")
         tree_input = (
             f"100644 blob {data_blob}\tdata.json\n"
             f"100644 blob {meta_blob}\tmeta.json\n"
         )
+        if parse_blob:
+            tree_input += f"100644 blob {parse_blob}\tparse.json\n"
         tree = self._git("mktree", stdin=tree_input).strip()
         message = f"pytest-less shard {self.shard}"
         try:

@@ -69,7 +69,7 @@ import os
 import sys
 from pathlib import Path
 
-from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache
+from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache, ParseCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 try:
@@ -244,6 +244,7 @@ class FileMonitor:
         self, root: Path, exclude_roots: tuple[Path, ...] = (),
         *, data_files: bool = False,
         cosmetic: bool = True,
+        parse_cache: ParseCache | None = None,
     ):
         self.root = Path(root).resolve()
         # Whether non-Python files opened by tests are recorded as
@@ -274,7 +275,9 @@ class FileMonitor:
         self.spawn_shared = False
         # Block analysis (one AST parse per file, lazily).  ``cosmetic``
         # strips docstrings before hashing (on by default).
-        self._blocks = BlockCache(self.root, cosmetic=cosmetic)
+        self._blocks = BlockCache(
+            self.root, cosmetic=cosmetic, parse_cache=parse_cache
+        )
         # Internals.
         self._active = False
         self._tool_id: int | None = None
@@ -801,6 +804,15 @@ class FileMonitor:
     def module_dep(self, rel: str) -> Block:
         """Import-time dependency on a module (its skeleton)."""
         return self._blocks.module_dep(rel)
+
+    @property
+    def parse_cache(self) -> ParseCache | None:
+        return self._blocks.parse_cache
+
+    @property
+    def parse_stats(self) -> tuple[int, int]:
+        """(parse-cache hits, files actually parsed)."""
+        return self._blocks.hits, self._blocks.misses
 
     def file_blocks(self, rel: str):
         """Block table of a repo file (None if unparseable); cached."""

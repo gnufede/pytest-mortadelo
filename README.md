@@ -138,7 +138,8 @@ For every pytest **command** the data is stored in a dedicated ref:
 ```
 refs/less/<shard>   →  lightweight commit
                             ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "doc_readers":[...], "bdocs":[hash per block-table entry]}
-                            └── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
+                            ├── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
+                            └── parse.json  {"v":1, "py":"3.13", "cosmetic":true, "files":{file:{"h":content-hash, "b":{block:[hash,docs-hash]}, "s":spans, "m":markers, "r":reads-docs}}}
 ```
 
 - The shard key is a hash of the **normalized** invocation arguments
@@ -156,6 +157,22 @@ refs/less/<shard>   →  lightweight commit
   `commit-tree` / `update-ref`); it never touches the working tree, `HEAD`,
   or any branch, and nothing is ever committed by normal `git commit`.
 - Latest record wins: the ref always points at the most recent run's data.
+- **Parse cache (`parse.json`).** `git diff` tells us which files changed for
+  *staleness*, but resolving an executed code object to a block needs the
+  block table of every file whose code runs — changed or not — and an
+  incremental run used to re-parse hundreds of untouched files (about half the
+  wall time of a run that selects nothing). `parse.json` stores each
+  dependency file's analysis keyed by the **hash of its bytes**: reading and
+  hashing a file costs ~0.1 ms against ~10 ms to parse and hash its blocks.
+  Every entry is verified against the current bytes on every use, so a stale
+  entry is just a miss — whatever the working tree looked like when it was
+  written (dirty, reverted, another branch). The blob is only valid for the
+  same Python minor version, cosmetic setting and analysis version
+  (`PARSE_CACHE_VERSION`, bumped whenever hashing changes), is loaded on first
+  use (never on the no-change fast path), and is carried over by object id
+  when nothing new was parsed. Because it lives in the shard it travels with
+  `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
+  dependency set. A cold first record parses everything, as before.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 

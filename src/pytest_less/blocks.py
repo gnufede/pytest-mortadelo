@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import sys
 from pathlib import Path
 
 MODULE_BLOCK = "<module>"
@@ -392,25 +393,157 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
     return FileBlocks(blocks, spans, markers, bdocs, reads_docs)
 
 
+# Bump when anything that feeds a block/docstring hash changes (the algorithm
+# in parse_blocks / scan_tree / block_docstring_hashes): a stored parse result
+# from another version must not be trusted.
+PARSE_CACHE_VERSION = 1
+
+
+def _content_hash(data: bytes) -> str:
+    return hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
+def _file_to_json(fb: FileBlocks) -> dict:
+    return {
+        "b": {k: [v, fb.bdocs.get(k, "")] for k, v in fb.blocks.items()},
+        "s": [list(span) for span in fb.spans],
+        "m": list(fb.markers),
+        "r": int(fb.reads_docs),
+    }
+
+
+def _file_from_json(d: dict) -> FileBlocks:
+    blocks = {k: v[0] for k, v in d["b"].items()}
+    bdocs = {k: v[1] for k, v in d["b"].items() if v[1]}
+    spans = [(int(a), int(b), c) for a, b, c in d["s"]]
+    return FileBlocks(blocks, spans, tuple(d["m"]), bdocs, bool(d["r"]))
+
+
+class ParseCache:
+    """Parse results keyed by file *content hash*.
+
+    Analyzing a file (parse + block hashes + marker scan) costs ~10ms; reading
+    it and hashing the bytes costs ~0.1ms.  ``git diff`` already tells us which
+    files changed for *staleness*, but resolving an executed code object to a
+    block needs the block table of every file whose code runs -- changed or
+    not -- so an incremental run used to re-parse hundreds of untouched files.
+    Entries are verified against the current bytes on every use, so a stale
+    entry is merely a miss: the cache can never serve a wrong table, whatever
+    the working tree looked like when it was written (dirty, reverted, switched
+    branch).  It lives in the shard (``parse.json``) and travels with it.
+    """
+
+    def __init__(self, loader=None, *, cosmetic: bool = False) -> None:
+        self._loader = loader
+        self._cosmetic = cosmetic
+        self._loaded = loader is None
+        self._header_ok = True
+        self._had_blob = False
+        self.entries: dict[str, dict] = {}
+        self.fresh: dict[str, dict] = {}
+
+    def _header(self) -> dict:
+        return {
+            "v": PARSE_CACHE_VERSION,
+            "py": f"{sys.version_info[0]}.{sys.version_info[1]}",
+            "cosmetic": self._cosmetic,
+        }
+
+    def preload(self) -> None:
+        """Read the stored cache now (call outside the monitored region: the
+        loader may spawn a git process)."""
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            raw = self._loader()
+        except Exception:
+            raw = None
+        if not isinstance(raw, dict):
+            return
+        self._had_blob = True
+        header = self._header()
+        if all(raw.get(k) == v for k, v in header.items()) and isinstance(
+            raw.get("files"), dict
+        ):
+            self.entries = raw["files"]
+        else:
+            self._header_ok = False
+
+    def lookup(self, rel: str, digest: str) -> FileBlocks | None:
+        self.preload()
+        entry = self.fresh.get(rel) or self.entries.get(rel)
+        if entry is None or entry.get("h") != digest:
+            return None
+        try:
+            return _file_from_json(entry)
+        except Exception:  # corrupt / foreign entry: a miss, never a crash
+            return None
+
+    def store(self, rel: str, digest: str, fb: FileBlocks) -> None:
+        entry = _file_to_json(fb)
+        entry["h"] = digest
+        self.fresh[rel] = entry
+
+    def dump(self, keep: set[str]) -> dict | None:
+        """The cache to persist (entries for *keep* only), or None when the
+        stored blob is already exactly right and can be carried over as is."""
+        self.preload()
+        files = {rel: e for rel, e in self.entries.items() if rel in keep}
+        files.update({rel: e for rel, e in self.fresh.items() if rel in keep})
+        unchanged = (
+            self._header_ok
+            and (self._had_blob or not files)
+            and set(files) == set(self.entries)
+            and not any(rel in keep for rel in self.fresh)
+        )
+        if unchanged:
+            return None
+        return {**self._header(), "files": files}
+
+
 class BlockCache:
     """Lazily parses repo files into :class:`FileBlocks` (one parse per file)."""
 
-    def __init__(self, root: Path, *, cosmetic: bool = False):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        cosmetic: bool = False,
+        parse_cache: ParseCache | None = None,
+    ):
         self.root = root
         self.cosmetic = cosmetic
+        self.parse_cache = parse_cache
+        self.hits = 0
+        self.misses = 0
         self._cache: dict[str, FileBlocks | None] = {}
 
     def file_blocks(self, rel: str) -> FileBlocks | None:
-        if rel not in self._cache:
-            try:
-                source = (self.root / rel).read_text(
-                    encoding="utf-8", errors="replace"
-                )
-            except OSError:
-                self._cache[rel] = None
-            else:
-                self._cache[rel] = parse_blocks(source, cosmetic=self.cosmetic)
-        return self._cache[rel]
+        if rel in self._cache:
+            return self._cache[rel]
+        try:
+            data = (self.root / rel).read_bytes()
+        except OSError:
+            self._cache[rel] = None
+            return None
+        digest = None
+        if self.parse_cache is not None:
+            digest = _content_hash(data)
+            fb = self.parse_cache.lookup(rel, digest)
+            if fb is not None:
+                self.hits += 1
+                self._cache[rel] = fb
+                return fb
+        source = data.decode("utf-8", errors="replace")
+        if b"\r" in data:  # same universal-newline translation as read_text
+            source = source.replace("\r\n", "\n").replace("\r", "\n")
+        fb = parse_blocks(source, cosmetic=self.cosmetic)
+        self.misses += 1
+        if self.parse_cache is not None and fb is not None:
+            self.parse_cache.store(rel, digest, fb)
+        self._cache[rel] = fb
+        return fb
 
     def module_dep(self, rel: str) -> Block:
         """Import-time dependency on a module: its skeleton."""

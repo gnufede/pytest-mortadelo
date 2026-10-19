@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from .blocks import DYNAMIC_DEP, WILDCARD, Block
+from .blocks import DYNAMIC_DEP, WILDCARD, Block, ParseCache
 from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import (
@@ -338,7 +338,22 @@ def pytest_load_initial_conftests(early_config, parser, args):
                 cosmetic = "--less-no-cosmetic" not in args and _cosmetic_enabled(
                     early_config, args
                 )
-                monitor = FileMonitor(root, data_files=data_files, cosmetic=cosmetic)
+                # Parse cache (shard blob, content-hash keyed): loaded now,
+                # before the tool is armed, so the git call is not observed
+                # and import-time parses already hit it.
+                parse_cache = ParseCache(
+                    GitStore(
+                        root, command_key(early_config.invocation_params.args, root)
+                    ).load_parse,
+                    cosmetic=cosmetic,
+                )
+                parse_cache.preload()
+                monitor = FileMonitor(
+                    root,
+                    data_files=data_files,
+                    cosmetic=cosmetic,
+                    parse_cache=parse_cache,
+                )
                 if monitor.activate():
                     # Stash on the config (the same instance
                     # pytest_configure receives) instead of a module global.
@@ -426,10 +441,14 @@ class LessState:
                 # and --less from ini addopts): root conftest imports
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
+                cosmetic = _cosmetic_enabled(config)
+                parse_cache = ParseCache(self.store.load_parse, cosmetic=cosmetic)
+                parse_cache.preload()
                 self.monitor = FileMonitor(
                     self.root,
                     data_files=_data_files_enabled(config),
-                    cosmetic=_cosmetic_enabled(config),
+                    cosmetic=cosmetic,
+                    parse_cache=parse_cache,
                 )
                 self.monitor.activate()
                 self.notes.append(
@@ -934,7 +953,17 @@ class LessState:
             "spawn_unknown": spawn_unknown,
             "dynamic": sorted(dynamic) if dynamic is not None else None,
         }
-        self.store.save(data, meta)
+        # Parse results of the dependency files (content-hash keyed, verified
+        # on every use): None carries the stored blob over untouched.
+        parse = None
+        if monitor.parse_cache is not None:
+            parse = monitor.parse_cache.dump({f for f in dep_files if f.endswith(".py")})
+            hits, parsed = monitor.parse_stats
+            if config.getoption("verbose", 0) > 0 and hits + parsed:
+                self.notes.append(
+                    f"less: parse cache: {hits} hit(s), {parsed} file(s) parsed"
+                )
+        self.store.save(data, meta, parse=parse)
         if self.sync_remote and self.sync_mode in ("push", "both"):
             try:
                 self.notes.append(f"less: {self.store.sync_push(self.sync_remote)}")
