@@ -19,7 +19,7 @@ Dependencies are ``Block`` triples ``(repo-relative file, block id, content
 hash)``.  A ``WILDCARD`` block id means "any change to this file re-runs"
 (the file-level fallback for code objects we cannot map to a block:
 redefined names, dynamically compiled code, unparseable files, and
-non-Python data files recorded through the ``open`` audit hook).
+non-Python data files recorded by wrapping ``open``).
 
 Blocks are identified by mapping the executing *code object* directly via
 ``co_qualname`` (precise, immune to code motion, no coverage-line mapping),
@@ -39,7 +39,6 @@ are invisible to the AST anyway).  A per-file docstring hash plus a
 from __future__ import annotations
 
 import ast
-import copy
 import hashlib
 from pathlib import Path
 
@@ -70,16 +69,24 @@ _DYNAMIC_ATTR_CALLS = frozenset({"getattr", "setattr", "delattr"})
 _DYNAMIC_METHODS = frozenset({"__getattr__", "__getattribute__"})
 
 
-def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
-    """Reflective/dynamic constructs in *tree*, as ``name@Lline`` strings.
+def scan_tree(tree: ast.AST) -> tuple[tuple[str, ...], bool]:
+    """One walk over *tree*: ``(dynamic markers, reads docstrings)``.
 
-    Deliberately ignores *statically resolvable* access: ``getattr(x, "lit")``
-    names its attribute, so it cannot hide an unseen edge; a computed second
-    argument (anything but a string constant) is flagged.  ``__getattr__`` /
-    ``__getattribute__`` definitions are flagged wholesale: every attribute
-    read on the object may dispatch to code no recording saw execute.
+    Dynamic markers are reflective/dynamic constructs as ``name@Lline``
+    strings.  Deliberately ignored: *statically resolvable* access --
+    ``getattr(x, "lit")`` names its attribute, so it cannot hide an unseen
+    edge; a computed second argument (anything but a string constant) is
+    flagged.  ``__getattr__`` / ``__getattribute__`` definitions are flagged
+    wholesale: every attribute read on the object may dispatch to code no
+    recording saw execute.
+
+    "Reads docstrings" is true for a *load* of ``__doc__``/``getdoc``/
+    ``cleandoc``/``help`` or an import of ``doctest``/``pydoc`` (see
+    ``_DOC_ATTRS``); *assigning* ``fn.__doc__ = ...`` is not reading.
     """
     markers: set[str] = set()
+    reads_docs = False
+    Load = ast.Load
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func = node.func
@@ -102,7 +109,27 @@ def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name in _DYNAMIC_METHODS:
                 markers.add(f"{node.name}@L{node.lineno}")
-    return tuple(sorted(markers))
+        elif not reads_docs:
+            if isinstance(node, ast.Attribute):
+                reads_docs = node.attr in _DOC_ATTRS and isinstance(node.ctx, Load)
+            elif isinstance(node, ast.Name):
+                reads_docs = (
+                    node.id in _DOC_ATTRS or node.id == "help"
+                ) and isinstance(node.ctx, Load)
+            elif isinstance(node, ast.Import):
+                reads_docs = any(
+                    a.name.split(".")[0] in _DOC_MODULES for a in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                reads_docs = (node.module or "").split(".")[0] in _DOC_MODULES or any(
+                    a.name in _DOC_ATTRS for a in node.names
+                )
+    return tuple(sorted(markers)), reads_docs
+
+
+def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
+    """Reflective/dynamic constructs in *tree* (see :func:`scan_tree`)."""
+    return scan_tree(tree)[0]
 
 
 # Docstring readers: code that treats a docstring as *data* (help text,
@@ -114,36 +141,63 @@ _DOC_MODULES = frozenset({"doctest", "pydoc"})
 
 
 def find_doc_readers(tree: ast.AST) -> bool:
-    """Whether *tree* references docstrings as data (see ``_DOC_ATTRS``)."""
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in _DOC_ATTRS:
-            return True
-        if isinstance(node, ast.Name) and (
-            node.id in _DOC_ATTRS or node.id == "help"
-        ):
-            return True
-        if isinstance(node, ast.Import):
-            if any(a.name.split(".")[0] in _DOC_MODULES for a in node.names):
-                return True
-        elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").split(".")[0] in _DOC_MODULES:
-                return True
-            if any(a.name in _DOC_ATTRS for a in node.names):
-                return True
-    return False
+    """Whether *tree* reads docstrings as data (see :func:`scan_tree`)."""
+    return scan_tree(tree)[1]
 
 
-def docstrings_hash(tree: ast.AST) -> str:
-    """Hash of every docstring in *tree* (before any stripping)."""
-    docs = [
-        ast.get_docstring(node, clean=False)
-        for node in ast.walk(tree)
-        if isinstance(
-            node,
-            (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        )
-    ]
-    return _hash(repr(docs))
+def _scopes(tree: ast.AST):
+    """Every Module/ClassDef/FunctionDef node, found by walking *statements*
+    only (docstring owners cannot hide inside expressions; skipping them is
+    several times cheaper than a full ``ast.walk``)."""
+    scope_types = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, scope_types):
+            yield node
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                stack.append(child)
+
+
+def block_docstring_hashes(tree: ast.AST) -> dict[int, str]:
+    """``id(node) -> hash of the docstrings that node's block hash covers``.
+
+    Computed on the *unstripped* tree.  A function block covers every
+    docstring in its subtree (nested definitions included); a class or module
+    block is a skeleton -- function bodies are stubbed out -- so it covers
+    only the class/module docstrings outside function bodies.  The cosmetic
+    filter hides exactly these texts from the block hashes, so recording them
+    lets selection tell "this block's docstring changed" from "this block's
+    code changed".
+    """
+    out: dict[int, str] = {}
+    scope_types = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    func_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+    def walk(node: ast.AST) -> tuple[list, list]:
+        """(docstrings in the full subtree, docstrings of the skeleton)."""
+        full: list = []
+        skel: list = []
+        if isinstance(node, scope_types):
+            doc = ast.get_docstring(node, clean=False)
+            full.append(doc)
+            if not isinstance(node, func_types):
+                skel.append(doc)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                child_full, child_skel = walk(child)
+                full += child_full
+                if not isinstance(child, func_types):
+                    skel += child_skel
+        if isinstance(node, func_types):
+            out[id(node)] = _hash(repr(full))
+        elif isinstance(node, scope_types):
+            out[id(node)] = _hash(repr(skel))
+        return full, skel
+
+    walk(tree)
+    return out
 
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
@@ -151,36 +205,59 @@ def _strip_docstrings(tree: ast.AST) -> ast.AST:
 
     The cosmetic edit filter (on by default): a docstring is prose, not
     behavior -- for code that never reads ``__doc__`` (files that do are
-    flagged by :func:`find_doc_readers` and keep their docstring edits
-    selecting).  Only true docstrings
-    (a bare string as the first body statement, the ``ast.get_docstring``
-    definition) are removed; string values elsewhere are behavior and stay.
-    Comments and whitespace are already invisible to ``ast.dump``, so this is
-    the entire textual surface the hash needs to ignore.  Annotations are
-    deliberately *kept*: typing changes are observable.
+    flagged by :func:`scan_tree` and keep their docstring edits selecting).
+    Only true docstrings (a bare string as the first body statement, the
+    ``ast.get_docstring`` definition) are removed; string values elsewhere
+    are behavior and stay.  Comments and whitespace are already invisible to
+    ``ast.dump``, so this is the entire textual surface the hash needs to
+    ignore.  Annotations are deliberately *kept*: typing changes are
+    observable.
     """
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            body = node.body
-            if (
-                body
-                and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)
-            ):
-                rest = body[1:]
-                # A function whose entire body is its docstring still needs
-                # a statement to be valid Python (hashes only, never run).
-                node.body = rest or [ast.Pass()]
+    for node in _scopes(tree):
+        body = node.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            # A function whose entire body is its docstring still needs a
+            # statement to be valid Python (hashes only, never run).
+            node.body = body[1:] or [ast.Pass()]
     return tree
 
 
-def _stub_bodies(tree: ast.AST) -> ast.AST:
-    """Replace every function/method body in *tree* with a single ``pass``."""
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node.body = [ast.Pass()]
-    return tree
+_PASS_BODY: list[ast.stmt] = [ast.Pass()]
+
+
+def _skeleton_dump(node: ast.AST) -> str:
+    """``ast.dump`` of *node* with every function body replaced by ``pass``.
+
+    The class / module skeleton: what executes at import time (class-level
+    statements, decorators, signatures) without the method bodies.  Computed
+    **in place** -- swap the bodies, dump, restore -- instead of on a
+    ``deepcopy``: copying every class (methods and all) was 60% of the whole
+    analysis cost on a large codebase (5s of 11s for 295 sqlalchemy files).
+    The traversal does not descend into function bodies (they are being
+    replaced anyway), so it only touches the class-level statements.  The
+    result is byte-identical to the copy-based version, so recorded shards
+    stay valid.
+    """
+    stash: list[tuple[ast.AST, list[ast.stmt]]] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stash.append((child, child.body))
+                child.body = _PASS_BODY
+            elif isinstance(child, (ast.stmt, ast.ExceptHandler, ast.match_case)):
+                stack.append(child)
+    try:
+        return ast.dump(node, include_attributes=False)
+    finally:
+        for fn, body in stash:
+            fn.body = body
 
 
 class FileBlocks:
@@ -194,22 +271,23 @@ class FileBlocks:
     constructs (see :func:`find_dynamic_markers`), empty for ordinary code.
     """
 
-    __slots__ = ("blocks", "doc_hash", "markers", "reads_docs", "spans")
+    __slots__ = ("bdocs", "blocks", "markers", "reads_docs", "spans")
 
     def __init__(
         self,
         blocks: dict[str, str],
         spans: list[tuple[int, int, str]],
         markers: tuple[str, ...] = (),
-        doc_hash: str = "",
+        bdocs: dict[str, str] | None = None,
         reads_docs: bool = False,
     ) -> None:
         self.blocks = blocks
         self.spans = spans
         self.markers = markers
-        # Hash of all docstrings of the file, and whether the file reads
-        # docstrings as data: the safety net of the cosmetic filter.
-        self.doc_hash = doc_hash
+        # Per-block docstring hash (what the cosmetic filter hides from the
+        # block hash) and whether the file reads docstrings as data: the
+        # safety net of the cosmetic filter.
+        self.bdocs = bdocs or {}
         self.reads_docs = reads_docs
 
     def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
@@ -242,14 +320,15 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
         return None
-    markers = find_dynamic_markers(tree)
-    reads_docs = find_doc_readers(tree)
-    doc_hash = docstrings_hash(tree)
+    markers, reads_docs = scan_tree(tree)
+    node_docs = block_docstring_hashes(tree)
     if cosmetic:
         _strip_docstrings(tree)
 
     blocks: dict[str, str] = {}
     spans: list[tuple[int, int, str]] = []
+    # (qname, first line, last line, hash, docstring hash)
+    defs: list[tuple[str, int, int, str, str]] = []
 
     def visit(node: ast.AST, prefix: str, in_function: bool) -> None:
         for child in ast.iter_child_nodes(node):
@@ -270,26 +349,18 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
                 # The class body executes at import time: its hash is the
                 # class skeleton (method bodies stubbed, class-level
                 # statements intact).
-                content = _hash(
-                    ast.dump(
-                        _stub_bodies(copy.deepcopy(child)), include_attributes=False
-                    )
-                )
-                start = child.lineno
+                content = _hash(_skeleton_dump(child))
             else:
                 content = _hash(ast.dump(child, include_attributes=False))
-                start = (
-                    child.decorator_list[0].lineno
-                    if child.decorator_list
-                    else child.lineno
-                )
-            if qname not in blocks:
-                blocks[qname] = content
-            elif blocks[qname] != content:
-                # Same qualified name defined twice with different content
-                # (e.g. branches): unresolvable -- file-level fallback.
-                blocks[qname] = WILDCARD
-            spans.append((start, child.end_lineno, qname))
+            # co_firstlineno points at the first decorator when present.
+            start = (
+                child.decorator_list[0].lineno
+                if child.decorator_list
+                else child.lineno
+            )
+            defs.append(
+                (qname, start, child.end_lineno, content, node_docs[id(child)])
+            )
             visit(
                 child,
                 qname,
@@ -297,8 +368,28 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
             )
 
     visit(tree, "", False)
-    blocks[MODULE_BLOCK] = _hash(ast.dump(_stub_bodies(tree), include_attributes=False))
-    return FileBlocks(blocks, spans, markers, doc_hash, reads_docs)
+    # A qualified name defined more than once with *different* content
+    # (``@overload`` stubs, property getter/setter pairs, conditional
+    # definitions) is ambiguous: ``co_qualname`` cannot tell the definitions
+    # apart.  Each gets its own id, ``qname~<hash>``, resolved by source line.
+    # An edit then only invalidates the definition that changed (and an
+    # ``@overload`` stub, which never executes, invalidates nothing).  The old
+    # behaviour -- a file-level wildcard -- made *any* edit to such a file,
+    # even a comment, stale for every test that touched one of them: 314
+    # blocks over 91 files in sqlalchemy, including ``Session.execute``.
+    distinct: dict[str, set[str]] = {}
+    for qname, _, _, content, _ in defs:
+        distinct.setdefault(qname, set()).add(content)
+    bdocs: dict[str, str] = {}
+    for qname, start, end, content, doc in defs:
+        block_id = qname if len(distinct[qname]) == 1 else f"{qname}~{content}"
+        blocks[block_id] = content
+        # Identical duplicates share a block id: fold their docstrings.
+        bdocs[block_id] = _hash(bdocs[block_id] + doc) if block_id in bdocs else doc
+        spans.append((start, end, block_id))
+    blocks[MODULE_BLOCK] = _hash(_skeleton_dump(tree))
+    bdocs[MODULE_BLOCK] = node_docs[id(tree)]
+    return FileBlocks(blocks, spans, markers, bdocs, reads_docs)
 
 
 class BlockCache:

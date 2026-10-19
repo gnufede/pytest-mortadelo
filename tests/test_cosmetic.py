@@ -170,13 +170,14 @@ READER = (
 
 @pytest.fixture
 def reader_project(doc_project):
-    """doc_project plus a test that reads ``lib.documented.__doc__`` through
-    a docstring-reading helper (``reader.py``)."""
+    """doc_project plus a test that executes ``lib.documented`` *and* reads its
+    ``__doc__`` through a docstring-reading helper (``reader.py``)."""
     tests = doc_project.path / "tests"
     (tests / "reader.py").write_text(READER)
     (tests / "test_reader.py").write_text(
         "def test_reader():\n"
         "    import lib, reader\n"
+        "    assert lib.documented() == 1\n"
         "    assert 'prose' in reader.read_doc(lib.documented)\n"
     )
     commit(doc_project.path, "add reader")
@@ -188,8 +189,8 @@ class TestDocReaderSafetyNet:
         run_less(reader_project, "-q").assert_outcomes(passed=3)
         write_lib(reader_project, DOCSTRING_EDIT)
         result = run_less(reader_project, "-v")
-        # test_doc ran lib.documented but reads no docstrings: still
-        # deselected.  test_reader read the docstring: selected.
+        # test_doc executed lib.documented but reads no docstrings: still
+        # deselected.  test_reader executed it *and* read the docstring.
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
         result.stdout.fnmatch_lines(["*test_reader.py::test_reader PASSED*"])
@@ -204,22 +205,35 @@ class TestDocReaderSafetyNet:
         result.stdout.no_fnmatch_line("*test_doc.py::test_doc PASSED*")
         result.stdout.no_fnmatch_line("*test_plain.py::test_plain PASSED*")
 
+    def test_net_never_selects_more_than_no_filter_at_all(self, reader_project):
+        # The safety net restores the unfiltered behavior for doc-sensitive
+        # tests; it must not exceed it.
+        run_less(reader_project, "-q").assert_outcomes(passed=3)
+        run_less(reader_project, "-q", "--less-no-cosmetic").assert_outcomes(passed=3)
+        write_lib(reader_project, DOCSTRING_EDIT)
+        with_net = run_less(reader_project, "-q")
+        without = run_less(reader_project, "-q", "--less-no-cosmetic")
+        n_net = int(with_net.parseoutcomes().get("passed", 0))
+        n_plain = int(without.parseoutcomes().get("passed", 0))
+        assert n_net <= n_plain
+        assert (n_net, n_plain) == (1, 2)  # test_reader  vs  test_reader + test_doc
+
     def test_semantic_edit_unaffected(self, reader_project):
         run_less(reader_project, "-q").assert_outcomes(passed=3)
         write_lib(reader_project, BODY_EDIT)
         result = run_less(reader_project, "-v")
-        # documented()'s body changed: only test_doc *executes* it
-        # (test_reader merely reads its docstring) -- block precision holds.
-        result.assert_outcomes(passed=1)
-        result.stdout.fnmatch_lines(["*test_doc.py::test_doc PASSED*"])
+        # documented()'s body changed: both executors re-run (stale block).
+        result.assert_outcomes(passed=2)
 
     def test_record_stores_docs_and_readers(self, reader_project):
         from test_plugin import shard_data
 
         run_less(reader_project, "-q").assert_outcomes(passed=3)
         data = shard_data(reader_project.path)
-        assert "tests/lib.py" in data["docs"]
         assert data["doc_readers"] == ["tests/reader.py"]
+        # one docstring hash per block-table entry, parallel to ``blocks``
+        assert len(data["bdocs"]) == len(data["blocks"])
+        assert any(data["bdocs"])
 
 
 class TestHashNormalization:
@@ -289,12 +303,40 @@ class TestHashNormalization:
 
 
 class TestDocAnalysis:
-    def test_doc_hash_tracks_only_docstrings(self):
-        a = parse_blocks('def f():\n    """one"""\n    return 1\n', cosmetic=True)
-        b = parse_blocks('def f():\n    """two"""\n    return 1\n', cosmetic=True)
-        c = parse_blocks('def f():\n    """one"""\n    return 2\n', cosmetic=True)
-        assert a.blocks == b.blocks and a.doc_hash != b.doc_hash
-        assert a.doc_hash == c.doc_hash
+    def test_block_doc_hash_tracks_only_the_blocks_own_docstrings(self):
+        a = parse_blocks('def f():\n    "one"\n    return 1\n', cosmetic=True)
+        b = parse_blocks('def f():\n    "two"\n    return 1\n', cosmetic=True)
+        c = parse_blocks('def f():\n    "one"\n    return 2\n', cosmetic=True)
+        assert a.blocks == b.blocks and a.bdocs["f"] != b.bdocs["f"]
+        assert a.bdocs["f"] == c.bdocs["f"]
+
+    def test_skeleton_docs_exclude_function_bodies(self):
+        # The class/module block hashes stub function bodies out, so their
+        # docstring hashes must not cover method docstrings -- and a method's
+        # own block must.
+        src = (
+            '"mod"\n'
+            "class C:\n"
+            '    "cls"\n'
+            "    def m(self):\n"
+            '        "meth"\n'
+            "        return 1\n"
+        )
+        a = parse_blocks(src, cosmetic=True)
+        b = parse_blocks(src.replace("meth", "METH"), cosmetic=True)
+        assert a.bdocs["C"] == b.bdocs["C"]
+        assert a.bdocs["<module>"] == b.bdocs["<module>"]
+        assert a.bdocs["C.m"] != b.bdocs["C.m"]
+        c = parse_blocks(src.replace("cls", "CLS"), cosmetic=True)
+        assert a.bdocs["C"] != c.bdocs["C"] and a.bdocs["C.m"] == c.bdocs["C.m"]
+
+    def test_nested_function_docstring_is_covered_by_the_outer_block(self):
+        src = "def f():\n    def g():\n        'one'\n    return g\n"
+        a = parse_blocks(src, cosmetic=True)
+        b = parse_blocks(src.replace("one", "two"), cosmetic=True)
+        assert a.blocks == b.blocks
+        assert a.bdocs["f"] != b.bdocs["f"]
+        assert a.bdocs["f.<locals>.g"] != b.bdocs["f.<locals>.g"]
 
     @pytest.mark.parametrize(
         "src",

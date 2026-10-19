@@ -4,7 +4,7 @@ A dependency is a ``Block`` triple ``(file, block id, hash)``.  A changed
 file does not automatically affect a test: the file is re-parsed and only
 stale blocks (missing, or with a different content hash) re-run their
 dependents.  A ``WILDCARD`` block id (dynamic code, redefined names, v1
-shards, unparseable files, audit-recorded data files) means "any change
+shards, unparseable files, recorded data files) means "any change
 to this file re-runs".
 
 Tests are selected when they have no recorded data, failed in the recorded
@@ -22,14 +22,23 @@ of that:
   during collection, where the culprit test is unknown) falls back to the
   weaker rule: every test is selected when a changed ``.py`` file is stale
   or was never recorded at all.
-* **runtime-dynamic tests** -- tests that ran string-compiled code or went
-  through a reflective entry point (``importlib.import_module``, ...) at
-  test time (``dynamic``) are selected under that same "stale or never
-  recorded .py changed" condition.
+* **runtime-dynamic tests** -- tests that went through a reflective entry
+  point (``importlib.import_module``, ``pkgutil.walk_packages``, ``runpy``,
+  ...) at test time (``dynamic``) are selected when a changed ``.py`` file
+  was *never recorded* (a new module, or one no test ever executed): the one
+  edge a computed name can reach that the recording never saw.  A *stale*
+  recorded file needs no widening: whatever the test executed of it is
+  already a dependency, and what it did not execute cannot change its
+  result.  (String-compiled code -- ``eval``/``exec`` -- is deliberately not
+  a signal: the generated code comes from generators that are themselves
+  recorded, and flagging it selected 69% of sqlalchemy's ORM tests on every
+  edit.)
 * **docstring readers** -- the cosmetic filter hides docstring-only edits
-  from the block hashes; a changed file whose docstrings differ from the
-  recorded ones still selects the tests that touched it *if* they also ran
-  a file that reads docstrings as data (``doc_readers``).
+  from the block hashes.  A block whose docstring text differs from the
+  recorded one (``block_docs``) still selects the tests that executed it
+  *if* they also ran a file that reads docstrings as data (``doc_readers``).
+  This is block-level, so its selection is always a subset of what no
+  cosmetic filter at all would select.
 * everything else is block-precise; each widening is reported in the run
   summary, never silent.
 """
@@ -67,9 +76,9 @@ class Shard:
     # Tests that ran string-compiled code / reflective entry points.  None =
     # unknown (old shard): every test is conservatively treated as dynamic.
     dynamic: set[str] | None = field(default_factory=set)
-    # Per-file docstring hash at record time, and the files that read
+    # Per-block docstring hash at record time, and the files that read
     # docstrings as data (the cosmetic filter's safety net).
-    docs: dict[str, str] = field(default_factory=dict)
+    block_docs: dict[Block, str] = field(default_factory=dict)
     doc_readers: set[str] = field(default_factory=set)
 
 
@@ -154,12 +163,14 @@ def load_shard(data, meta) -> Shard | None:
             if isinstance(raw_dynamic, list)
             else None
         )
-        raw_docs = data.get("docs")
-        docs = (
-            {k: v for k, v in raw_docs.items() if isinstance(k, str) and isinstance(v, str)}
-            if isinstance(raw_docs, dict)
-            else {}
-        )
+        # Per-block docstring hashes, parallel to the block table (absent in
+        # shards recorded before the safety net: no doc information).
+        block_docs: dict[Block, str] = {}
+        raw_bdocs = data.get("bdocs")
+        if version == DATA_VERSION and isinstance(raw_bdocs, list):
+            for block, doc in zip(table, raw_bdocs, strict=False):
+                if isinstance(doc, str) and doc:
+                    block_docs[block] = doc
         raw_readers = data.get("doc_readers")
         doc_readers = (
             {r for r in raw_readers if isinstance(r, str)}
@@ -179,7 +190,7 @@ def load_shard(data, meta) -> Shard | None:
         always=always,
         spawn_unknown=spawn_unknown,
         dynamic=dynamic,
-        docs=docs,
+        block_docs=block_docs,
         doc_readers=doc_readers,
     )
 
@@ -218,9 +229,11 @@ class _Context:
     dynamic_files: set[str]  # marker-bearing files with a stale block
     dynamic_global: bool  # ... of which one is in the shared import bucket
     spawn_active: bool  # some changed .py is stale or was never recorded
+    unrecorded_py: bool = False  # some changed .py was never recorded
     import_files: set[str] = field(default_factory=set)
-    # Changed files whose docstrings differ from the recorded ones.
-    doc_changed: set[str] = field(default_factory=set)
+    # Recorded blocks (not stale) whose docstring text changed.
+    doc_changed: set[Block] = field(default_factory=set)
+    import_doc_changed: bool = False
     _memo: dict[Block, bool] = field(default_factory=dict)
 
     def stale(self, dep: Block) -> bool:
@@ -247,12 +260,25 @@ def build_context(
     recorded: set[str] = set()
     stale_files: set[str] = set()
 
+    doc_changed: set[Block] = set()
+
     def note(block: Block) -> None:
         rel = block[0]
         if rel in changed:
             recorded.add(rel)
             if stale_dep(block, changed, maps):
                 stale_files.add(rel)
+            else:
+                # Same code (cosmetic hash) -- but did its docstring text change?
+                old = shard.block_docs.get(block)
+                fb = maps.get(rel)
+                if (
+                    old is not None
+                    and fb is not None
+                    and block[1] != WILDCARD
+                    and fb.bdocs.get(block[1]) != old
+                ):
+                    doc_changed.add(block)
 
     for b in shard.import_deps:
         import_files.add(b[0])
@@ -277,14 +303,8 @@ def build_context(
     spawn_active = bool(changed_py) and bool(
         (changed_py & stale_files) | (changed_py - recorded)
     )
-    doc_changed = {
-        rel
-        for rel, recorded_hash in shard.docs.items()
-        if rel in changed
-        and (fb := maps.get(rel)) is not None
-        and fb.doc_hash != recorded_hash
-    }
     return _Context(
+        unrecorded_py=bool(changed_py - recorded),
         changed=changed,
         maps=maps,
         import_stale=import_stale,
@@ -293,6 +313,7 @@ def build_context(
         spawn_active=spawn_active,
         import_files=import_files,
         doc_changed=doc_changed,
+        import_doc_changed=bool(doc_changed & shard.import_deps),
     )
 
 
@@ -312,15 +333,16 @@ def affected_reason(
         return "stale"
     if ctx.dynamic_global or any(b[0] in ctx.dynamic_files for b in deps):
         return "dynamic"
-    if ctx.spawn_active:
-        if shard.spawn_unknown:
-            return "spawn"
-        if shard.dynamic is None or nodeid in shard.dynamic:
-            return "runtime"
-    if ctx.doc_changed:
-        files = {b[0] for b in deps} | ctx.import_files
-        if files & ctx.doc_changed and files & shard.doc_readers:
-            return "doc"
+    if ctx.spawn_active and shard.spawn_unknown:
+        return "spawn"
+    if ctx.unrecorded_py and (shard.dynamic is None or nodeid in shard.dynamic):
+        return "runtime"
+    if (
+        ctx.doc_changed
+        and (ctx.import_doc_changed or not ctx.doc_changed.isdisjoint(deps))
+        and (ctx.import_files | {b[0] for b in deps}) & shard.doc_readers
+    ):
+        return "doc"
     return None
 
 

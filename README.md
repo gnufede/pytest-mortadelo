@@ -74,8 +74,8 @@ conservatively re-runs everything. This is what makes the plugin safe to run
 on its own test suite (`uv run pytest --less tests`).
 
 **Data files** (on by default; opt out via `--less-no-data-files` or
-`less_data_files = false`): a
-`sys.addaudithook` subscription on the `open` event records every in-repo
+`less_data_files = false`): wrapping
+`open()` (`builtins.open` / `io.open`) records every in-repo
 non-Python file opened while the monitor is active — fixtures, templates,
 profiles, `.proto`/`.dat`/`.sql` assets — bucketed exactly like code
 dependencies (per test during a test, shared import-time bucket before
@@ -85,12 +85,18 @@ tests read selects nothing — a red suite with a green CI. Trade-offs: "opened"
 ≠ "depended on" (tests that open files speculatively widen, in the safe
 direction); Python source/bytecode opens are excluded on purpose (they are
 tracked at block precision by `PY_START`, and a wildcard dep on them would
-throw that precision away); `.so` loading via `dlopen` emits no `open` event
-and remains untracked.
+throw that precision away); files opened through `os.open`, `FileIO`, `mmap`
+or a C extension (including `.so` loading via `dlopen`) are not seen and
+remain untracked. No `sys.addaudithook` is used anywhere: an audit hook is a
+Python call for *every* audit event in the process, and `builtins.id` alone
+fires 22M times in sqlalchemy's ORM suite (~7s of pure dispatch for a hook
+that cared about under a thousand events), whereas wrapping the few functions
+involved costs nothing until they are called.
 
-**Subprocess boundaries (always on):** the same always-installed audit hook
-also watches process-creation events (`subprocess.Popen`, `os.system`,
-`os.fork`, `os.posix_spawn`, `pty.spawn`, ...). Coverage cannot follow a
+**Subprocess boundaries (always on):** the functions that create processes
+are wrapped (`subprocess.Popen`, `os.system`, `os.fork`/`forkpty`,
+`os.posix_spawn`/`posix_spawnp`, `os.exec*`, `_posixsubprocess.fork_exec` —
+which also covers `multiprocessing`). Coverage cannot follow a
 child process, so when a test spawns one the monitor **stops collecting for
 that test, writes no dependencies for it, and lists it in the shard's
 `always` key: it re-runs every time** (reported as `N always re-run (spawn
@@ -104,20 +110,23 @@ recorded). Shards recorded before this feature behave the same until a full
 record run heals them. Spawns during pytest's own startup are **not**
 attributed — our own git subprocesses run in that phase, and attributing them
 would mark every test a spawner.
+
 **Reflection and dynamic code (always on):** whatever `getattr`/`setattr`/
-`import_module` *reaches* still executes, so `PY_START` records it. What a
-recording cannot know is what a **computed name** would reach next time. Two
-runtime signals mark a test *dynamic*: code compiled from a string
-(`eval`/`exec`/`compile`, generated classes — audit event `compile` with a
-`<...>` filename) and reflective entry points (`importlib.import_module`,
-`importlib.reload`, `runpy.run_*`, `pkgutil.walk_packages`/`iter_modules`,
-`importlib.util.spec_from_file_location`, `importlib.metadata.entry_points`).
-Both are only attributed during a test (module-level `namedtuple`/dataclass at
-import time reaches no unseen edge). A dynamic test keeps its precise
-dependencies, and is *also* selected whenever a changed `.py` file is stale or
-was never recorded (reported as `N selected as runtime-dynamic`). The static
-markers (below) still cover the constructs with no runtime signal
-(`getattr`/`setattr` with computed names, `__getattr__`).
+`import_module` *reaches* still executes, so `PY_START` records it. The one
+thing a **computed name** can reach that a recording never saw is a *new*
+module. A test that went through a reflective entry point
+(`importlib.import_module`, `importlib.reload`, `runpy.run_*`,
+`pkgutil.walk_packages`/`iter_modules`, `importlib.util.spec_from_file_location`,
+`importlib.metadata.entry_points`) is marked *dynamic* (a `PY_START`
+pseudo-dependency; only during a test) and is also selected whenever a changed
+`.py` file was **never recorded** (reported as `N selected as
+runtime-dynamic`). A *stale* recorded file does not widen: what the test
+executed of it is already a dependency, and what it did not execute cannot
+change its result. String-compiled code (`eval`/`exec`) is deliberately **not**
+a signal: the generated code comes from generators that are themselves
+recorded, and flagging it selected 69% of sqlalchemy's ORM tests on every
+edit. The static markers (below) still cover the constructs with no runtime
+signal (`getattr`/`setattr` with computed names, `__getattr__`).
 
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
@@ -128,7 +137,7 @@ For every pytest **command** the data is stored in a dedicated ref:
 
 ```
 refs/less/<shard>   →  lightweight commit
-                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "docs":{file:hash}, "doc_readers":[...]}
+                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "doc_readers":[...], "bdocs":[hash per block-table entry]}
                             └── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
 ```
 
@@ -289,10 +298,10 @@ working tree) ∪ (untracked files)`. A test runs when:
 - the test is a **spawner** (`always`): it runs every time (`N always re-run`);
   under `spawn_unknown`, every test runs when a changed `.py` file is stale
   or was never recorded (`N selected by the subprocess rule`),
-- the test is **runtime-dynamic** and some changed `.py` file is stale or
-  was never recorded (`N selected as runtime-dynamic`), or
-- the test ran a **docstring reader** and a file it touched has changed
-  docstrings (`N selected by docstring readers`, see cosmetic edits below).
+- the test is **runtime-dynamic** and some changed `.py` file was never
+  recorded (`N selected as runtime-dynamic`), or
+- the test ran a **docstring reader** and executed a block whose docstring
+  changed (`N selected by docstring readers`, see cosmetic edits below).
 
 Every widening is printed in the run summary — selection never widens
 silently. **Cosmetic edits** (on by default): block hashes are computed from a
@@ -300,13 +309,22 @@ docstring-stripped AST, so a comment or docstring-only change produces no
 stale block and selects nothing (comments and formatting are invisible to the
 AST regardless; annotations are kept — typing changes are observable).
 Docstrings are only *prose* for code that never reads them, so each shard also
-records a per-file docstring hash and the files that read docstrings as data
-(`__doc__`, `getdoc`, `cleandoc`, `doctest`, `pydoc`, `help`): a docstring-only
-edit still re-runs the tests that touched the changed file **and** ran a
-docstring reader. The filter turns itself off under `--doctest-modules` /
+records, per block, the hash of the docstrings that block covers (`bdocs`) and
+the files that load docstrings as data (`__doc__`, `getdoc`, `cleandoc`,
+`doctest`, `pydoc`, `help`): a docstring-only edit still re-runs the tests that
+**executed that block and** ran a docstring reader. This restores exactly the
+behavior of an unfiltered run for those tests, so the net can never select more
+than having no cosmetic filter at all. (Assigning `fn.__doc__ = ...` is not
+reading.) The filter turns itself off under `--doctest-modules` /
 `--doctest-glob` (docstrings are test input); `--less-no-cosmetic` /
 `less_cosmetic = false` opts out manually.
 
+- A qualified name defined more than once with different content
+  (`@overload` stubs, property getter/setter pairs, conditional definitions)
+  is split into per-definition blocks (`name~<hash>`) resolved by source line,
+  so editing one definition — or an `@overload` stub that never executes —
+  does not invalidate the others (previously a file-level wildcard: any edit,
+  even a comment, re-ran every test that touched such a function).
 - Dependencies are code blocks; precision is bounded by the block unit — a
   hot, branchy method fans out to every test that executed *any* part of it
   (an edit inside one branch re-runs tests exercising another). Deliberate:
@@ -322,10 +340,12 @@ docstring reader. The filter turns itself off under `--doctest-modules` /
 - The dynamic-marker widening only considers changed files with a *stale
   recorded block*; it cannot widen edits for which no recording exists at
   all (nothing stale → nothing widened — the causal-closure argument).
-- The cosmetic filter's docstring-reader net is static and file-level: a
-  library that reads docstrings on your behalf (e.g. a CLI framework building
-  help text from `__doc__`) is invisible to it — opt out with
-  `--less-no-cosmetic` if your tests depend on that.
+- The cosmetic filter's docstring-reader net is static: a library that reads
+  docstrings on your behalf (e.g. a CLI framework building help text from
+  `__doc__`) is invisible to it — opt out with `--less-no-cosmetic` if your
+  tests depend on that. In a codebase whose own import machinery reads
+  docstrings (sqlalchemy's `decorator` helpers), every test is a "docstring
+  reader" and the filter degrades to unfiltered behavior — safe, just no gain.
 - Reflection with no runtime signal (`getattr`/`setattr` with a computed
   name, `__getattr__`) is only covered by the static markers: a stale block in
   a marker-bearing file widens to the whole file.

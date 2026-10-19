@@ -23,21 +23,25 @@ Dependencies are bucketed by execution phase, which the plugin drives:
 Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
-Non-Python data files are tracked through an optional ``sys.addaudithook``
-subscription on the ``open`` event (on by default; ``--less-no-data-files`` opts out):
-every in-repo file opened while the monitor is active is bucketed like code
-dependencies -- per test during a test, into the shared import-time bucket
-before collection.  Python source and bytecode opens are deliberately *not*
-recorded here: they are tracked at block precision by PY_START, and a
-file-level wildcard dep on them would throw that precision away.
+Non-Python data files are tracked by wrapping ``open`` (on by default;
+``--less-no-data-files`` opts out): every in-repo file opened while the monitor
+is active is bucketed like code dependencies -- per test during a test, into
+the shared import-time bucket before collection.  Python source and bytecode
+opens are deliberately *not* recorded here: they are tracked at block
+precision by PY_START, and a file-level wildcard dep on them would throw that
+precision away.
 
-The same always-installed audit hook records *subprocess boundaries*: a
-process spawned during a test marks that test as a spawner.  Coverage cannot
-follow the child, so collection for that test stops, its dependencies are
-never written, and it re-runs every time.  Code compiled from a string
-(``eval``/``exec``/``compile``) and reflective entry points such as
-``importlib.import_module`` mark the running test *dynamic*: it re-runs when
-a changed ``.py`` file is stale or was never recorded.
+*Subprocess boundaries* are detected by wrapping the functions that create
+processes (``subprocess.Popen``, ``os.system``/``fork``/``exec*``/
+``posix_spawn``, ``_posixsubprocess.fork_exec``): a process spawned during a
+test marks that test as a spawner.  Coverage cannot follow the child, so
+collection for that test stops, its dependencies are never written, and it
+re-runs every time.  Reflective stdlib entry points (``importlib.import_module``
+and friends) mark the running test *dynamic* through a PY_START
+pseudo-dependency.  Neither uses ``sys.addaudithook``: an audit hook is called
+for every audit event in the process (``builtins.id`` alone fires millions of
+times in a large suite), which cost seconds for nothing.
+
 Spawns are only attributed during the collect and test phases: during
 pytest's own startup (phase ``import``) our *own* git subprocesses run --
 attributing those would mark every test a spawner and destroy precision.
@@ -243,9 +247,10 @@ class FileMonitor:
     ):
         self.root = Path(root).resolve()
         # Whether non-Python files opened by tests are recorded as
-        # file-level dependencies (audit-hook bolt-on; on by default).
+        # file-level dependencies (wrapped ``open``; on by default).
         self._data_files = data_files
-        self._audit_installed = False
+        # (owner, name, original, wrapper) of every installed interceptor.
+        self._undo: list[tuple] = []
         # Absolute directories whose files are never recorded as dependencies
         # (e.g. the pytest_less package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
@@ -267,10 +272,6 @@ class FileMonitor:
         # every test -- same policy as the import-time bucket).
         self.spawn_tests: set[str] = set()
         self.spawn_shared = False
-        # Tests that ran code compiled from a string (eval/exec/compile,
-        # generated classes) -- see ``_on_audit``.  Reflective stdlib entry
-        # points are collected through the DYNAMIC_DEP pseudo-dependency.
-        self.dynamic_tests: set[str] = set()
         # Block analysis (one AST parse per file, lazily).  ``cosmetic``
         # strips docstrings before hashing (on by default).
         self._blocks = BlockCache(self.root, cosmetic=cosmetic)
@@ -362,25 +363,19 @@ class FileMonitor:
         else:
             return False
         monitoring_events = _sys_monitoring.events
+        # Interceptors first: installing them runs Python code (functools,
+        # imports) that the freshly armed tool would otherwise observe.
+        self._install_interceptors()
         try:
             _sys_monitoring.set_events(self._tool_id, monitoring_events.PY_START)
             _sys_monitoring.register_callback(
                 self._tool_id, monitoring_events.PY_START, self._on_py_start
             )
         except ValueError:
+            self._remove_interceptors()
             self._release_tool()
             return False
         self._active = True
-        if not self._audit_installed:
-            # Audit hooks cannot be unregistered: install at most once per
-            # monitor instance.  Always installed (not only when
-            # data-file tracking is on): the subprocess-boundary events
-            # are recorded unconditionally.  Without data-files the hook
-            # rejects ``open`` on a string comparison and returns.
-            # A deactivated monitor's leftover hook no-ops via the
-            # ``_active`` check below.
-            sys.addaudithook(self._on_audit)
-            self._audit_installed = True
         return True
 
     def deactivate(self) -> None:
@@ -398,6 +393,7 @@ class FileMonitor:
             self._release_tool()
         self._active = False
         self._tool_id = None
+        self._remove_interceptors()
 
     def _release_tool(self) -> None:
         if self._tool_id is None:
@@ -407,128 +403,173 @@ class FileMonitor:
         except ValueError:  # pragma: no cover
             pass
 
-    # -- data-file tracking (audit hook) ---------------------------------
+    # -- spawn / data-file interception ----------------------------------
+    #
+    # No ``sys.addaudithook``: an audit hook is a Python call for *every*
+    # audit event in the process, and some of them are extremely hot
+    # (``builtins.id`` fires on every ``id()`` call: 22M events -- ~7s -- in
+    # the sqlalchemy ORM suite, for a hook that ended up caring about <1k of
+    # them).  Wrapping the few functions we care about costs nothing until
+    # they are called.  Trade-off: only the Python-level entry points are
+    # seen (see ``_SPAWN_TARGETS``); a C extension that forks or opens files
+    # on its own is invisible.
 
     # Repository-relative locations that are never dependencies: VCS
     # internals and pytest's own cache (the latter is written on every
     # run and would otherwise pin "the last test that ran" forever).
     _AUDIT_SKIP_PREFIXES = (".git/", ".pytest_cache/", "__pycache__/")
 
-    # Audit events that mean "a new process was created or an image
-    # exec'd" (subprocess boundary).  Some names may not exist on
-    # every Python version; an event that never fires is harmless -- we
-    # only compare, never register by name.
-    _SPAWN_EVENTS = frozenset(
-        {
-            "subprocess.Popen",
-            "os.system",
-            "os.fork",
-            "os.forkpty",
-            "os.posix_spawn",
-            "os.spawn",
-            "pty.spawn",
-            "os.exec",
-        }
+    # (module, attribute) pairs that create a process or replace the image.
+    # ``Popen.__init__`` is the choke point of ``subprocess``; the others
+    # cover direct os-level use and ``multiprocessing`` (``os.fork`` /
+    # ``_posixsubprocess.fork_exec``).  Names missing on a platform are
+    # skipped.
+    _SPAWN_TARGETS = (
+        ("subprocess", "Popen.__init__"),
+        ("subprocess", "_fork_exec"),
+        ("_posixsubprocess", "fork_exec"),
+        ("os", "system"),
+        ("os", "fork"),
+        ("os", "forkpty"),
+        ("os", "posix_spawn"),
+        ("os", "posix_spawnp"),
+        ("os", "execv"),
+        ("os", "execve"),
+        ("os", "execvp"),
+        ("os", "execvpe"),
     )
 
-    def _on_audit(self, event, args) -> None:
-        """Single always-installed audit hook: two concerns.
+    def _install_interceptors(self) -> None:
+        """Wrap spawn functions (always) and ``open`` (data files only).
 
-        * ``open`` (unless ``--less-no-data-files``): record non-Python
-          in-repo files as file-level wildcard deps -- a data file has no
-          code structure, so ``(rel, "*", "*")`` means "any content change
-          re-runs the tests (or, outside a test, everything) that opened
-          it".  git only reports content changes, so mtime-only churn never
-          reaches selection.  The suffix reject-first filter runs before
-          any path resolution: without data-files this branch is one string
-          comparison.
-        * spawn events (always): attribute process creation to the running
-          test / collect phase (see the class docstring for the phase
-          policy and its rationale).
-        * ``compile`` (always, test phase only): code compiled from a string
-          (``eval``/``exec``/``compile``, generated classes) has a
-          ``<...>`` filename and is invisible to the dependency recording --
-          the running test is marked dynamic.
+        Wrappers are removed again by :meth:`deactivate`; one that cannot be
+        removed (someone wrapped on top of it) no-ops through the ``_active``
+        check.
         """
-        if event == "open":
-            if not self._active or not self._data_files:
+        import functools
+
+        def wrap(owner, name, make):
+            orig = getattr(owner, name, None)
+            if orig is None:
                 return
+            wrapper = make(orig)
             try:
-                path = args[0] if args else None
-                if isinstance(path, str):
-                    fname = path
-                elif isinstance(path, (bytes, os.PathLike)):
-                    try:
-                        fname = os.fspath(path)
-                    except TypeError:
-                        return
-                    if not isinstance(fname, str):
-                        fname = os.fsdecode(fname)
-                else:
-                    return  # int fd or exotic object: no path to record
-                # Reject-first on the suffix: opens in a test run are
-                # overwhelmingly Python source/bytecode, and those are already
-                # tracked at block precision by PY_START -- recording them
-                # here as file-level wildcards would throw that precision
-                # away (every body edit would re-run the test).
-                if fname.endswith((".py", ".pyc", ".pyo")):
-                    return
-                rel = self.repo_rel(fname)  # memoized; None outside the repo
-                if rel is None:
-                    return
-                if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
-                    return
-                if self._exclude_roots and self._is_excluded(fname):
-                    return
-                # GIL note: set.add is atomic; bucket attribution under
-                # concurrent threads follows the current test (documented
-                # over/under-attribution caveat, same as the code tracker).
-                self._bucket(((rel, WILDCARD, WILDCARD),))
-            except Exception:
-                pass  # an audit hook must never break the open() it observes
-            return
-        if event == "compile":
-            # ``_busy``: our own block analysis parses source (``ast.parse``
-            # compiles with the filename "<unknown>") from inside a test.
-            if (
-                self._phase == "test"
-                and self._active
-                and not self._busy
-                and self._nodeid is not None
-            ):
-                try:
-                    filename = args[1]
-                    if isinstance(filename, bytes):
-                        filename = os.fsdecode(filename)
-                    if (
-                        isinstance(filename, str)
-                        and filename.startswith("<")
-                        and not filename.startswith("<frozen")
-                    ):
-                        self.dynamic_tests.add(self._nodeid)
-                except Exception:
-                    pass
-            return
-        if event in self._SPAWN_EVENTS:
-            if not self._active:
+                setattr(owner, name, wrapper)
+            except (AttributeError, TypeError):  # pragma: no cover
                 return
+            self._undo.append((owner, name, orig, wrapper))
+
+        def spawn_wrapper(orig):
+            note = self._note_spawn
+
+            @functools.wraps(orig)
+            def wrapper(*a, **k):
+                note()
+                return orig(*a, **k)
+
+            return wrapper
+
+        for modname, attr in self._SPAWN_TARGETS:
             try:
-                if self._phase == "test" and self._nodeid is not None:
-                    # Coverage cannot follow a child process: stop recording
-                    # this test (see ``_bucket``) and force it to re-run
-                    # every time -- it is never given dependencies.
-                    self.spawn_tests.add(self._nodeid)
-                elif self._phase == "collect":
-                    # During test-module import: affects everything loaded
-                    # around it -- conservative shared (all-tests) mark.
-                    self.spawn_shared = True
-                # phase "import": pytest's own startup -- and with it our
-                # own git subprocesses during setup/planning, which must
-                # not mark every test a spawner.  User conftest spawns at
-                # startup are therefore not attributed (documented scope).
-                # phase "done": recording is over.
-            except Exception:
-                pass  # an audit hook must never break the event it observes
+                module = __import__(modname)
+            except ImportError:  # pragma: no cover - platform specific
+                continue
+            owner, _, leaf = (module, None, attr)
+            if "." in attr:  # "Popen.__init__"
+                cls, _, leaf = attr.partition(".")
+                owner = getattr(module, cls, None)
+                if owner is None:  # pragma: no cover
+                    continue
+            wrap(owner, leaf, spawn_wrapper)
+
+        if self._data_files:
+            import builtins
+            import io
+
+            def open_wrapper(orig):
+                track = self._track_open
+
+                @functools.wraps(orig)
+                def wrapper(file, *a, **k):
+                    track(file)
+                    return orig(file, *a, **k)
+
+                return wrapper
+
+            # ``builtins.open`` and ``io.open`` are the same object; wrap
+            # both bindings (pathlib and most libraries go through one of
+            # them at call time).
+            wrap(builtins, "open", open_wrapper)
+            wrap(io, "open", open_wrapper)
+
+    def _remove_interceptors(self) -> None:
+        while self._undo:
+            owner, name, orig, wrapper = self._undo.pop()
+            try:
+                if getattr(owner, name, None) is wrapper:
+                    setattr(owner, name, orig)
+            except (AttributeError, TypeError):  # pragma: no cover
+                pass
+
+    def _note_spawn(self) -> None:
+        """A process is being created: attribute it to the running test.
+
+        * test phase: coverage cannot follow the child, so collection for
+          this test stops (see ``_bucket``) and the recorder never gives it
+          dependencies -- it re-runs every time.
+        * collect phase: the culprit is unknown (module import) -> shared
+          mark.
+        * import phase: pytest's own startup -- and with it our *own* git
+          subprocesses during setup/planning -- must not mark every test a
+          spawner.  Done phase: recording is over.
+        """
+        if not self._active:
+            return
+        try:
+            if self._phase == "test" and self._nodeid is not None:
+                self.spawn_tests.add(self._nodeid)
+            elif self._phase == "collect":
+                self.spawn_shared = True
+        except Exception:  # pragma: no cover - never break the call we wrap
+            pass
+
+    def _track_open(self, path) -> None:
+        """Record a non-Python in-repo file opened while the monitor is active
+        as a file-level wildcard dependency -- a data file has no code
+        structure, so ``(rel, "*", "*")`` means "any content change re-runs
+        the tests (or, outside a test, everything) that opened it".  git only
+        reports content changes, so mtime-only churn never reaches selection.
+        The suffix reject-first filter runs before any path resolution.
+        """
+        if not self._active:
+            return
+        try:
+            if isinstance(path, str):
+                fname = path
+            elif isinstance(path, (bytes, os.PathLike)):
+                fname = os.fspath(path)
+                if not isinstance(fname, str):
+                    fname = os.fsdecode(fname)
+            else:
+                return  # int fd or exotic object: no path to record
+            # Python source/bytecode is tracked at block precision by
+            # PY_START; a file-level wildcard dep on it would throw that
+            # precision away.
+            if fname.endswith((".py", ".pyc", ".pyo")):
+                return
+            rel = self.repo_rel(fname)  # memoized; None outside the repo
+            if rel is None:
+                return
+            if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
+                return
+            if self._exclude_roots and self._is_excluded(fname):
+                return
+            # GIL note: set.add is atomic; bucket attribution under
+            # concurrent threads follows the current test (documented
+            # over/under-attribution caveat, same as the code tracker).
+            self._bucket(((rel, WILDCARD, WILDCARD),))
+        except Exception:
+            pass  # tracking must never break the open() it observes
 
     # -- event handling --------------------------------------------------
 

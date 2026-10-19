@@ -1,19 +1,19 @@
 """Runtime detection of reflective / dynamic code (fail on the safe side).
 
-``getattr``/``setattr`` have no audit event, but whatever they *reach* still
-executes and is recorded by PY_START.  What a recording cannot know is which
-code a **computed name** would reach next time.  Two runtime signals mark a
-test *dynamic*:
+``getattr``/``setattr`` have no runtime signal, but whatever they *reach*
+still executes and is recorded by PY_START.  What a recording cannot know is
+which code a **computed name** would reach next time -- and the only thing a
+computed name can reach that the recording never saw is a *new* module.  So
+a test that went through a reflective entry point (``importlib.import_module``,
+``runpy.run_*``, ``pkgutil.walk_packages``, ...) is marked *dynamic* (a
+PY_START pseudo-dependency) and is selected when a changed ``.py`` file was
+**never recorded**.
 
-* code compiled from a string -- ``eval``/``exec``/``compile``, generated
-  classes -- (audit event ``compile`` with a ``<...>`` filename), and
-* reflective entry points (``importlib.import_module``, ``runpy.run_*``,
-  ``pkgutil.walk_packages``, ...), seen through a PY_START pseudo-dependency.
-
-A dynamic test keeps its recorded dependencies (precision for ordinary
-edits is unchanged) but is also selected whenever a changed ``.py`` file is
-stale or was never recorded -- a new module or an edited block it could have
-reached by name.
+Deliberately not a signal: string-compiled code (``eval``/``exec``).  The
+generated code comes from generators that are themselves recorded; flagging
+it selected 69% of sqlalchemy's ORM tests on every edit.  And a *stale*
+recorded file does not widen: what a test executed of it is already a
+dependency, what it did not execute cannot change its result.
 """
 
 import importlib
@@ -61,11 +61,12 @@ def dyn_project(pytester):
 
 
 class TestRecording:
-    def test_dynamic_tests_are_marked_and_plain_is_not(self, dyn_project):
+    def test_only_reflective_entry_points_mark_a_test(self, dyn_project):
         run_less(dyn_project, "-q").assert_outcomes(passed=3)
         data = shard_data(dyn_project.path)
-        assert data["dynamic"] == sorted([EVAL_ID, IMPORT_ID])
-        assert read_meta(dyn_project.path)["dynamic"] == sorted([EVAL_ID, IMPORT_ID])
+        # eval() is not a signal; import_module() is.
+        assert data["dynamic"] == [IMPORT_ID]
+        assert read_meta(dyn_project.path)["dynamic"] == [IMPORT_ID]
 
     def test_dynamic_tests_keep_their_dependencies(self, dyn_project):
         run_less(dyn_project, "-q").assert_outcomes(passed=3)
@@ -91,24 +92,32 @@ class TestSelection:
         run_less(dyn_project, "-q")
         (dyn_project.path / "tests" / "plugin_x.py").write_text("X = 1\n")
         result = run_less(dyn_project, "-v")
-        result.assert_outcomes(passed=2)
-        result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
         result.stdout.fnmatch_lines(["*runtime-dynamic*"])
-        result.stdout.no_fnmatch_line("*test_plain.py::test_plain PASSED*")
+        result.stdout.fnmatch_lines(["*test_importmod.py::test_importmod PASSED*"])
 
-    def test_stale_edit_of_a_reachable_module_selects_dynamic_tests(
-        self, dyn_project
-    ):
+    def test_stale_edit_does_not_widen_dynamic_tests(self, dyn_project):
+        run_less(dyn_project, "-q")
+        # helper.py is executed only by test_plain: the dynamic test (which
+        # reached lib by name) must not be dragged in by an edit it cannot see.
+        (dyn_project.path / "tests" / "helper.py").write_text(
+            "def g():\n    return 1 + 1\n"
+        )
+        result = run_less(dyn_project, "-v")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*test_plain.py::test_plain PASSED*"])
+
+    def test_stale_edit_of_a_reached_module_selects_by_staleness(self, dyn_project):
         run_less(dyn_project, "-q")
         (dyn_project.path / "tests" / "lib.py").write_text(
             "def f():\n    return 1 + 0\n"
         )
         result = run_less(dyn_project, "-v")
-        # test_importmod via staleness, test_eval via the runtime rule;
-        # test_plain never touched lib and stays deselected.
-        result.assert_outcomes(passed=2)
-        result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
-        result.stdout.no_fnmatch_line("*test_plain.py::test_plain PASSED*")
+        # test_importmod executed lib.f -> ordinary staleness; test_eval and
+        # test_plain never touched it.
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*test_importmod.py::test_importmod PASSED*"])
 
     def test_non_py_change_selects_nothing(self, dyn_project):
         run_less(dyn_project, "-q")
@@ -133,45 +142,6 @@ class TestSelection:
             {"version": 2, "blocks": [], "tests": {}}, {"base_commit": None}
         )
         assert shard is not None and shard.dynamic is None  # unknown
-
-
-class TestAuditHook:
-    @staticmethod
-    def make(tmp_path):
-        m = FileMonitor(tmp_path)
-        m._active = True  # white-box: no real tool id for the unit test
-        m.phase = "test"
-        m.current_nodeid = "t"
-        return m
-
-    @pytest.mark.parametrize("filename", ["<string>", "<unknown>", b"<string>"])
-    def test_string_compiled_code_marks_the_test(self, tmp_path, filename):
-        m = self.make(tmp_path)
-        m._on_audit("compile", (b"1+1", filename))
-        assert m.dynamic_tests == {"t"}
-
-    @pytest.mark.parametrize("filename", ["/repo/mod.py", "<frozen importlib._bootstrap>"])
-    def test_real_files_and_frozen_modules_do_not(self, tmp_path, filename):
-        m = self.make(tmp_path)
-        m._on_audit("compile", (b"x=1", filename))
-        assert m.dynamic_tests == set()
-
-    def test_only_the_test_phase_counts(self, tmp_path):
-        # Module-level namedtuple/dataclass at import or collection time is
-        # ubiquitous and reaches no unseen edge.
-        m = self.make(tmp_path)
-        for phase in ("import", "collect", "done"):
-            m.phase = phase
-            m._on_audit("compile", (b"x", "<string>"))
-        assert m.dynamic_tests == set()
-
-    def test_our_own_block_analysis_is_ignored(self, tmp_path):
-        # ast.parse compiles with "<unknown>"; the monitor parses source
-        # lazily from inside tests.
-        m = self.make(tmp_path)
-        m._busy = True
-        m._on_audit("compile", (b"x", "<unknown>"))
-        assert m.dynamic_tests == set()
 
 
 class TestReflectiveEntryPoints:

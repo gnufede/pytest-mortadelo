@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from .blocks import DYNAMIC_DEP, Block
+from .blocks import DYNAMIC_DEP, WILDCARD, Block
 from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import (
@@ -219,8 +219,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Disable data-file tracking (on by default): non-Python files "
-        "opened during a test are recorded as file-level dependencies via "
-        "the sys audit hook on 'open'. Part of the shard key: toggling it "
+        "opened during a test are recorded as file-level dependencies "
+        "(open() is wrapped). Part of the shard key: toggling it "
         "starts a fresh record run.",
     )
     group.addoption(
@@ -810,7 +810,7 @@ class LessState:
                 tests[nodeid] = set()
         # Reflective entry points leave a pseudo-dependency: turn it into the
         # test's "dynamic" mark and keep it out of the shard.
-        dynamic_now = set(monitor.dynamic_tests)
+        dynamic_now: set[str] = set()
         for nodeid, deps in monitor.test_deps.items():
             if DYNAMIC_DEP in deps:
                 dynamic_now.add(nodeid)
@@ -837,22 +837,46 @@ class LessState:
         else:
             dynamic = (dynamic_now | ((old_dynamic or set()) - observed)) & set(tests)
 
-        # Docstring safety net (cosmetic filter): per-file docstring hashes
-        # and the files that read docstrings as data.
+        # Docstring safety net (cosmetic filter): which files read docstrings
+        # as data (per file), and each block's docstring hash (per block,
+        # filled below next to the block table).  Unchanged files keep their
+        # previous info: re-deriving it would re-parse every dependency file,
+        # which a run that executed a few tests has not parsed.
         doc_files: set[str] = {b[0] for b in import_blocks}
         for deps in tests.values():
             doc_files.update(b[0] for b in deps)
-        docs: dict[str, str] = {}
+        old_readers = old_shard.doc_readers if old_shard is not None else set()
+        old_bdocs = old_shard.block_docs if old_shard is not None else {}
+        changed_now = self.changed
         doc_readers: list[str] = []
         for rel in sorted(doc_files):
             if not rel.endswith(".py"):
                 continue
-            fb = monitor.file_blocks(rel)
-            if fb is None:
+            if (
+                old_shard is not None
+                and changed_now is not None
+                and rel not in changed_now
+            ):
+                if rel in old_readers:
+                    doc_readers.append(rel)
                 continue
-            docs[rel] = fb.doc_hash
-            if fb.reads_docs:
+            fb = monitor.file_blocks(rel)
+            if fb is not None and fb.reads_docs:
                 doc_readers.append(rel)
+        # A block's recorded docstring only advances when every test sharing
+        # the block saw the new text: with selectors active not all of them
+        # ran, so the old value stays (the signal persists -- safe, merely
+        # over-selecting later).
+        freeze_docs = self.selectors_active or changed_now is None
+
+        def doc_for(block: Block) -> str:
+            rel, block_id, _ = block
+            if block_id == WILDCARD or not rel.endswith(".py"):
+                return ""
+            if block in old_bdocs and (freeze_docs or rel not in changed_now):
+                return old_bdocs[block]
+            fb = monitor.file_blocks(rel)
+            return fb.bdocs.get(block_id, "") if fb is not None else ""
 
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
@@ -884,11 +908,12 @@ class LessState:
             # Tests that ran string-compiled / reflective code (None =
             # unknown) -> re-run when a .py file is stale or unrecorded.
             "dynamic": sorted(dynamic) if dynamic is not None else None,
-            # Cosmetic-filter safety net.
-            "docs": docs,
+            # Cosmetic-filter safety net: files that read docstrings as data,
+            # and (parallel to ``blocks``) each block's docstring hash.
             "doc_readers": doc_readers,
         }
         data["blocks"] = [list(b) for b in ordered]
+        data["bdocs"] = [doc_for(b) for b in ordered]
         dep_files: set[str] = {b[0] for b in import_blocks}
         for deps in tests.values():
             dep_files.update(b[0] for b in deps)

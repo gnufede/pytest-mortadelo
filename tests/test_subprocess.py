@@ -224,7 +224,7 @@ class TestSpawnAttribution:
         m = self.make(tmp_path)
         m.phase = "test"
         m.current_nodeid = "tests/test_x.py::test_x"
-        m._on_audit("subprocess.Popen", (None,))
+        m._note_spawn()
         assert m.spawn_tests == {"tests/test_x.py::test_x"}
         assert not m.spawn_shared
 
@@ -237,34 +237,72 @@ class TestSpawnAttribution:
         before: Block = ("a.py", "f", "h1")
         after: Block = ("b.py", "g", "h2")
         m._bucket((before,))
-        m._on_audit("subprocess.Popen", (None,))
+        m._note_spawn()
         m._bucket((after,))
         assert m.test_deps["t"] == {before}  # nothing recorded after the spawn
         m.current_nodeid = "other"
         m._bucket((after,))
         assert m.test_deps["other"] == {after}  # other tests are unaffected
 
-    def test_spawn_events_cover_system_and_fork(self, tmp_path):
-        m = self.make(tmp_path)
-        m.phase = "test"
-        m.current_nodeid = "t"
-        for event in ("os.system", "os.fork", "pty.spawn"):
-            m._on_audit(event, ())
-        assert m.spawn_tests == {"t"}
+    def test_real_spawns_are_intercepted_and_restored(self, tmp_path):
+        # End to end on the wrappers (a real tool id, real subprocesses):
+        # every Python-level way to create a process is seen, and the
+        # originals are back after deactivate().
+        import os
+        import subprocess
+        import sys
+
+        from pytest_less.monitoring import FileMonitor
+
+        originals = (subprocess.Popen.__init__, os.system, os.fork)
+        m = FileMonitor(tmp_path)
+        assert m.activate()
+        try:
+            for i, run in enumerate(
+                (
+                    lambda: subprocess.run([sys.executable, "-c", "pass"], check=False),
+                    lambda: os.system("true"),
+                )
+            ):
+                m.phase = "test"
+                m.current_nodeid = f"t{i}"
+                run()
+            assert m.spawn_tests == {"t0", "t1"}
+            assert subprocess.Popen.__init__ is not originals[0]  # wrapped
+        finally:
+            m.deactivate()
+        assert (subprocess.Popen.__init__, os.system, os.fork) == originals
+
+    def test_no_audit_hook_is_installed(self, tmp_path):
+        # The whole point of the redesign: zero per-event cost.
+        import sys
+
+        from pytest_less.monitoring import FileMonitor
+
+        seen = []
+        real = sys.addaudithook
+        sys.addaudithook = lambda f: seen.append(f)
+        try:
+            m = FileMonitor(tmp_path)
+            assert m.activate()
+            m.deactivate()
+        finally:
+            sys.addaudithook = real
+        assert seen == []
 
     def test_import_phase_is_ignored(self, tmp_path):
         # pytest's own startup git subprocesses run in this phase: marking
         # shared here would make every test a spawner and kill precision.
         m = self.make(tmp_path)
         m.phase = "import"
-        m._on_audit("subprocess.Popen", (None,))
+        m._note_spawn()
         assert m.spawn_tests == set()
         assert not m.spawn_shared
 
     def test_collect_phase_marks_shared(self, tmp_path):
         m = self.make(tmp_path)
         m.phase = "collect"
-        m._on_audit("subprocess.Popen", (None,))
+        m._note_spawn()
         assert m.spawn_shared is True
         assert m.spawn_tests == set()
 
@@ -273,13 +311,13 @@ class TestSpawnAttribution:
         m.phase = "test"
         m.current_nodeid = "t"
         m.phase = "done"
-        m._on_audit("subprocess.Popen", (None,))
+        m._note_spawn()
         assert m.spawn_tests == set()
         inactive = self.make(tmp_path)
         inactive.phase = "test"
         inactive.current_nodeid = "t"
         inactive._active = False
-        inactive._on_audit("subprocess.Popen", (None,))
+        inactive._note_spawn()
         assert inactive.spawn_tests == set()
 
 
