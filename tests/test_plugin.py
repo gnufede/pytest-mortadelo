@@ -746,3 +746,11 @@ class TestGitSpawnBudget:
         result = run_outside(project, "-q")
         assert result.ret == 5  # ignored: no candidate, nothing selected
         assert len(counted()) == 1
+
+
+class TestHermeticEnvironment:
+    def test_the_outer_plugin_environment_does_not_leak_into_inner_runs(self):
+        import os
+
+        for name in ("PYTEST_LESS", "PYTEST_LESS_SYNC", "PYTEST_LESS_PARSE_CACHE"):
+            assert name not in os.environ
