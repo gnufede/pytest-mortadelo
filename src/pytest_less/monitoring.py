@@ -237,6 +237,30 @@ def _build_module_index(root: Path, exclude_roots: tuple[Path, ...]) -> dict[str
     return index
 
 
+def _mode_is_output_only(mode) -> bool:
+    """Whether an ``open()`` mode never reads the file's existing content.
+
+    ``w``/``x`` discard or refuse existing content (``w+`` too: what it reads
+    back is what it wrote); ``a`` without ``+`` can only append.  ``r``,
+    ``r+`` and ``a+`` can read pre-existing content: inputs.
+    """
+    if not isinstance(mode, str):
+        return False
+    return "w" in mode or "x" in mode or ("a" in mode and "+" not in mode)
+
+
+def _flags_are_output_only(flags) -> bool:
+    """The ``os.open`` flavour of :func:`_mode_is_output_only`."""
+    if not isinstance(flags, int):
+        return False
+    if flags & getattr(os, "O_ACCMODE", 3) == os.O_WRONLY:
+        return True
+    if flags & getattr(os, "O_TRUNC", 0):
+        return True  # truncated: existing content is discarded
+    created = getattr(os, "O_CREAT", 0) & flags and getattr(os, "O_EXCL", 0) & flags
+    return bool(created)  # exclusive create: the file is new by definition
+
+
 class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
@@ -252,6 +276,9 @@ class FileMonitor:
         self._data_files = data_files
         # (owner, name, original, wrapper) of every installed interceptor.
         self._undo: list[tuple] = []
+        # In-repo files this run only *wrote*: outputs, never inputs (see
+        # ``_track_open``).
+        self._written: set[str] = set()
         # Absolute directories whose files are never recorded as dependencies
         # (e.g. the pytest_less package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
@@ -489,15 +516,25 @@ class FileMonitor:
             import builtins
             import io
 
-            def open_wrapper(orig):
-                track = self._track_open
+            def make_open_wrapper(is_output):
+                def open_wrapper(orig):
+                    track = self._track_open
 
-                @functools.wraps(orig)
-                def wrapper(file, *a, **k):
-                    track(file)
-                    return orig(file, *a, **k)
+                    @functools.wraps(orig)
+                    def wrapper(file, *a, **k):
+                        track(file, is_output(a, k))
+                        return orig(file, *a, **k)
 
-                return wrapper
+                    return wrapper
+
+                return open_wrapper
+
+            py_open = make_open_wrapper(
+                lambda a, k: _mode_is_output_only(a[0] if a else k.get("mode", "r"))
+            )
+            fd_open = make_open_wrapper(
+                lambda a, k: _flags_are_output_only(a[0] if a else k.get("flags"))
+            )
 
             # ``builtins.open`` and ``io.open`` are the same object; wrap
             # both bindings (pathlib and most libraries go through one of
@@ -505,9 +542,9 @@ class FileMonitor:
             # directly by plenty of code (and by libraries that want a raw
             # fd), so it needs its own wrapper: without it those reads are
             # invisible and an edited data file selects nothing.
-            wrap(builtins, "open", open_wrapper)
-            wrap(io, "open", open_wrapper)
-            wrap(os, "open", open_wrapper)
+            wrap(builtins, "open", py_open)
+            wrap(io, "open", py_open)
+            wrap(os, "open", fd_open)
 
     def _remove_interceptors(self) -> None:
         while self._undo:
@@ -540,13 +577,19 @@ class FileMonitor:
         except Exception:  # pragma: no cover - never break the call we wrap
             pass
 
-    def _track_open(self, path) -> None:
+    def _track_open(self, path, output_only: bool = False) -> None:
         """Record a non-Python in-repo file opened while the monitor is active
         as a file-level wildcard dependency -- a data file has no code
         structure, so ``(rel, "*", "*")`` means "any content change re-runs
         the tests (or, outside a test, everything) that opened it".  git only
         reports content changes, so mtime-only churn never reaches selection.
         The suffix reject-first filter runs before any path resolution.
+
+        Outputs are not inputs.  A file the run only *writes* (*output_only*)
+        is remembered instead of recorded, and reading it back later in the
+        same run is not a dependency either: it is produced by the run, and
+        recording it would make the test depend on a file it creates itself
+        -- untracked, hence "changed" forever, hence re-run on every run.
         """
         if not self._active:
             return
@@ -570,6 +613,11 @@ class FileMonitor:
             if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
                 return
             if self._exclude_roots and self._is_excluded(fname):
+                return
+            if output_only:
+                self._written.add(rel)
+                return
+            if rel in self._written:
                 return
             # GIL note: set.add is atomic; bucket attribution under
             # concurrent threads follows the current test (documented

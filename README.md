@@ -88,7 +88,13 @@ direction); Python source/bytecode opens are excluded on purpose (they are
 tracked at block precision by `PY_START`, and a wildcard dep on them would
 throw that precision away); files opened through `FileIO`, `mmap` or a C
 extension (including `.so` loading via `dlopen`) are not seen and remain
-untracked. `builtins.open`, `io.open` and `os.open` are wrapped. No
+untracked. `builtins.open`, `io.open` and `os.open` are wrapped. **Outputs are
+not inputs:** a file a test only *writes* (`open` modes `w`/`x`/`a` without
+`+`; `os.open` with `O_WRONLY`, `O_TRUNC` or `O_CREAT|O_EXCL`) is never a
+dependency, and neither is reading it back later in the same run. Once such a
+file exists it is untracked — git lists it as changed on every run — so
+recording it would make the test re-run forever. `r+`, `a+` and `O_RDWR` stay
+dependencies (they can read pre-existing content). No
 `sys.addaudithook` is used anywhere: an audit hook is a
 Python call for *every* audit event in the process, and `builtins.id` alone
 fires 22M times in sqlalchemy's ORM suite (~7s of pure dispatch for a hook
