@@ -213,12 +213,33 @@ class TestEndToEnd:
         run_less(project, "-q").assert_outcomes(passed=2)
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
         run_less(project, "-q").assert_outcomes(passed=1)
-        # same working tree again: the failed/changed set is unchanged, so
-        # lib.py is looked up once more -- now a hit, not a parse.
-        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
+        # lib.py's new content was cached by the run above.  Now change a
+        # different executed file: only that one is parsed, lib.py is a hit.
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b(always_false=False):\n"
+            "    if always_false:\n"
+            "        import other\n"
+            "    assert 2 == 1 + 1\n"
+        )
         result = run_less(project, "-v")
-        _, parsed = parse_note(result)
-        assert parsed == 1  # only other.py is new
+        result.assert_outcomes(passed=1)
+        hits, parsed = parse_note(result)
+        assert parsed == 1  # test_b.py only
+        assert hits >= 1  # lib.py (new content, cached) among them
+
+    def test_nothing_ran_leaves_the_shard_untouched(self, project):
+        run_less(project, "-q").assert_outcomes(passed=2)
+        ref = git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
+        ).stdout.split()[0]
+        before = git(project.path, "rev-parse", ref).stdout
+        # other.py is only a dead-branch dependency: editing its body stales
+        # nothing, so nothing runs -- and nothing is rewritten.
+        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*nothing ran; stored shard left unchanged*"])
+        assert git(project.path, "rev-parse", ref).stdout == before
 
     def test_no_change_rerun_keeps_the_parse_blob(self, project):
         run_less(project, "-q")

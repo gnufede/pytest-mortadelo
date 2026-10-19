@@ -351,6 +351,7 @@ def select_tests(
     shard: Shard | None,
     changed: set[str] | None,
     maps: dict[str, FileBlocks | None] | None = None,
+    ctx: _Context | None = None,
 ) -> Selection:
     """Decide which of *collected* tests should run."""
     maps = maps or {}
@@ -374,7 +375,8 @@ def select_tests(
     # block-granular: a body edit of a function that only runs at test time
     # no longer re-runs the world -- only module skeletons and the blocks
     # that actually executed at import time (module-level calls included) do.
-    ctx = build_context(shard, changed, maps)
+    if ctx is None:
+        ctx = build_context(shard, changed, maps)
     selected: list[str] = []
     deselected: list[str] = []
     n_affected = n_failed = n_new = n_dynamic = n_spawn = 0

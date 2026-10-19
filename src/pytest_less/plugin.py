@@ -85,6 +85,31 @@ def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
     return (remote, mode)
 
 
+def _shared_git_root(config, path):
+    """``git_root`` memoized on the config (probe, early hook and setup all ask)."""
+    cache = config.__dict__.setdefault("_less_roots", {})
+    key = str(path)
+    if key not in cache:
+        cache[key] = git_root(Path(path))
+    return cache[key]
+
+
+def _shared_store(config, root, cli_args) -> GitStore:
+    """The run's one ``GitStore`` (same shard key from probe to finish).
+
+    It memoizes ``changed_since`` and ``load_meta``: the early probe, setup
+    and collection planning used to ask git the same questions three times
+    over (23 spawns for a run that selected nothing).
+    """
+    key = (str(root), command_key(cli_args, root))
+    cached = config.__dict__.get("_less_store")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    store = GitStore(root, key[1], memoize=True)
+    config._less_store = (key, store)
+    return store
+
+
 def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
     """Probe the run using only meta.json (the first-level cache).
 
@@ -158,7 +183,7 @@ def _dynamic_possible(meta) -> bool:
     return any(isinstance(n, str) for n in dynamic)
 
 
-def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
+def _early_probe_pure_fast(args: list[str], cli_args, config=None) -> bool:
     """Heuristic pre-configure check: can we skip monitor activation?
 
     Conservative in the right direction: any raw-argument that could mean
@@ -175,13 +200,17 @@ def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
         a.startswith(("-k", "-m", "--lf", "--ff")) or "::" in a for a in args
     ):
         return False
-    root = git_root(Path.cwd())
+    root = _shared_git_root(config, Path.cwd()) if config else git_root(Path.cwd())
     if root is None:
         return False
     # The shard key comes from the *invocation* arguments: the hook's args
     # already include ini addopts, which the configure-time key
     # (config.invocation_params.args) does not.
-    store = GitStore(root, command_key(cli_args, root))
+    store = (
+        _shared_store(config, root, cli_args)
+        if config
+        else GitStore(root, command_key(cli_args, root))
+    )
     _, fast, pure = _fast_conditions(store, store.load_meta())
     return fast and pure
 
@@ -329,7 +358,9 @@ def pytest_load_initial_conftests(early_config, parser, args):
     # instead of the command line is handled by a late activation fallback in
     # pytest_configure.)
     if "--less" in args or _env_enabled():
-        if _early_probe_pure_fast(args, early_config.invocation_params.args):
+        if _early_probe_pure_fast(
+            args, early_config.invocation_params.args, early_config
+        ):
             # No-change rerun (decided from meta.json alone, before any
             # conftest is imported): no recorded dependency can be stale
             # and nothing new can run, so the whole monitoring machinery is
@@ -337,7 +368,7 @@ def pytest_load_initial_conftests(early_config, parser, args):
             # options and can still activate it late if this was wrong.
             early_config._less_probe_pure = True
         else:
-            root = git_root(Path.cwd())
+            root = _shared_git_root(early_config, Path.cwd())
             if root is not None:
                 # Options are not parsed yet: peek the raw flags; the ini is
                 # registered (and readable) at this point.  Data-file
@@ -355,8 +386,8 @@ def pytest_load_initial_conftests(early_config, parser, args):
                 parse_cache = None
                 if _parse_cache_enabled():
                     parse_cache = ParseCache(
-                        GitStore(
-                            root, command_key(early_config.invocation_params.args, root)
+                        _shared_store(
+                            early_config, root, early_config.invocation_params.args
                         ).load_parse,
                         cosmetic=cosmetic,
                     )
@@ -408,21 +439,24 @@ class LessState:
         self.fast_recorded: set[str] = set()
         self.fast_pure = False  # fast path AND the monitor can stay off
         self._meta: dict | None = None
-        # Current block tables of the changed files (selection input).
+        # Current block tables of the changed files (selection input), and
+        # the selection context built once from them (planning and selection
+        # ask the same questions of the same shard).
         self.new_maps: dict = {}
+        self.ctx = None
 
     # -- setup ----------------------------------------------------------
 
     def setup(self, config: pytest.Config, early_monitor: FileMonitor | None) -> None:
         self.requested = True
-        self.root = git_root(config.rootpath)
+        self.root = _shared_git_root(config, config.rootpath)
         if self.root is None:
             self.notes.append("less: not a git repository; running and recording nothing")
             self._drop_early_monitor(early_monitor)
             return
 
         self._collect_conftest_deps(config)
-        self.store = GitStore(self.root, command_key(config.invocation_params.args, self.root))
+        self.store = _shared_store(config, self.root, config.invocation_params.args)
         sync = _sync_remote(config)
         if sync is not None:
             self.sync_remote, self.sync_mode = sync
@@ -572,7 +606,7 @@ class LessState:
         # predicate -- a test can never run under one and be skipped under
         # the other).  If a shared import-time dependency went stale, or a
         # dynamic-marker file widens to *all* tests, nothing is skippable.
-        ctx = build_context(self.shard, changed, self.new_maps)
+        ctx = self.ctx = build_context(self.shard, changed, self.new_maps)
         if ctx.import_stale or ctx.dynamic_global:
             return
         # Which files still have at least one test that will run?  A test
@@ -680,7 +714,9 @@ class LessState:
             )
             return
         else:
-            selection = select_tests(collected, self.shard, self.changed, self.new_maps)
+            selection = select_tests(
+                collected, self.shard, self.changed, self.new_maps, ctx=self.ctx
+            )
         if self.skipped_test_ids:
             # Only report tests whose files were genuinely not collected;
             # a planned skip can be overridden by pytest (e.g. a file given
@@ -766,6 +802,20 @@ class LessState:
             # test as a subprocess spawn.
             monitor.phase = "done"
             monitor.current_nodeid = None
+        if (
+            monitor is not None
+            and not self.fast
+            and self.shard is not None
+            and not self.finished
+            and not self.failed
+            and not interrupted
+        ):
+            # Armed, but no test ran (everything deselected): there is
+            # nothing new to learn, and rewriting the shard would re-serialize
+            # megabytes (and spawn ~6 git processes) just to record the same
+            # data again.  Unchanged recorded hashes keep their meaning.
+            self.notes.append("less: nothing ran; stored shard left unchanged")
+            return
         if self.fast:
             # Something ran (a new test, or a previously failed one):
             # lazily load the full data now to preserve everything else.

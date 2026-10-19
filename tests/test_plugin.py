@@ -652,3 +652,59 @@ class TestSelectorsDisableSelection:
             "tests/test_a.py::test_a",
             "tests/test_b.py::test_b",
         }
+
+
+class TestGitSpawnBudget:
+    """Every git call is a process spawn: a few ms on a quiet machine, a
+    quarter of a second where endpoint scanning slows exec.  The same
+    questions used to be asked 2-3 times over (23 spawns for a run that
+    selected nothing); keep the count down."""
+
+    @pytest.fixture
+    def counted(self, project, tmp_path, monkeypatch):
+        import os
+        import shutil
+
+        real = shutil.which("git")
+        log = tmp_path / "gitcalls.log"
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        script = shim / "git"
+        script.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{real}" "$@"\n')
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+        def calls():
+            text = log.read_text() if log.exists() else ""
+            log.write_text("")
+            return [line for line in text.splitlines() if line]
+
+        return calls
+
+    def test_no_change_rerun(self, project, counted):
+        run_less(project, "-q")
+        counted()  # discard the record run
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        assert len(counted()) <= 6
+
+    def test_run_that_selects_nothing_does_not_rewrite_the_shard(self, project, counted):
+        run_less(project, "-q")
+        counted()
+        # other.py is a dead-branch dependency: editing it stales nothing.
+        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        calls = counted()
+        assert len(calls) <= 9, calls
+        assert not [c for c in calls if "hash-object" in c or "commit-tree" in c]
+
+    def test_changed_files_are_asked_for_once(self, project, counted):
+        run_less(project, "-q")
+        counted()
+        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
+        run_less(project, "-q")
+        calls = counted()
+        assert len([c for c in calls if " diff " in f" {c} " or c.startswith("diff")]) == 1
+        assert len([c for c in calls if "ls-files" in c]) == 1
+        assert len([c for c in calls if "show-toplevel" in c]) <= 2

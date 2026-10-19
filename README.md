@@ -183,6 +183,16 @@ refs/less/<shard>   →  lightweight commit
   lives in the shard it travels with `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
   dependency set. A cold first record parses everything, as before.
 
+- **Git spawn budget.** Every git call is a process spawn — a few ms on a quiet
+  machine, a quarter of a second where endpoint scanning slows `exec`. The
+  run's single `GitStore` therefore memoizes `changed_since` and `load_meta`
+  (invalidated by save / delete / sync pull), `git_root` is asked once per
+  path, planning and selection share one context, and `changed_since` no
+  longer spends a separate spawn probing whether the base commit exists. A
+  run that selects nothing takes 4–6 git calls (it used to take 10–23) and,
+  because nothing new was learned, does not rewrite the shard. Tests pin the
+  budget.
+
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 
 #### Automatic sync (recommended)

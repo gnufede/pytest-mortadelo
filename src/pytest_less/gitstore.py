@@ -44,10 +44,18 @@ def _parse_iso(value) -> object:
 class GitStore:
     """Read/write one dependency shard behind a dedicated git ref."""
 
-    def __init__(self, root: Path, shard: str):
+    def __init__(self, root: Path, shard: str, *, memoize: bool = False):
         self.root = Path(root)
         self.shard = shard
         self.ref = f"refs/less/{shard}"
+        # Startup asks the same questions from several places (the early
+        # probe, setup, collection planning).  Every answer is a git spawn
+        # -- a few ms on a quiet machine, a quarter of a second on one with
+        # endpoint scanning -- so the plugin's shared store remembers them
+        # until the ref changes (sync pull / save / delete).  Off by default:
+        # a store used directly must always see the current state.
+        self._memoize = memoize
+        self._memo: dict = {}
 
     def _git(self, *args: str, stdin: str | None = None, extra_env: dict | None = None) -> str:
         env = None
@@ -90,23 +98,40 @@ class GitStore:
         trigger a re-run).  Returns None when the change set cannot be
         computed (e.g. the base commit is gone after a rebase).
         """
-        if not base_commit or not self.commit_exists(base_commit):
+        if not base_commit:
             return None
+        key = ("changed", base_commit)
+        if self._memoize and key in self._memo:
+            return set(self._memo[key])
         changed: set[str] = set()
-        out = run_git(self.root, "diff", "--no-renames", "--name-only", base_commit)
+        try:
+            # No separate "does the commit exist" probe: a missing base makes
+            # the diff itself fail.
+            out = run_git(
+                self.root, "diff", "--no-renames", "--name-only", base_commit
+            )
+        except subprocess.CalledProcessError:
+            return None
         changed.update(line for line in out.splitlines() if line)
         out = run_git(self.root, "ls-files", "--others", "--exclude-standard")
         changed.update(line for line in out.splitlines() if line)
+        if self._memoize:
+            self._memo[key] = set(changed)
         return changed
 
     # -- shard persistence -------------------------------------------------
 
     def load_meta(self) -> dict | None:
         """Load only meta.json (tiny: the fast-path summary)."""
+        if self._memoize and "meta" in self._memo:
+            return self._memo["meta"]
         try:
-            return json.loads(self._git("cat-file", "blob", f"{self.ref}:meta.json"))
+            meta = json.loads(self._git("cat-file", "blob", f"{self.ref}:meta.json"))
         except (subprocess.CalledProcessError, json.JSONDecodeError):
-            return None
+            meta = None
+        if self._memoize:
+            self._memo["meta"] = meta
+        return meta
 
     def load_data(self) -> dict | None:
         """Load only data.json (the potentially large dependency blob)."""
@@ -172,6 +197,7 @@ class GitStore:
                 },
             ).strip()
         self._git("update-ref", self.ref, commit)
+        self._memo.pop("meta", None)
 
     def delete(self) -> bool:
         """Delete the shard ref. Returns False if there was nothing to delete."""
@@ -183,6 +209,7 @@ class GitStore:
             return False
         try:
             run_git(self.root, "update-ref", "-d", self.ref)
+            self._memo.pop("meta", None)
             return True
         except subprocess.CalledProcessError:
             return False
@@ -225,6 +252,7 @@ class GitStore:
             self._delete_ref_quiet(scratch)
             return f"shard on '{remote}' is not newer than local; keeping local"
         run_git(self.root, "update-ref", self.ref, scratch)
+        self._memo.pop("meta", None)
         self._delete_ref_quiet(scratch)
         return f"pulled a newer shard from '{remote}'"
 

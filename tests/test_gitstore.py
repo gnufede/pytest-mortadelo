@@ -235,3 +235,47 @@ class TestShardPersistence:
         store = GitStore(repo, "deadbeef")
         store.save({"version": 1, "tests": {}, "failed": []}, {"version": 1})
         assert store.load() != (None, None)
+
+
+class TestMemoization:
+    """The plugin's shared store remembers answers within a run; a store used
+    directly must always see the current state."""
+
+    def test_default_store_always_sees_the_current_state(self, repo):
+        base = commit(repo)
+        store = GitStore(repo, "x")
+        assert store.changed_since(base) == set()
+        repo.joinpath("new.txt").write_text("x")
+        assert store.changed_since(base) == {"new.txt"}
+
+    def test_memoizing_store_answers_repeats_from_memory(self, repo):
+        base = commit(repo)
+        store = GitStore(repo, "x", memoize=True)
+        assert store.changed_since(base) == set()
+        repo.joinpath("new.txt").write_text("x")
+        # Same question, same run: the first answer stands (startup phases
+        # ask three times; nothing runs in between).
+        assert store.changed_since(base) == set()
+
+    def test_returned_sets_are_copies(self, repo):
+        base = commit(repo)
+        repo.joinpath("new.txt").write_text("x")
+        store = GitStore(repo, "x", memoize=True)
+        first = store.changed_since(base)
+        first.add("scribble")
+        assert store.changed_since(base) == {"new.txt"}
+
+    def test_meta_memo_is_invalidated_by_save_and_delete(self, repo):
+        store = GitStore(repo, "x", memoize=True)
+        assert store.load_meta() is None
+        store.save({"version": 2}, {"version": 1, "n": 1})
+        assert store.load_meta()["n"] == 1
+        store.save({"version": 2}, {"version": 1, "n": 2})
+        assert store.load_meta()["n"] == 2
+        assert store.delete()
+        assert store.load_meta() is None
+
+    def test_missing_base_commit_is_none_without_a_probe_spawn(self, repo):
+        commit(repo)
+        assert GitStore(repo, "x").changed_since("f" * 40) is None
+        assert GitStore(repo, "x").changed_since(None) is None
