@@ -1,9 +1,10 @@
 """Shard storage in git: dedicated refs under ``refs/less/``, never commits.
 
-A shard is stored as a lightweight commit whose tree contains two blobs::
+A shard is stored as a lightweight commit whose tree contains three blobs::
 
-    data.json  -- {"version": 1, "tests": {nodeid: [dep, ...]}, "failed": [...]}
+    data.json  -- {"version": 2, "blocks": [...], "tests": {...}, "failed": [...], ...}
     meta.json  -- {"version": 1, "shard": ..., "base_commit": ..., "created": ...}
+    parse.json -- per-file parse results keyed by content hash (optional)
 
 The ref ``refs/less/<shard>`` always points at the latest record for that
 pytest command ("latest wins"; overwriting is just an ``update-ref``).  The
@@ -22,10 +23,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import zlib
 from datetime import datetime
 from pathlib import Path
 
+from .gitobjects import Repo, Unsupported, backend_enabled
 from .util import run_git
+
+# What the in-process object layer may raise when it meets something it does
+# not model (packed objects, odd layouts, a held lock): the caller then asks
+# git instead.  Correctness never depends on the fast path applying.
+_FALLBACK = (Unsupported, OSError, ValueError, KeyError, IndexError, zlib.error)
 
 # Sync operations must never hang or prompt for credentials during a test run.
 _SYNC_ENV = {"GIT_TERMINAL_PROMPT": "0"}
@@ -56,6 +64,10 @@ class GitStore:
         # a store used directly must always see the current state.
         self._memoize = memoize
         self._memo: dict = {}
+        # Reads/writes of refs and loose objects without spawning git; None
+        # when disabled (PYTEST_LESS_GIT_BACKEND=subprocess) or the layout is
+        # not one it models.
+        self._repo = Repo.discover(self.root) if backend_enabled() else None
 
     def _git(self, *args: str, stdin: str | None = None, extra_env: dict | None = None) -> str:
         env = None
@@ -71,10 +83,32 @@ class GitStore:
         )
         return proc.stdout
 
+    def _git_concurrently(self, *commands: tuple[str, ...]) -> list[str | None]:
+        """Run git commands at the same time; ``None`` for each one that failed."""
+        procs = [
+            subprocess.Popen(
+                ["git", "-C", str(self.root), *args],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for args in commands
+        ]
+        results: list[str | None] = []
+        for proc in procs:
+            out, _ = proc.communicate()
+            results.append(out if proc.returncode == 0 else None)
+        return results
+
     # -- repository state ------------------------------------------------
 
     def head(self) -> str | None:
         """Current HEAD commit sha, or None on an unborn branch."""
+        if self._repo is not None:
+            try:
+                return self._repo.head()
+            except _FALLBACK:
+                pass
         try:
             return run_git(self.root, "rev-parse", "HEAD").strip() or None
         except subprocess.CalledProcessError:
@@ -104,48 +138,67 @@ class GitStore:
         if self._memoize and key in self._memo:
             return set(self._memo[key])
         changed: set[str] = set()
-        try:
-            # No separate "does the commit exist" probe: a missing base makes
-            # the diff itself fail.
-            out = run_git(
-                self.root, "diff", "--no-renames", "--name-only", base_commit
-            )
-        except subprocess.CalledProcessError:
+        # The two queries are independent: start both, then collect, so the
+        # latency is the slower one rather than the sum (it matters where a
+        # spawn is slow).  No separate "does the commit exist" probe: a
+        # missing base makes the diff itself fail.
+        diff, others = self._git_concurrently(
+            ("diff", "--no-renames", "--name-only", base_commit),
+            ("ls-files", "--others", "--exclude-standard"),
+        )
+        if diff is None or others is None:
             return None
-        changed.update(line for line in out.splitlines() if line)
-        out = run_git(self.root, "ls-files", "--others", "--exclude-standard")
-        changed.update(line for line in out.splitlines() if line)
+        changed.update(line for line in diff.splitlines() if line)
+        changed.update(line for line in others.splitlines() if line)
         if self._memoize:
             self._memo[key] = set(changed)
         return changed
 
     # -- shard persistence -------------------------------------------------
 
+    def _read_blob(self, name: str) -> bytes | None:
+        """Content of ``<ref>:<name>``, or None when the shard or the entry
+        does not exist.  In-process for loose objects; git otherwise."""
+        if self._repo is not None:
+            try:
+                return self._repo.blob_in_ref(self.ref, name)
+            except _FALLBACK:
+                pass
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(self.root), "cat-file", "blob", f"{self.ref}:{name}"],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        return proc.stdout
+
+    def _read_json(self, name: str) -> dict | None:
+        raw = self._read_blob(name)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
     def load_meta(self) -> dict | None:
         """Load only meta.json (tiny: the fast-path summary)."""
         if self._memoize and "meta" in self._memo:
             return self._memo["meta"]
-        try:
-            meta = json.loads(self._git("cat-file", "blob", f"{self.ref}:meta.json"))
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
-            meta = None
+        meta = self._read_json("meta.json")
         if self._memoize:
             self._memo["meta"] = meta
         return meta
 
     def load_data(self) -> dict | None:
         """Load only data.json (the potentially large dependency blob)."""
-        try:
-            return json.loads(self._git("cat-file", "blob", f"{self.ref}:data.json"))
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
-            return None
+        return self._read_json("data.json")
 
     def load_parse(self) -> dict | None:
         """Load parse.json (per-file parse results keyed by content hash)."""
-        try:
-            return json.loads(self._git("cat-file", "blob", f"{self.ref}:parse.json"))
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
-            return None
+        return self._read_json("parse.json")
 
     def load(self) -> tuple[dict | None, dict | None]:
         """Load the latest shard, or (None, None) if absent/unreadable."""
@@ -158,7 +211,39 @@ class GitStore:
 
         *parse* is the new parse.json content; ``None`` carries the existing
         blob over untouched (by object id: it is not even read).
+
+        Written in-process (zlib + sha1 + a ref lock: 39ms for 12 MB against
+        165ms and six spawns through ``hash-object`` / ``mktree`` /
+        ``commit-tree`` / ``update-ref``); git does it when the layout is not
+        one the in-process writer models, or anything goes wrong.
         """
+        if self._repo is not None:
+            try:
+                self._save_in_process(data, meta, parse)
+                self._memo.pop("meta", None)
+                return
+            except _FALLBACK:
+                pass
+        self._save_with_git(data, meta, parse)
+
+    def _save_in_process(self, data: dict, meta: dict, parse: dict | None) -> None:
+        files = {
+            "data.json": json.dumps(data).encode(),
+            "meta.json": json.dumps(meta).encode(),
+        }
+        reuse: dict[str, str] = {}
+        if parse is not None:
+            files["parse.json"] = json.dumps(parse).encode()
+        else:
+            # Carry the stored blob over by id (it may even be packed).
+            existing = self._repo.blob_sha_in_ref(self.ref, "parse.json")
+            if existing:
+                reuse["parse.json"] = existing
+        self._repo.write_shard(
+            self.ref, files, f"pytest-less shard {self.shard}", reuse=reuse
+        )
+
+    def _save_with_git(self, data: dict, meta: dict, parse: dict | None) -> None:
         data_blob = self._git(
             "hash-object", "-w", "--stdin", stdin=json.dumps(data)
         ).strip()
@@ -277,6 +362,11 @@ class GitStore:
         return f"shard pushed to '{remote}'"
 
     def _ref_sha(self, ref: str) -> str | None:
+        if self._repo is not None and ":" not in ref:
+            try:
+                return self._repo.read_ref(ref)
+            except _FALLBACK:
+                pass
         try:
             sha = run_git(self.root, "rev-parse", "--verify", "--quiet", ref)
             return sha.strip() or None

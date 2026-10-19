@@ -33,6 +33,7 @@ Options:
 | `--less-no-cosmetic` | hash docstrings as behavior (by default comments *and* docstrings are ignored); ini: `less_cosmetic = false`; automatically off under `--doctest-modules` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `PYTEST_LESS_PARSE_CACHE=0` | disable the `parse.json` read/write (cold-run measurements, debugging a suspected cache bug); the stored blob is carried over untouched |
+| `PYTEST_LESS_GIT_BACKEND=subprocess` | never read/write git objects in-process; use `git` commands for everything (triage, CI of the fallback path) |
 | `-p no:less` | disable the plugin entirely |
 
 If nothing changed and nothing failed, **zero tests run and pytest exits with
@@ -184,14 +185,36 @@ refs/less/<shard>   →  lightweight commit
   dependency set. A cold first record parses everything, as before.
 
 - **Git spawn budget.** Every git call is a process spawn — a few ms on a quiet
-  machine, a quarter of a second where endpoint scanning slows `exec`. The
-  run's single `GitStore` therefore memoizes `changed_since` and `load_meta`
-  (invalidated by save / delete / sync pull), `git_root` is asked once per
-  path, planning and selection share one context, and `changed_since` no
-  longer spends a separate spawn probing whether the base commit exists. A
-  run that selects nothing takes 4–6 git calls (it used to take 10–23) and,
-  because nothing new was learned, does not rewrite the shard. Tests pin the
-  budget.
+  machine, a quarter of a second where endpoint scanning slows `exec`. Most of
+  what the plugin asks git is plain file access, so `gitobjects.py` does it
+  in-process: finding the toplevel (a directory walk; plain repos, linked
+  worktrees and submodules), `HEAD`, refs (loose files, then `packed-refs`),
+  reading **loose** objects (`zlib` plus the `type size\0` header), and writing
+  the shard (loose blobs, a tree, a parentless commit, then the ref moved with
+  git's own `<ref>.lock` protocol). Writing the 12 MB shard takes 39 ms
+  against 165 ms and six spawns through `hash-object` / `mktree` /
+  `commit-tree` / `update-ref`; the trees it builds are byte-identical to
+  `git mktree`'s, and `git fsck --strict` is clean.
+
+  It deliberately does **not** model packed objects (git may pack the shard
+  later via `gc` / `maintenance`), alternates, SHA-256 repositories, reftable,
+  `GIT_DIR`-style relocation, or a held ref lock. In any of those cases — or
+  on any error — it steps aside and the original `git` command runs, so
+  correctness never depends on it applying; only speed does. Mixed use is
+  fine: a shard written in-process is an ordinary ref that git reads, and the
+  other way round. `PYTEST_LESS_GIT_BACKEND=subprocess` forces the fallback,
+  and CI runs the whole suite both ways on Python 3.12 and 3.13.
+
+  Change detection stays on git on purpose: `git diff --name-only <base>` and
+  `ls-files --others --exclude-standard` encode the index, stat caches, renames
+  and every flavour of `.gitignore`, and a reimplementation that misses a change
+  means a missed test. The two queries run **concurrently**, so their latency is
+  the slower one, not the sum. `changed_since` and `load_meta` are memoized on
+  the run's single `GitStore` (invalidated by save / delete / sync pull), and
+  planning and selection share one context. Result: a cold record spawns **no**
+  git process and a run that selects nothing spawns 2 (it used to spawn 14 and
+  23); because nothing new was learned it does not rewrite the shard. Tests pin
+  the budget.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 

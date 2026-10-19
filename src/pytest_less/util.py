@@ -8,6 +8,8 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+from .gitobjects import toplevel
+
 
 def run_git(root: Path, *args: str, stdin: str | None = None, timeout: float | None = None, extra_env: dict | None = None) -> str:
     """Run a git command in *root*; raise CalledProcessError on failure."""
@@ -29,6 +31,12 @@ def run_git(root: Path, *args: str, stdin: str | None = None, timeout: float | N
 def git_root(start: Path | str | None = None) -> Path | None:
     """Toplevel directory of the git repository containing *start* (or None)."""
     start = Path(start) if start is not None else Path.cwd()
+    # In-process first (a directory walk): ``rev-parse`` costs a spawn, and
+    # the plugin asks several times per run.  None means "no repository or
+    # a layout the walk does not model" -- ask git then.
+    found = toplevel(start)
+    if found is not None:
+        return found
     try:
         out = subprocess.run(
             ["git", "-C", str(start), "rev-parse", "--show-toplevel"],

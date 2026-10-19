@@ -45,6 +45,24 @@ jobs:
           if [ "$code" -eq 5 ]; then exit 0; fi
           exit "$code"
 
+  tests:
+    # The plain suite on every supported Python, with both git backends: the
+    # in-process object layer (default) and the forced `git` subprocess
+    # fallback that it must always be able to hand over to.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+        git_backend: [auto, subprocess]
+    env:
+      PYTEST_LESS_GIT_BACKEND: ${{ matrix.git_backend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --python ${{ matrix.python }}
+      - run: uv run --python ${{ matrix.python }} pytest -q tests
+
   lint:
     runs-on: ubuntu-latest
     steps:
