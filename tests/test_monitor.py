@@ -9,6 +9,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def dep_ids(deps):
+    """[file:block, ...] for readable assertions over Block triples."""
+    return sorted(f"{f}:{b}" for f, b, _ in deps)
+
 SRC = Path(__file__).resolve().parents[1] / "src"
 
 DRIVER = """
@@ -84,18 +89,18 @@ class TestBasicRecording:
     def test_own_file_recorded(self, tmp_path):
         root = make_repo(tmp_path)
         out = run_monitor(tmp_path, root, "test", "probe.py", "x = 1\n")
-        assert out["test"] == ["probe.py"]
+        assert dep_ids(out["test"]) == ["probe.py:<module>"]
 
     def test_import_phase_buckets_elsewhere(self, tmp_path):
         root = make_repo(tmp_path)
         out = run_monitor(tmp_path, root, "import", "probe.py", "x = 1\n")
-        assert out["import"] == ["probe.py"]
+        assert dep_ids(out["import"]) == ["probe.py:<module>"]
         assert out["test"] == []
 
     def test_collect_phase_buckets_elsewhere(self, tmp_path):
         root = make_repo(tmp_path)
         out = run_monitor(tmp_path, root, "collect", "probe.py", "x = 1\n")
-        assert out["collect"] == ["probe.py"]
+        assert dep_ids(out["collect"]) == ["probe.py:<module>"]
         assert out["test"] == []
 
 
@@ -104,7 +109,7 @@ class TestImports:
         root = make_repo(tmp_path)
         (root / "lib.py").write_text("def f():\n    return 1\n")
         out = run_monitor(tmp_path, root, "test", "probe.py", "import lib\nassert lib.f() == 1\n")
-        assert "lib.py" in out["test"]
+        assert any(d[0] == "lib.py" for d in out["test"])
 
     def test_dynamic_import_never_executed_is_still_recorded(self, tmp_path):
         # The conservative guarantee: an import inside a code block that
@@ -121,14 +126,14 @@ class TestImports:
             "helper(False)\n"
         )
         out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
-        assert "lib.py" in out["test"]
+        assert any(d[0] == "lib.py" for d in out["test"])
 
     def test_from_import_submodule(self, tmp_path):
         root = make_repo(tmp_path)
         (root / "pkg" / "mod.py").write_text("v = 1\n")
         out = run_monitor(tmp_path, root, "test", "probe.py", "from pkg import mod\nassert mod.v == 1\n")
-        assert "pkg/__init__.py" in out["test"]
-        assert "pkg/mod.py" in out["test"]
+        assert any(d[0] == "pkg/__init__.py" for d in out["test"])
+        assert any(d[0] == "pkg/mod.py" for d in out["test"])
 
     def test_relative_imports(self, tmp_path):
         root = make_repo(tmp_path)
@@ -142,23 +147,23 @@ class TestImports:
             "assert sib.v + thing.v + up.v == 6\n"
         )
         out = run_monitor(tmp_path, root, "test", Path("pkg") / "sub" / "probe.py", snippet)
-        assert "pkg/sub/probe.py" in out["test"]
-        assert "pkg/sub/sib.py" in out["test"]
-        assert "pkg/sub/thing.py" in out["test"]
-        assert "pkg/up.py" in out["test"]
+        assert any(d[0] == "pkg/sub/probe.py" for d in out["test"])
+        assert any(d[0] == "pkg/sub/sib.py" for d in out["test"])
+        assert any(d[0] == "pkg/sub/thing.py" for d in out["test"])
+        assert any(d[0] == "pkg/up.py" for d in out["test"])
 
     def test_stdlib_and_outside_repo_are_dropped(self, tmp_path):
         root = make_repo(tmp_path)
         snippet = "import json\nfrom pathlib import Path\n"
         out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
-        assert out["test"] == ["probe.py"]
+        assert dep_ids(out["test"]) == ["probe.py:<module>"]
 
     def test_ancestor_packages_recorded(self, tmp_path):
         root = make_repo(tmp_path)
         (root / "pkg" / "sub" / "deep.py").write_text("v = 1\n")
         snippet = "import pkg.sub.deep\nassert pkg.sub.deep.v == 1\n"
         out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
-        assert {"pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/deep.py"} <= set(out["test"])
+        assert {"pkg/__init__.py", "pkg/sub/__init__.py", "pkg/sub/deep.py"} <= {d[0] for d in out["test"]}
 
 
 DISABLE_DRIVER = """
@@ -271,7 +276,7 @@ class TestModuleIndex:
         names = "\n".join(f"x{i} = {i}" for i in range(300))
         snippet = f"{names}\nimport lib\nassert lib.f() == 1\n"
         out = run_monitor(tmp_path, root, "test", "probe.py", snippet)
-        assert "lib.py" in out["test"]
+        assert any(d[0] == "lib.py" for d in out["test"])
 
 
 COEXIST_DRIVER = """
@@ -337,8 +342,9 @@ class TestToolIdAllocation:
         )
         out = json.loads(proc.stdout.strip().splitlines()[-1])
         assert len(set(out["tool_ids"])) == 2
-        assert out["mon"] == ["lib.py", "probe.py"]
-        assert out["mon2"] == ["lib.py", "probe.py"]
+        expected = ["lib.py:<module>", "lib.py:f", "probe.py:<module>"]
+        assert dep_ids(out["mon"]) == expected
+        assert dep_ids(out["mon2"]) == expected
 
 
 class TestDisable:
@@ -361,8 +367,12 @@ class TestDisable:
         # 20,000 starts of dep-less code produced only a handful of events.
         assert out["hot_loop_events"] < 10, out["hot_loop_events"]
         # Repo code still fires on every test: both buckets are attributed.
-        assert out["test"] == ["lib.py", "probe.py"]
-        assert out["test2"] == ["lib.py", "probe.py"]
+        assert dep_ids(out["test"]) == [
+            "lib.py:<module>", "lib.py:f", "probe.py:<module>",
+        ]
+        assert dep_ids(out["test2"]) == [
+            "lib.py:<module>", "lib.py:f", "probe.py:<module>",
+        ]
         assert out["snippet_events"] > 0
 
 
@@ -382,9 +392,9 @@ class TestExclusions:
         out = run_monitor(
             tmp_path, root, "test", "probe.py", snippet, exclude=plugin_dir
         )
-        assert "fake_plugin/hooks.py" not in out["test"]
-        assert "fake_plugin/hooks.py" not in out["import"]
-        assert out["test"] == ["probe.py"]
+        assert not any(d[0] == "fake_plugin/hooks.py" for d in out["test"])
+        assert not any(d[0] == "fake_plugin/hooks.py" for d in out["import"])
+        assert dep_ids(out["test"]) == ["probe.py:<module>"]
 
     def test_venv_inside_repo_is_not_recorded(self, tmp_path):
         # uv-style in-repo virtual environment: code executed from inside

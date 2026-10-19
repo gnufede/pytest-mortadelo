@@ -33,6 +33,18 @@ def shard_data(path):
     return json.loads(git(path, "cat-file", "blob", f"{refs[0]}:data.json").stdout)
 
 
+def decode_shard(data):
+    """v2 shard -> (tests: {nid: set[(file, block, hash)]}, import_deps: set)."""
+    table = [tuple(b) for b in data["blocks"]]
+    tests = {nid: {table[i] for i in idxs} for nid, idxs in data["tests"].items()}
+    import_deps = {table[i] for i in data.get("import_deps", [])}
+    return tests, import_deps
+
+
+def dep_ids(deps):
+    return sorted(f"{f}:{b}" for f, b, _ in deps)
+
+
 @pytest.fixture
 def project(pytester):
     """A small git repository with two tests and two lazily-imported helpers.
@@ -78,19 +90,23 @@ class TestRecording:
         )
 
         data = shard_data(project.path)
-        assert set(data["tests"]) == {
+        tests, import_deps = decode_shard(data)
+        assert set(tests) == {
             "tests/test_a.py::test_a",
             "tests/test_b.py::test_b",
         }
         assert data["failed"] == []
-        # Executed dynamic import recorded for test_a...
-        assert "tests/lib.py" in data["tests"]["tests/test_a.py::test_a"]
-        # ...and the never-executed import recorded for test_b.
-        assert "tests/other.py" in data["tests"]["tests/test_b.py::test_b"]
-        # Import-time deps (conftest) and the test's own module are recorded...
-        for deps in data["tests"].values():
-            assert "tests/conftest.py" in deps
-        assert "tests/test_a.py" in data["tests"]["tests/test_a.py::test_a"]
+        # Executed dynamic import recorded for test_a: lib's SKELETON plus
+        # the executed body of ping...
+        assert "tests/lib.py:<module>" in dep_ids(tests["tests/test_a.py::test_a"])
+        assert "tests/lib.py:ping" in dep_ids(tests["tests/test_a.py::test_a"])
+        # ...while test_b's never-executed (dead branch) import records only
+        # other's SKELETON -- a body edit there would NOT re-run test_b.
+        assert dep_ids(tests["tests/test_b.py::test_b"]) == [
+            "tests/other.py:<module>", "tests/test_b.py:<module>", "tests/test_b.py:test_b",
+        ]
+        # Conftest skeleton is a shared import-time dep.
+        assert "tests/conftest.py:<module>" in dep_ids(import_deps)
         # ...but other tests' modules must NOT leak into a test's deps.
         assert "tests/test_b.py" not in data["tests"]["tests/test_a.py::test_a"]
         assert "tests/test_a.py" not in data["tests"]["tests/test_b.py::test_b"]
@@ -114,8 +130,9 @@ class TestRecording:
             "tests/test_a.py::test_a",
             "tests/test_b.py::test_b",
         }
-        assert "tests/lib.py" in data["tests"]["tests/test_a.py::test_a"]
-        assert "tests/other.py" in data["tests"]["tests/test_b.py::test_b"]
+        tests, _ = decode_shard(data)
+        assert "tests/lib.py:<module>" in dep_ids(tests["tests/test_a.py::test_a"])
+        assert "tests/other.py:<module>" in dep_ids(tests["tests/test_b.py::test_b"])
 
     def test_disabled_without_flag_records_nothing(self, project):
         result = project.runpytest_subprocess("-q")
@@ -311,6 +328,268 @@ class TestSyncEndToEnd:
         assert "pushed" not in result.stdout.str()
         # The remote was not touched.
         assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split() == seeded
+
+
+class TestFastPath:
+    """The no-change rerun: meta.json as first-level cache, data.json never read."""
+
+    def _shard_sha(self, path):
+        return git(
+            path, "for-each-ref", "--format=%(objectname)", "refs/less/"
+        ).stdout.split()[0]
+
+    def test_no_change_rerun_is_fast_and_leaves_shard_untouched(self, project):
+        run_less(project, "-q")
+        before = self._shard_sha(project.path)
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(
+            ["*selected 0/2 tests: no recorded dependency changed; fast path*"]
+        )
+        # Nothing ran: the shard was not even rewritten.
+        assert self._shard_sha(project.path) == before
+
+    def test_irrelevant_change_still_takes_fast_path(self, project):
+        run_less(project, "-q")
+        (project.path / "README.md").write_text("docs change, not a dependency\n")
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*fast path*"])
+
+    def test_new_test_file_runs_via_fast_path_and_preserves_old(self, project):
+        run_less(project, "-q")
+        (project.path / "tests" / "test_new.py").write_text(
+            "def test_new():\n    assert True\n"
+        )
+        result = run_less(project, "-q")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*fast path*"])
+        data = shard_data(project.path)
+        tests, _ = decode_shard(data)
+        assert set(tests) == {
+            "tests/test_a.py::test_a",
+            "tests/test_b.py::test_b",
+            "tests/test_new.py::test_new",
+        }
+        # and the meta summary covers the new file
+        ref = git(
+            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
+        ).stdout.split()[0]
+        meta = json.loads(
+            git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout
+        )
+        assert "tests/test_new.py" in meta["dep_files"]
+        assert "tests/test_new.py::test_new" in meta["nodeids"]
+
+    def test_pure_rerun_never_activates_the_monitor(self, project):
+        # The distinguishing note of the monitor-less fast path.
+        run_less(project, "-q")
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*fast path (monitoring not armed*"])
+
+    def test_unmonitored_test_in_pure_run_failure_is_persisted(self, project):
+        # The only thing that can run in a pure (monitor-less) rerun is a
+        # test that was never recorded -- e.g. lost to an interrupted run.
+        # Simulate that: drop test_a from the recorded shard, then make it
+        # fail via an untracked non-dependency, non-.py file.  The failure
+        # list must be persisted (so the next run re-runs it) while its deps
+        # stay as recorded-or-absent.
+        # Make test_a's outcome depend on a marker file (committed first so
+        # the edit is not itself a change).
+        (project.path / "tests" / "test_a.py").write_text(
+            "import pathlib\n\ndef test_a():\n"
+            "    import lib\n"
+            "    assert lib.ping() == 1\n"
+            "    assert not pathlib.Path('flag.txt').exists()\n"
+        )
+        git(project.path, "add", "-A")
+        git(project.path, "commit", "-q", "-m", "outcome marker")
+        run_less(project, "-q")
+
+        # Simulate the interruption loss: rewrite the shard without test_a.
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/less/").stdout.split()[0]
+        data = json.loads(git(project.path, "cat-file", "blob", f"{ref}:data.json").stdout)
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        drop = [i for i, b in enumerate(data["blocks"])
+                if b[0] == "tests/test_a.py"]
+        keep = [i for i in range(len(data["blocks"])) if i not in drop]
+        remap = {old: new for new, old in enumerate(keep)}
+        data["blocks"] = [data["blocks"][i] for i in keep]
+        data["tests"] = {nid: [remap[i] for i in idxs if i in remap]
+                         for nid, idxs in data["tests"].items()
+                         if nid != "tests/test_a.py::test_a"}
+        data["import_deps"] = [remap[i] for i in data["import_deps"] if i in remap]
+        meta["nodeids"] = [n for n in meta["nodeids"]
+                           if n != "tests/test_a.py::test_a"]
+        meta["dep_files"] = [f for f in meta["dep_files"] if f != "tests/test_a.py"]
+        from pytest_less.gitstore import GitStore
+        GitStore(project.path, meta["shard"]).save(data, meta)
+
+        # Flip the outcome via the untracked marker (non-.py, not a dep:
+        # still pure -- no dep changed, no new .py file).
+        (project.path / "flag.txt").write_text("x\n")
+
+        result = run_less(project, "-q")
+        result.assert_outcomes(failed=1)  # test_a ran (unrecorded) and failed
+        result.stdout.fnmatch_lines(["*monitoring not armed*"])
+        # ... and the failure is persisted for the next run
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/less/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert meta["failed"] == ["tests/test_a.py::test_a"]
+        # next run: test_a is BOTH unrecorded and previously failed; the
+        # new-test branch wins the label (it runs either way).
+        result = run_less(project, "-q")
+        result.assert_outcomes(failed=1)
+        result.stdout.fnmatch_lines(["*selected 1/2 tests:*1 new*"])
+
+    def test_changed_dependency_disables_fast_path(self, project):
+        run_less(project, "-q")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 12345\n")
+        result = run_less(project, "-q")
+        result.assert_outcomes(failed=1)
+        assert "fast path" not in result.stdout.str()
+
+    def test_previous_failure_disables_fast_path_then_reenables(self, project):
+        run_less(project, "-q")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 12345\n")
+        run_less(project, "-q")  # test_a fails
+        result = run_less(project, "-q")  # failed -> rerun (slow path)
+        result.assert_outcomes(failed=1)
+        assert "fast path" not in result.stdout.str()
+        # it passes again after the fix -> meta.failed empty -> fast again
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1\n")
+        result = run_less(project, "-q")
+        result.stdout.fnmatch_lines(["*1 previously failed*"])
+
+
+class TestInterruptedRuns:
+    """Interrupted runs must never lose a test to collection skipping."""
+
+    def test_interrupted_tests_are_marked_to_rerun(self, project):
+        # test_a fails (a real failure), then test_b raises KeyboardInterrupt
+        # mid-run: neither result is trustworthy, so both must re-run next
+        # time -- test_b especially, whose result is unknown.
+        (project.path / "tests" / "test_a.py").write_text(
+            "def test_a():\n    import lib\n    assert lib.ping() == 12345\n"
+        )
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    raise KeyboardInterrupt\n"
+        )
+        result = run_less(project, "-q")
+        assert result.ret in (1, 2)
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/less/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert set(meta["failed"]) == {
+            "tests/test_a.py::test_a", "tests/test_b.py::test_b",
+        }
+        # and both stay in the recorded node ids (with deps for the one that
+        # did finish, an entry for the interrupted one)
+        assert set(meta["nodeids"]) == {
+            "tests/test_a.py::test_a", "tests/test_b.py::test_b",
+        }
+        # next run: previously-failed/unfinished re-run (fast path disabled)
+        result = run_less(project, "-q")
+        result.stdout.fnmatch_lines(["*2 previously failed*"])
+
+    def test_interrupted_first_run_never_loses_a_test(self, project):
+        # Interrupt the very first run mid-test: the unfinished test keeps a
+        # shard entry (empty deps) and is must-rerun, so the next run cannot
+        # collection-skip it away.
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    raise KeyboardInterrupt\n"
+        )
+        result = run_less(project, "-q")
+        assert result.ret in (1, 2)
+        ref = git(project.path, "for-each-ref", "--format=%(refname)",
+                  "refs/less/").stdout.split()[0]
+        meta = json.loads(git(project.path, "cat-file", "blob", f"{ref}:meta.json").stdout)
+        assert "tests/test_b.py::test_b" in meta["nodeids"]
+        assert "tests/test_b.py::test_b" in meta["failed"]
+        # fix the interruption and run again: test_b re-runs
+        (project.path / "tests" / "test_b.py").write_text(
+            "def test_b():\n    assert True\n"
+        )
+        git(project.path, "add", "-A")
+        git(project.path, "commit", "-q", "-m", "fix interruption")
+        result = run_less(project, "-q")
+        # test_b (previously interrupted -> must-rerun) runs and passes;
+        # test_a finished in the interrupted run with unchanged deps, so it
+        # stays deselected.
+        result.assert_outcomes(passed=1)
+
+
+class TestBlockGranularity:
+    """The point of block-level deps: edit granularity decides re-runs."""
+
+    def test_body_edit_of_one_test_reruns_only_that_test(self, project):
+        # File-level tracking re-ran the whole file's tests on any edit;
+        # block-level re-runs only the test whose function body changed.
+        run_less(project, "-q")
+        content = (project.path / "tests" / "test_a.py").read_text()
+        (project.path / "tests" / "test_a.py").write_text(
+            content.replace("assert lib.ping() == 1", "assert lib.ping() == 1\n    marker = 1")
+        )
+        result = run_less(project, "-q")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*1 affected*"])
+
+    def test_comment_edit_of_helper_reruns_nothing(self, project):
+        run_less(project, "-q")
+        (project.path / "tests" / "lib.py").write_text(
+            "# a comment change only\ndef ping():\n    return 1\n"
+        )
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+
+    def test_body_edit_of_dead_imported_helper_does_not_rerun(self, project):
+        # test_b imports `other` in a dead branch: its recorded dep is
+        # other's SKELETON. Editing other.pong's BODY must not re-run test_b
+        # (file-level tracking would have).
+        run_less(project, "-q")
+        (project.path / "tests" / "other.py").write_text(
+            "def pong():\n    return 99\n"  # body edit
+        )
+        result = run_less(project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+
+    def test_module_level_edit_of_dead_imported_helper_reruns(self, project):
+        run_less(project, "-q")
+        (project.path / "tests" / "other.py").write_text(
+            "NEW_CONSTANT = 1\ndef pong():\n    return 2\n"  # module-level edit
+        )
+        result = run_less(project, "-v")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*test_b.py::test_b PASSED*"])
+
+    def test_body_edit_of_executed_helper_reruns_only_its_caller(self, project):
+        # lib.ping's body executes inside test_a only.  (The edited body is
+        # deliberately a different byte length: a same-length edit inside the
+        # same mtime second could otherwise be served from a stale .pyc.)
+        run_less(project, "-q")
+        (project.path / "tests" / "lib.py").write_text(
+            "def ping():\n    return 12345\n"
+        )
+        result = run_less(project, "-q")
+        # test_a re-runs (and fails: the assertion now mismatches).
+        result.assert_outcomes(failed=1)
+        result.stdout.fnmatch_lines(["*FAILED tests/test_a.py::test_a*"])
+
+    def test_conftest_body_edit_reruns_everything_import_time(self, project):
+        # Anything that executes at import time (here: a function body in a
+        # conftest called at module level) is a shared import-time dep: a
+        # body edit re-runs the world.
+        run_less(project, "-q")
+        (project.path / "tests" / "conftest.py").write_text(
+            "def helper():\n    return 2  # body edit\n\nVAL = helper()\n"
+        )
+        result = run_less(project, "-q")
+        result.assert_outcomes(passed=2)  # everything re-ran (import-time stale)
 
 
 class TestSelfHosting:

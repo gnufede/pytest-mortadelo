@@ -27,10 +27,18 @@ from pathlib import Path
 
 import pytest
 
+from .blocks import Block
 from .gitstore import GitStore
 from .monitoring import FileMonitor
-from .selection import Selection, Shard, load_shard, select_tests
-from .util import command_key, git_root, to_repo_rel
+from .selection import (
+    DATA_VERSION,
+    Selection,
+    Shard,
+    load_shard,
+    select_tests,
+    stale_dep,
+)
+from .util import _EXCLUDED_SEGMENTS, command_key, git_root, to_repo_rel
 
 _ENV_TRUTHY = ("1", "true", "yes")
 
@@ -63,6 +71,69 @@ def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
     if sep and left.lower() in ("pull", "push") and right.strip():
         mode, remote = left.lower(), right.strip()
     return (remote, mode)
+
+
+def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
+    """Probe the run using only meta.json (the first-level cache).
+
+    Returns (changed-file set, fast-path eligible, monitor-less eligible).
+    Fast path: no recorded dependency can be stale.  Monitor-less ("pure"):
+    additionally, no unrecorded .py file exists that pytest could collect
+    tests from -- if one did, it might run and need recording, so the
+    monitor must stay armed.
+    """
+    if (
+        meta is None
+        or not isinstance(meta.get("nodeids"), list)
+        or not isinstance(meta.get("dep_files"), list)
+    ):
+        return None, False, False
+    try:
+        changed = store.changed_since(meta.get("base_commit"))
+    except Exception:
+        return None, False, False
+    if changed is None:
+        return changed, False, False
+    if meta.get("failed") or changed & {
+        f for f in meta["dep_files"] if isinstance(f, str)
+    }:
+        return changed, False, False
+    dep_files = {f for f in meta["dep_files"] if isinstance(f, str)}
+    candidates = {
+        f
+        for f in changed - dep_files
+        if f.endswith(".py")
+        and not _EXCLUDED_SEGMENTS.intersection(Path(f).parts)
+    }
+    return changed, True, not candidates
+
+
+def _early_probe_pure_fast(args: list[str], cli_args) -> bool:
+    """Heuristic pre-configure check: can we skip monitor activation?
+
+    Conservative in the right direction: any raw-argument that could mean
+    selectors, discards or forced runs makes the probe fail (the monitor is
+    activated normally).  A wrong probe verdict only costs the early
+    import-time capture -- pytest_configure re-runs the exact check and
+    late-activates the monitor when needed.
+    """
+    if any(
+        flag in args
+        for flag in ("--less-force", "--less-clean", "--lf", "--ff",
+                     "--last-failed", "--failed-first")
+    ) or any(
+        a.startswith(("-k", "-m", "--lf", "--ff")) or "::" in a for a in args
+    ):
+        return False
+    root = git_root(Path.cwd())
+    if root is None:
+        return False
+    # The shard key comes from the *invocation* arguments: the hook's args
+    # already include ini addopts, which the configure-time key
+    # (config.invocation_params.args) does not.
+    store = GitStore(root, command_key(cli_args, root))
+    _, fast, pure = _fast_conditions(store, store.load_meta())
+    return fast and pure
 
 
 def _selectors_active(config: pytest.Config) -> bool:
@@ -105,12 +176,38 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default=False,
         help="Discard the stored dependency data for this command before running.",
     )
+    group.addoption(
+        "--less-data-files",
+        action="store_true",
+        default=False,
+        help="Also record non-Python files opened during a test (sys audit "
+        "hook on 'open') as file-level dependencies, closing the data-file "
+        "blind spot (fixtures, templates, profiles). Part of the shard key: "
+        "toggling it starts a fresh record run.",
+    )
     parser.addini(
         "less_sync",
         help="git remote to sync the dependency shard with (e.g. 'origin'): "
         "pulled before selection, pushed after recording",
         default="",
     )
+    parser.addini(
+        "less_data_files",
+        help="like --less-data-files: record non-Python files opened by "
+        "tests as file-level dependencies",
+        type="bool",
+        default=False,
+    )
+
+
+def _data_files_enabled(config) -> bool:
+    """Whether data-file tracking is on (ini or parsed CLI option)."""
+    try:
+        if config.getini("less_data_files"):
+            return True
+    except Exception:  # pragma: no cover - ini not registered (embedders)
+        pass
+    return bool(getattr(config.option, "less_data_files", False))
 
 
 # ---------------------------------------------------------------- early activation
@@ -124,13 +221,26 @@ def pytest_load_initial_conftests(early_config, parser, args):
     # instead of the command line is handled by a late activation fallback in
     # pytest_configure.)
     if "--less" in args or _env_enabled():
-        root = git_root(Path.cwd())
-        if root is not None:
-            monitor = FileMonitor(root)
-            if monitor.activate():
-                # Stash on the config (the same instance pytest_configure
-                # receives) instead of a module global.
-                early_config._less_early_monitor = monitor
+        if _early_probe_pure_fast(args, early_config.invocation_params.args):
+            # No-change rerun (decided from meta.json alone, before any
+            # conftest is imported): no recorded dependency can be stale
+            # and nothing new can run, so the whole monitoring machinery is
+            # not needed at all.  pytest_configure re-checks with parsed
+            # options and can still activate it late if this was wrong.
+            early_config._less_probe_pure = True
+        else:
+            root = git_root(Path.cwd())
+            if root is not None:
+                # Options are not parsed yet: peek the raw flag; the ini is
+                # registered (and readable) at this point.
+                data_files = (
+                    "--less-data-files" in args or _data_files_enabled(early_config)
+                )
+                monitor = FileMonitor(root, data_files=data_files)
+                if monitor.activate():
+                    # Stash on the config (the same instance
+                    # pytest_configure receives) instead of a module global.
+                    early_config._less_early_monitor = monitor
     return (yield)
 
 
@@ -163,6 +273,13 @@ class LessState:
         # Shard sync (see _sync_remote).
         self.sync_remote: str | None = None
         self.sync_mode: str = "both"
+        # No-change fast path (meta.json is the first-level cache).
+        self.fast = False
+        self.fast_recorded: set[str] = set()
+        self.fast_pure = False  # fast path AND the monitor can stay off
+        self._meta: dict | None = None
+        # Current block tables of the changed files (selection input).
+        self.new_maps: dict = {}
 
     # -- setup ----------------------------------------------------------
 
@@ -172,28 +289,6 @@ class LessState:
         if self.root is None:
             self.notes.append("less: not a git repository; running and recording nothing")
             self._drop_early_monitor(early_monitor)
-            return
-
-        if early_monitor is not None and early_monitor.root == self.root:
-            self.monitor = early_monitor
-        else:
-            self._drop_early_monitor(early_monitor)
-            if early_monitor is None:
-                # Late activation (e.g. --less came from ini addopts):
-                # root conftest imports already happened unwatched, so add
-                # the conftest files themselves as import-time deps.
-                self.monitor = FileMonitor(self.root)
-                self.monitor.activate()
-                self.notes.append(
-                    "less: monitoring activated late; conftest files added "
-                    "as import-time dependencies"
-                )
-        if self.monitor is None or not self.monitor.active:
-            self.notes.append(
-                "less: could not register a sys.monitoring tool "
-                "(already in use?); running all tests without recording"
-            )
-            self.monitor = None
             return
 
         self._collect_conftest_deps(config)
@@ -212,9 +307,85 @@ class LessState:
                 self.notes.append(f"less: {self.store.sync_pull(self.sync_remote)}")
             except Exception as e:  # never break the run
                 self.notes.append(f"less: sync pull failed ({e!r})")
-        data, meta = self.store.load()
-        self.shard = load_shard(data, meta)
+        meta = self.store.load_meta()
+        fast = self._try_fast_path(config, meta)
+        if not fast:
+            # Slow path: load the full dependency blob.
+            self.shard = load_shard(self.store.load_data(), meta)
+        if not (fast and self.fast_pure):
+            # The monitor is only armed when something might actually be
+            # recorded (the pure fast path runs nothing worth recording).
+            if early_monitor is not None and early_monitor.root == self.root:
+                self.monitor = early_monitor
+            else:
+                self._drop_early_monitor(early_monitor)
+                # Late activation (also the recovery path when the early
+                # probe skipped arming but this run turned out to need it,
+                # and --less from ini addopts): root conftest imports
+                # already happened unwatched, so add the conftest files
+                # themselves as import-time deps.
+                self.monitor = FileMonitor(
+                    self.root, data_files=_data_files_enabled(config)
+                )
+                self.monitor.activate()
+                self.notes.append(
+                    "less: monitoring activated late; conftest files added "
+                    "as import-time dependencies"
+                )
+            if self.monitor is None or not self.monitor.active:
+                self.notes.append(
+                    "less: could not register a sys.monitoring tool "
+                    "(already in use?); running all tests without recording"
+                )
+                self.monitor = None
+        else:
+            # Pure fast path: drop any early monitor the probe did not
+            # prevent (probe false-positives) and stay disarmed.
+            self._drop_early_monitor(early_monitor)
         self.enabled = True
+
+    def _try_fast_path(self, config: pytest.Config, meta) -> bool:
+        """Decide the run without reading data.json at all.
+
+        meta.json doubles as the first-level cache: it carries the recorded
+        node ids, the failed list, and -- crucially -- ``dep_files``, the set
+        of every file any recorded dependency references.  git itself is the
+        cache-validity oracle: if no file in that set changed since the
+        recorded base commit (working tree + untracked), no recorded
+        dependency can be stale, so the 40MB data blob is never read and no
+        per-test block expansion ever happens.  Runs everything through the
+        normal path when the summary is absent (old shards), anything
+        relevant changed, or tests failed (they must re-run).
+        """
+        self._meta = meta
+        if meta is None or config.option.less_force:
+            return False
+        if _selectors_active(config):
+            self.selectors_active = True
+            return False
+        changed, fast, pure = _fast_conditions(self.store, meta)
+        if changed is not None:
+            self.changed = changed
+        if not fast:
+            return False
+        # Nothing any recorded test depends on changed.
+        nodeids = [n for n in meta["nodeids"] if isinstance(n, str)]
+        self.fast = True
+        self.fast_pure = pure
+        self.fast_recorded = set(nodeids)
+        explicit = self._explicit_arg_files(config)
+        self.skip_collect_files = {n.split("::")[0] for n in nodeids} - explicit
+        self.skipped_test_ids = [
+            n for n in nodeids if n.split("::")[0] in self.skip_collect_files
+        ]
+        base = (meta.get("base_commit") or "?")[:8]
+        how = (
+            "fast path (monitoring not armed, dependency data not read)"
+            if self.fast_pure
+            else "fast path (dependency data not read)"
+        )
+        self.notes.append(f"less: no recorded dependency changed since {base}; {how}")
+        return True
 
     def _drop_early_monitor(self, monitor: FileMonitor | None) -> None:
         if monitor is not None:
@@ -258,13 +429,21 @@ class LessState:
         self.changed = changed
         if changed is None:
             return
-        # Which files still have at least one test that will run?
+        self.new_maps = self._new_maps(changed)
+        # If any shared import-time dependency went stale, every test runs:
+        # nothing is skippable.
+        if any(stale_dep(b, changed, self.new_maps) for b in self.shard.import_deps):
+            return
+        # Which files still have at least one test that will run?  A test
+        # runs if it previously failed or any of its recorded blocks went
+        # stale in the changed files.
         file_tests: dict[str, list[str]] = {}
         for nodeid in self.shard.tests:
             file_tests.setdefault(nodeid.split("::")[0], []).append(nodeid)
         for file, nodeids in file_tests.items():
             if any(
-                nodeid in self.shard.failed or self.shard.tests[nodeid] & changed
+                nodeid in self.shard.failed
+                or any(stale_dep(b, changed, self.new_maps) for b in self.shard.tests[nodeid])
                 for nodeid in nodeids
             ):
                 continue
@@ -280,6 +459,20 @@ class LessState:
             self.skipped_test_ids = [
                 n for n in self.skipped_test_ids if n.split("::")[0] not in dropped
             ]
+
+    def _new_maps(self, changed: set[str]) -> dict:
+        """Current block tables of the changed .py files (selection input).
+
+        Files that no longer parse (deleted, mid-edit) map to None, which
+        the stale check treats as "changed in a way we cannot resolve".
+        """
+        maps: dict = {}
+        if self.monitor is None:
+            return maps
+        for f in changed:
+            if f.endswith(".py"):
+                maps[f] = self.monitor.file_blocks(f)
+        return maps
 
     def _explicit_arg_files(self, config: pytest.Config) -> set[str]:
         """Repo-relative files explicitly given as pytest arguments."""
@@ -314,25 +507,36 @@ class LessState:
         all unaffected were already skipped at collection time)."""
         assert self.store is not None
         collected = [i.nodeid for i in items]
-        shard = self.shard
-        if shard is None:
+        if self.fast:
+            # Decision was already made from meta.json: recorded tests are
+            # deselected (nothing they depend on changed); anything not in
+            # the recorded set is new and runs.
+            recorded = self.fast_recorded
+            selection = Selection(
+                [n for n in collected if n not in recorded],
+                [n for n in collected if n in recorded],
+                set(self.changed or ()),
+                "no recorded dependency changed; fast path",
+            )
+        elif self.shard is None:
             self.selection = Selection(
                 collected, [], set(),
                 "no usable stored data for this command; running and recording everything",
             )
             return
-        if config.option.less_force:
+        elif config.option.less_force:
             self.selection = Selection(
                 collected, [], set(), "--less-force: running everything"
             )
             return
-        if self.selectors_active:
+        elif self.selectors_active:
             self.selection = Selection(
                 collected, [], set(),
                 "test selectors (-k/-m/--lf/explicit node ids) present: running everything",
             )
             return
-        selection = select_tests(collected, shard, self.changed)
+        else:
+            selection = select_tests(collected, self.shard, self.changed, self.new_maps)
         if self.skipped_test_ids:
             # Only report tests whose files were genuinely not collected;
             # a planned skip can be overridden by pytest (e.g. a file given
@@ -372,32 +576,88 @@ class LessState:
             # The test body finished; deps recorded for it are trustworthy.
             self.finished.add(report.nodeid)
 
-    def finish(self, config: pytest.Config) -> None:
-        """Merge monitor buckets into per-test deps and store the shard."""
-        if self.monitor is None or self.store is None or self.root is None:
+    def finish(self, config: pytest.Config, interrupted: bool = False) -> None:
+        """Merge monitor buckets into per-test deps and store the shard.
+
+        Block-level model (data version 2): each test keeps the blocks that
+        executed while it ran (plus the collect-time blocks of its own test
+        module); import-time blocks (module skeletons of everything imported
+        before the tests, conftests, and the bodies of anything that
+        executed during import) are shared by every test and stored once.
+        """
+        if self.store is None or self.root is None:
             return
+        if self.fast and not self.finished and not self.failed:
+            # Fast path and nothing ran: the stored shard is still exactly
+            # valid (same base commit, same content) -- leave it untouched.
+            self.notes.append("less: nothing ran; stored shard left unchanged")
+            return
+        if self.fast and self.monitor is None:
+            # Pure fast path (the monitor was never armed) but something
+            # ran or failed.  No dependency can have changed -- that is why
+            # we took the fast path -- so only the failure list can differ;
+            # deps of anything that ran without a monitor stay as recorded
+            # (or, for unrecorded tests, absent: they simply re-run next
+            # time, the conservative "new test" behavior).
+            data = self.store.load_data() or {
+                "version": DATA_VERSION, "blocks": [], "tests": {}, "import_deps": [],
+            }
+            data["failed"] = sorted(self.failed)
+            meta = dict(self._meta or {})
+            meta.update(
+                failed=sorted(self.failed),
+                base_commit=self.store.head(),
+                created=datetime.now(UTC).isoformat(),
+            )
+            self.store.save(data, meta)
+            self.notes.append(
+                "less: monitor was not armed (fast path); failure list "
+                "updated, dependencies left as recorded"
+            )
+            return
+        if self.fast:
+            # Something ran (a new test, or a previously failed one):
+            # lazily load the full data now to preserve everything else.
+            self.shard = load_shard(self.store.load_data(), self._meta)
         monitor = self.monitor
+        if monitor is None:
+            return
         monitor.phase = "done"
         monitor.current_nodeid = None
-        global_deps = (
-            monitor.import_deps
-            | (monitor.collect_deps - self.module_files)
-            | self.conftest_deps
-        )
-        old_tests = self.shard.tests if self.shard is not None else {}
-        tests: dict[str, list[str]] = {}
+
+        # Partition collect-phase blocks: those executed in test-module
+        # files belong to that module's tests only; everything else is a
+        # shared import-time dependency.
+        module_collect: dict[str, set[Block]] = {}
+        import_blocks: set[Block] = set(monitor.import_deps)
+        for block in monitor.collect_deps:
+            rel = block[0]
+            if rel in self.module_files:
+                module_collect.setdefault(rel, set()).add(block)
+            else:
+                import_blocks.add(block)
+        # Conftest skeletons: dependency of every test. (Normally captured
+        # by the monitor at import time anyway; covers late activation and
+        # empty conftest files.)
+        for rel in self.conftest_deps:
+            import_blocks.add(monitor.module_dep(rel))
+
+        old_shard = self.shard
+        old_tests = old_shard.tests if old_shard is not None else {}
+        # Keep previously recorded import-time deps (conservative: a module
+        # that stopped being imported still re-runs its dependents).
+        import_blocks |= old_shard.import_deps if old_shard is not None else set()
+
+        tests: dict[str, set[Block]] = {}
         for nodeid, module_rel in self.item_map.items():
-            base = set(global_deps)
-            if module_rel:
-                base.add(module_rel)
-            ran = monitor.test_deps.get(nodeid)
-            if ran is not None and nodeid in self.finished:
-                tests[nodeid] = sorted(base | ran)
+            own = monitor.test_deps.get(nodeid)
+            if own is not None and nodeid in self.finished:
+                extra = module_collect.get(module_rel, set()) if module_rel else set()
+                tests[nodeid] = own | extra
             elif nodeid in old_tests:
                 # Not run this time (deselected or interrupted): keep the
-                # previous dependency set, conservatively unioned with the
-                # current import-time deps.
-                tests[nodeid] = sorted(base | old_tests[nodeid])
+                # previous block set; the shared import deps cover the rest.
+                tests[nodeid] = set(old_tests[nodeid])
             # else: never ran and no history -> omit, so it is always
             # re-run in the future ("new test").
         # Tests in files whose collection was skipped never ran and are not
@@ -408,17 +668,64 @@ class LessState:
                 continue
             file = nodeid.split("::")[0]
             if file in self.skip_collect_files:
-                base = set(global_deps)
-                if file.endswith(".py"):
-                    base.add(file)
-                tests[nodeid] = sorted(base | old_deps)
+                tests[nodeid] = set(old_deps)
             # else: the file was collected but the test is gone -> drop
-        data = {"version": 1, "tests": tests, "failed": sorted(self.failed)}
+        if interrupted:
+            # A test that was collected but did not finish has an unknown
+            # result: it must re-run.  With valid old deps it would otherwise
+            # be deselected forever ("no stale block"), and without any
+            # recorded history it would be omitted entirely -- letting its
+            # file be collection-skipped, silently never running again.
+            # Keeping it in the shard (old deps if any, else none) and on the
+            # failed/must-rerun list closes both holes.
+            if self.selection is not None:
+                deselected = set(self.selection.deselected)
+            else:
+                deselected = set()
+            for nodeid in self.item_map:
+                if nodeid in self.finished or nodeid in deselected:
+                    continue
+                tests.setdefault(nodeid, set())
+                self.failed.add(nodeid)
+
+        # Serialize with a dedup table: shared blocks (import-time and
+        # common helpers) are stored once.
+        table: dict[Block, int] = {}
+        ordered: list[Block] = []
+
+        def index(block: Block) -> int:
+            i = table.get(block)
+            if i is None:
+                i = len(ordered)
+                ordered.append(block)
+                table[block] = i
+            return i
+
+        data = {
+            "version": DATA_VERSION,
+            "blocks": [list(b) for b in ordered],  # filled below
+            "tests": {
+                nid: sorted({index(b) for b in tests[nid]})
+                for nid in sorted(tests)
+            },
+            "import_deps": sorted({index(b) for b in import_blocks}),
+            "failed": sorted(self.failed),
+        }
+        data["blocks"] = [list(b) for b in ordered]
+        dep_files: set[str] = {b[0] for b in import_blocks}
+        for deps in tests.values():
+            dep_files.update(b[0] for b in deps)
         meta = {
             "version": 1,
             "shard": self.store.shard,
             "base_commit": self.store.head(),
             "created": datetime.now(UTC).isoformat(),
+            # First-level cache for the no-change rerun (see
+            # _try_fast_path): everything needed to decide "can anything
+            # be stale?" without reading data.json.
+            "failed": sorted(self.failed),
+            "nodeids": sorted(tests),
+            "dep_files": sorted(dep_files),
         }
         self.store.save(data, meta)
         if self.sync_remote and self.sync_mode in ("push", "both"):
@@ -530,13 +837,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus) -> None:
     state = _state_from(session.config)
     if state is None or not state.enabled:
         return
-    if exitstatus == pytest.ExitCode.INTERRUPTED:
-        state.notes.append(
-            "less: run interrupted; tests that never finished will be "
-            "re-run next time"
-        )
     try:
-        state.finish(session.config)
+        state.finish(session.config, interrupted=exitstatus == pytest.ExitCode.INTERRUPTED)
     except Exception as e:  # never break the test run
         state.notes.append(f"less: failed to store dependency data: {e!r}")
 

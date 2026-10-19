@@ -23,6 +23,14 @@ Dependencies are bucketed by execution phase, which the plugin drives:
 Code that lives outside the repository is ignored entirely, as are the
 exclusion roots (the plugin's own package) and virtual environments.
 
+Non-Python data files are tracked through an optional ``sys.addaudithook``
+subscription on the ``open`` event (enabled with ``--less-data-files``):
+every in-repo file opened while the monitor is active is bucketed like code
+dependencies -- per test during a test, into the shared import-time bucket
+before collection.  Python source and bytecode opens are deliberately *not*
+recorded here: they are tracked at block precision by PY_START, and a
+file-level wildcard dep on them would throw that precision away.
+
 Performance notes (the hot path runs once per code block start -- millions of
 times per suite; profiling numbers from the sqlalchemy benchmark):
 
@@ -44,6 +52,7 @@ import os
 import sys
 from pathlib import Path
 
+from .blocks import WILDCARD, Block, BlockCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 try:
@@ -198,9 +207,14 @@ class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
     def __init__(
-        self, root: Path, exclude_roots: tuple[Path, ...] = ()
+        self, root: Path, exclude_roots: tuple[Path, ...] = (),
+        *, data_files: bool = False,
     ):
         self.root = Path(root).resolve()
+        # Whether non-Python files opened by tests are recorded as
+        # file-level dependencies (audit-hook bolt-on; opt-in).
+        self._data_files = data_files
+        self._audit_installed = False
         # Absolute directories whose files are never recorded as dependencies
         # (e.g. the pytest_less package itself, which would otherwise show
         # up as a dependency of every test when installed editable in-repo).
@@ -214,13 +228,22 @@ class FileMonitor:
         self._phase = "import"  # import | collect | test | done
         self._nodeid: str | None = None
         self._key: tuple = ("import",)  # current attribution bucket
-        self.import_deps: set[str] = set()
-        self.collect_deps: set[str] = set()
-        self.test_deps: dict[str, set[str]] = {}
+        self.import_deps: set[Block] = set()
+        self.collect_deps: set[Block] = set()
+        self.test_deps: dict[str, set[Block]] = {}
+        # Block analysis (one AST parse per file, lazily).
+        self._blocks = BlockCache(self.root)
         # Internals.
         self._active = False
         self._tool_id: int | None = None
         self._busy = False  # re-entrancy guard (find_spec imports fire PY_START)
+        # Code objects that first started inside a busy region (the stdlib
+        # helpers of our own analysis: pathlib, ast, ...): analyzed after the
+        # outer analysis completes instead of being dropped.  Dropping them
+        # left them uncached, so every later execution re-entered the cold
+        # path (~7M redundant dispatches per sqlalchemy run), and could lose
+        # deps for code that only ever executes in busy regions.
+        self._pending: list = []
         # code object -> mutable [deps, last_bucket] cell.  Strong refs keep
         # the code objects (and their ids) alive for the whole run.  Deps are
         # re-attributed only when the bucket changes, so a code block that
@@ -307,6 +330,12 @@ class FileMonitor:
             self._release_tool()
             return False
         self._active = True
+        if self._data_files and not self._audit_installed:
+            # Audit hooks cannot be unregistered: install at most once per
+            # monitor instance.  A deactivated monitor's leftover hook
+            # no-ops via the ``_active`` check below.
+            sys.addaudithook(self._on_audit)
+            self._audit_installed = True
         return True
 
     def deactivate(self) -> None:
@@ -332,6 +361,58 @@ class FileMonitor:
             _free_tool(self._tool_id)
         except ValueError:  # pragma: no cover
             pass
+
+    # -- data-file tracking (audit hook) ---------------------------------
+
+    # Repository-relative locations that are never dependencies: VCS
+    # internals and pytest's own cache (the latter is written on every
+    # run and would otherwise pin "the last test that ran" forever).
+    _AUDIT_SKIP_PREFIXES = (".git/", ".pytest_cache/", "__pycache__/")
+
+    def _on_audit(self, event, args) -> None:
+        """``open`` audit hook: record non-Python in-repo files as deps.
+
+        A data file has no code structure, so it is recorded as a
+        file-level wildcard dep ``(rel, "*", "*")``: any content change
+        re-runs the tests (or, outside a test, everything) that opened it.
+        git only reports content changes, so mtime-only churn never
+        reaches selection.
+        """
+        if event != "open" or not self._active or not self._data_files:
+            return
+        try:
+            path = args[0] if args else None
+            if isinstance(path, str):
+                fname = path
+            elif isinstance(path, (bytes, os.PathLike)):
+                try:
+                    fname = os.fspath(path)
+                except TypeError:
+                    return
+                if not isinstance(fname, str):
+                    fname = os.fsdecode(fname)
+            else:
+                return  # int fd or exotic object: no path to record
+            # Reject-first on the suffix: opens in a test run are
+            # overwhelmingly Python source/bytecode, and those are already
+            # tracked at block precision by PY_START -- recording them
+            # here as file-level wildcards would throw that precision
+            # away (every body edit would re-run the test).
+            if fname.endswith((".py", ".pyc", ".pyo")):
+                return
+            rel = self.repo_rel(fname)  # memoized; None outside the repo
+            if rel is None:
+                return
+            if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
+                return
+            if self._exclude_roots and self._is_excluded(fname):
+                return
+            # GIL note: set.add is atomic; bucket attribution under
+            # concurrent threads follows the current test (documented
+            # over/under-attribution caveat, same as the code tracker).
+            self._bucket(((rel, WILDCARD, WILDCARD),))
+        except Exception:
+            pass  # an audit hook must never break the open() it observes
 
     # -- event handling --------------------------------------------------
 
@@ -376,10 +457,24 @@ class FileMonitor:
     def _first_start(self, code):
         """Cold path: first start of this code object."""
         if self._busy or self._phase == "done":
-            # Nested event while resolving imports for an outer block (or
-            # after the run ended): skip analysis and, crucially, cache
-            # nothing -- this code object gets a normal analysis the next
-            # time it starts outside a busy region.
+            # Nested event while resolving/analyzing for an outer block (or
+            # after the run ended): queue it for analysis once the outer one
+            # completes.  Analyzing inline would re-enter the machinery that
+            # triggered the event; dropping it would both lose dependencies
+            # for code that only ever executes in busy regions and leave the
+            # object uncached, so every later execution would pay the cold
+            # path again.
+            if self._phase == "done":
+                # Recording is over: no code executing now can ever become a
+                # dependency, so cache the object as empty and silence it.
+                # Without this, every execution during teardown -- and during
+                # our own finish() serialization, which alone makes millions
+                # of Python-level calls -- re-entered the cold path as an
+                # uncached miss (~7M redundant dispatches per sqlalchemy
+                # run).
+                self._code_cache[code] = [frozenset(), None]
+                return _sys_monitoring.DISABLE
+            self._pending.append(code)
             return None
         self._busy = True
         try:
@@ -393,9 +488,26 @@ class FileMonitor:
         if deps:
             self._bucket(deps)
             cell[1] = self._key
-            return _sys_monitoring.DISABLE if _REARM else None
-        # No dependencies ever: silence this code object for good.
-        return _sys_monitoring.DISABLE
+            result = _sys_monitoring.DISABLE if _REARM else None
+        else:
+            # No dependencies ever: silence this code object for good.
+            result = _sys_monitoring.DISABLE
+        self._drain_pending()
+        return result
+
+    def _drain_pending(self) -> None:
+        """Analyze code objects that first started inside a busy region."""
+        while self._pending:
+            code = self._pending.pop()
+            cell = self._code_cache.get(code)
+            if cell is not None:
+                # Queued and analyzed since (nested drains): just keep the
+                # attribution current.
+                if cell[0] and cell[1] is not self._key:
+                    self._bucket(cell[0])
+                    cell[1] = self._key
+                continue
+            self._first_start(code)  # busy is False here; nested events re-queue
 
     def _bucket(self, deps) -> None:
         phase = self._phase
@@ -409,17 +521,33 @@ class FileMonitor:
 
     # -- analysis ------------------------------------------------------
 
-    def _analyze(self, code) -> frozenset[str]:
-        """Deps of a code block: its own file plus anything it may import."""
+    def _analyze(self, code) -> frozenset[Block]:
+        """Deps of a code block: the block itself plus the module skeletons
+        of anything its bytecode may import."""
         if self._exclude_roots and self._is_excluded(code.co_filename):
             return frozenset()
         own = self.repo_rel(code.co_filename)
         if own is None:
-            # Code outside the repository cannot import repository modules in
-            # any way we care about; skip the (relatively expensive) scan.
+            # Code outside the repository cannot import repository modules
+            # in any way we care about; skip the (relatively expensive)
+            # scan.
             return frozenset()
-        files: set[str] = set()
-        files.add(own)
+        deps: set[Block] = set()
+        fb = self._blocks.file_blocks(own)
+        if fb is None:
+            # File not parseable (deleted mid-run, mid-edit): file-level dep.
+            deps.add((own, WILDCARD, WILDCARD))
+        else:
+            resolved = fb.resolve(
+                getattr(code, "co_qualname", code.co_name), code.co_firstlineno
+            )
+            if resolved is None or resolved[1] == WILDCARD:
+                # Unmappable code object (dynamic code, redefined name):
+                # file-level fallback.
+                deps.add((own, WILDCARD, WILDCARD))
+            else:
+                block_id, content = resolved
+                deps.add((own, block_id, content))
         if _FAST_IMPORT_PRECHECK:
             co_code = code.co_code
             if (
@@ -428,7 +556,7 @@ class FileMonitor:
             ):
                 # No import bytecode anywhere in this block (byte-level
                 # check over the original snapshot): nothing to resolve.
-                return frozenset(files)
+                return frozenset(deps)
         last_full: str | None = None
         instrs = list(dis.get_instructions(code, show_caches=False))
         for i, ins in enumerate(instrs):
@@ -437,7 +565,11 @@ class FileMonitor:
                 name = _operand_name(code, ins)
                 level = _static_level(instrs, i)
                 resolved, full = self._resolve_module(name, level, own)
-                files |= resolved
+                for rel in resolved:
+                    # Importing a module executes its module-level code: the
+                    # dependency is the module skeleton, not the whole file
+                    # (function bodies of the imported module do not run).
+                    deps.add(self._blocks.module_dep(rel))
                 last_full = full
             elif op == "IMPORT_FROM":
                 # ``from pkg import attr`` where attr is a submodule.  If it
@@ -445,8 +577,9 @@ class FileMonitor:
                 # skip it -- conservative in the right direction.
                 attr = _operand_name(code, ins)
                 if attr and last_full:
-                    files |= self._resolve_dotted(f"{last_full}.{attr}")
-        return frozenset(files)
+                    for rel in self._resolve_dotted(f"{last_full}.{attr}"):
+                        deps.add(self._blocks.module_dep(rel))
+        return frozenset(deps)
 
     def _resolve_module(
         self, name: str | None, level: int, own_rel: str
@@ -495,6 +628,14 @@ class FileMonitor:
             if origin:
                 files.add(origin)
         return frozenset(files)
+
+    def module_dep(self, rel: str) -> Block:
+        """Import-time dependency on a module (its skeleton)."""
+        return self._blocks.module_dep(rel)
+
+    def file_blocks(self, rel: str):
+        """Block table of a repo file (None if unparseable); cached."""
+        return self._blocks.file_blocks(rel)
 
     def repo_rel(self, filename: str) -> str | None:
         """Repo-relative path for a filename, memoized per monitor.
