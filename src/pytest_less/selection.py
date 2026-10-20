@@ -33,12 +33,6 @@ of that:
   a signal: the generated code comes from generators that are themselves
   recorded, and flagging it selected 69% of sqlalchemy's ORM tests on every
   edit.)
-* **docstring readers** -- the cosmetic filter hides docstring-only edits
-  from the block hashes.  A block whose docstring text differs from the
-  recorded one (``block_docs``) still selects the tests that executed it
-  *if* they also ran a file that reads docstrings as data (``doc_readers``).
-  This is block-level, so its selection is always a subset of what no
-  cosmetic filter at all would select.
 * everything else is block-precise; each widening is reported in the run
   summary, never silent.
 """
@@ -76,10 +70,6 @@ class Shard:
     # Tests that ran string-compiled code / reflective entry points.  None =
     # unknown (old shard): every test is conservatively treated as dynamic.
     dynamic: set[str] | None = field(default_factory=set)
-    # Per-block docstring hash at record time, and the files that read
-    # docstrings as data (the cosmetic filter's safety net).
-    block_docs: dict[Block, str] = field(default_factory=dict)
-    doc_readers: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -163,20 +153,6 @@ def load_shard(data, meta) -> Shard | None:
             if isinstance(raw_dynamic, list)
             else None
         )
-        # Per-block docstring hashes, parallel to the block table (absent in
-        # shards recorded before the safety net: no doc information).
-        block_docs: dict[Block, str] = {}
-        raw_bdocs = data.get("bdocs")
-        if version == DATA_VERSION and isinstance(raw_bdocs, list):
-            for block, doc in zip(table, raw_bdocs, strict=False):
-                if isinstance(doc, str) and doc:
-                    block_docs[block] = doc
-        raw_readers = data.get("doc_readers")
-        doc_readers = (
-            {r for r in raw_readers if isinstance(r, str)}
-            if isinstance(raw_readers, list)
-            else set()
-        )
         base_commit = meta.get("base_commit")
         if base_commit is not None and not isinstance(base_commit, str):
             return None
@@ -190,8 +166,6 @@ def load_shard(data, meta) -> Shard | None:
         always=always,
         spawn_unknown=spawn_unknown,
         dynamic=dynamic,
-        block_docs=block_docs,
-        doc_readers=doc_readers,
     )
 
 
@@ -234,9 +208,6 @@ class _Context:
     # a child process could read watched: tests that always re-run do not.
     pristine: bool = False
     import_files: set[str] = field(default_factory=set)
-    # Recorded blocks (not stale) whose docstring text changed.
-    doc_changed: set[Block] = field(default_factory=set)
-    import_doc_changed: bool = False
     _memo: dict[Block, bool] = field(default_factory=dict)
 
     def stale(self, dep: Block) -> bool:
@@ -266,25 +237,12 @@ def build_context(
     recorded: set[str] = set()
     stale_files: set[str] = set()
 
-    doc_changed: set[Block] = set()
-
     def note(block: Block) -> None:
         rel = block[0]
         if rel in changed:
             recorded.add(rel)
             if stale_dep(block, changed, maps):
                 stale_files.add(rel)
-            else:
-                # Same code (cosmetic hash) -- but did its docstring text change?
-                old = shard.block_docs.get(block)
-                fb = maps.get(rel)
-                if (
-                    old is not None
-                    and fb is not None
-                    and block[1] != WILDCARD
-                    and fb.bdocs.get(block[1]) != old
-                ):
-                    doc_changed.add(block)
 
     for b in shard.import_deps:
         import_files.add(b[0])
@@ -296,8 +254,8 @@ def build_context(
             note(b)
 
     # Dynamic-marker widening: reflective construct + a real (stale) change
-    # in the same file.  Cosmetic/format-only changes produce no stale block
-    # and do not widen (interlock with the cosmetic filter).  A marker file
+    # in the same file.  Format-only changes produce no stale block and do
+    # not widen.  A marker file
     # everyone imported widens to *all* tests (file-level semantics: any
     # test could reach code through an edge the recording never saw).
     dynamic_files = {
@@ -319,8 +277,6 @@ def build_context(
         dynamic_global=bool(dynamic_files & import_files),
         spawn_active=spawn_active,
         import_files=import_files,
-        doc_changed=doc_changed,
-        import_doc_changed=bool(doc_changed & shard.import_deps),
     )
 
 
@@ -344,12 +300,6 @@ def affected_reason(
         return "spawn"
     if ctx.unrecorded_py and (shard.dynamic is None or nodeid in shard.dynamic):
         return "runtime"
-    if (
-        ctx.doc_changed
-        and (ctx.import_doc_changed or not ctx.doc_changed.isdisjoint(deps))
-        and (ctx.import_files | {b[0] for b in deps}) & shard.doc_readers
-    ):
-        return "doc"
     return None
 
 
@@ -388,7 +338,7 @@ def select_tests(
     selected: list[str] = []
     deselected: list[str] = []
     n_affected = n_failed = n_new = n_dynamic = n_spawn = 0
-    n_always = n_runtime = n_doc = 0
+    n_always = n_runtime = 0
     always = shard.always
     for nodeid in collected:
         deps = shard.tests.get(nodeid)
@@ -413,8 +363,6 @@ def select_tests(
                 n_spawn += 1
             elif why == "runtime":
                 n_runtime += 1
-            elif why == "doc":
-                n_doc += 1
             else:
                 n_affected += 1
     base = (shard.base_commit or "?")[:8]
@@ -440,6 +388,4 @@ def select_tests(
         reason += f"; {n_spawn} selected by the subprocess rule"
     if n_runtime:
         reason += f"; {n_runtime} selected as runtime-dynamic (exec/import_module/...)"
-    if n_doc:
-        reason += f"; {n_doc} selected by docstring readers"
     return Selection(selected, deselected, set(changed), reason)

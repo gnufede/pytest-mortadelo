@@ -2,7 +2,9 @@
 
 from typing import ClassVar
 
-from pytest_less.blocks import MODULE_BLOCK, WILDCARD, parse_blocks
+from blocktable import table_of
+
+from pytest_less.blocks import MODULE_BLOCK, WILDCARD
 from pytest_less.selection import (
     Shard,
     load_shard,
@@ -81,35 +83,35 @@ class TestStaleDep:
         assert not stale_dep(dep("src/lib.py", "ping"), set(), {})
 
     def test_changed_file_matching_hash_not_stale(self):
-        fb = parse_blocks("def ping():\n    return 1\n")
+        fb = table_of("def ping():\n    return 1\n")
         # recorded hash from the same content:
         recorded = ("src/lib.py", "ping", fb.blocks["ping"])
         maps = {"src/lib.py": fb}
         assert not stale_dep(recorded, {"src/lib.py"}, maps)
 
     def test_changed_body_stales(self):
-        old = parse_blocks("def ping():\n    return 1\n")
-        new = parse_blocks("def ping():\n    return 2\n")
+        old = table_of("def ping():\n    return 1\n")
+        new = table_of("def ping():\n    return 2\n")
         recorded = ("src/lib.py", "ping", old.blocks["ping"])
         assert stale_dep(recorded, {"src/lib.py"}, {"src/lib.py": new})
 
     def test_removed_block_stales(self):
         recorded = dep("src/lib.py", "ping")
-        new = parse_blocks("def other():\n    return 1\n")
+        new = table_of("def other():\n    return 1\n")
         assert stale_dep(recorded, {"src/lib.py"}, {"src/lib.py": new})
 
     def test_wildcard_stales_on_any_change(self):
-        assert stale_dep(("src/lib.py", WILDCARD, WILDCARD), {"src/lib.py"}, {"src/lib.py": parse_blocks("x = 1\n")})
+        assert stale_dep(("src/lib.py", WILDCARD, WILDCARD), {"src/lib.py"}, {"src/lib.py": table_of("x = 1\n")})
 
     def test_unparseable_changed_file_stales(self):
         assert stale_dep(dep("src/lib.py", "ping"), {"src/lib.py"}, {"src/lib.py": None})
 
     def test_module_skeleton_granularity(self):
-        old = parse_blocks("X = 1\n\ndef f():\n    return 1\n")
+        old = table_of("X = 1\n\ndef f():\n    return 1\n")
         # body edit: skeleton unchanged, f changed
-        body_edit = parse_blocks("X = 1\n\ndef f():\n    return 2\n")
+        body_edit = table_of("X = 1\n\ndef f():\n    return 2\n")
         # module-level edit: skeleton changed, f unchanged
-        module_edit = parse_blocks("X = 2\n\ndef f():\n    return 1\n")
+        module_edit = table_of("X = 2\n\ndef f():\n    return 1\n")
         rec_skel = ("lib.py", MODULE_BLOCK, old.blocks[MODULE_BLOCK])
         rec_f = ("lib.py", "f", old.blocks["f"])
         assert not stale_dep(rec_skel, {"lib.py"}, {"lib.py": body_edit})
@@ -141,9 +143,9 @@ class TestSelectTests:
 
     def test_stale_block_selects_dependents(self):
         shard = make_shard()
-        old = parse_blocks("def ping():\n    return 1\n")
+        old = table_of("def ping():\n    return 1\n")
         shard.tests["tests/test_a.py::test_a"] = {("src/lib.py", "ping", old.blocks["ping"])}
-        new = parse_blocks("def ping():\n    return 2\n")
+        new = table_of("def ping():\n    return 2\n")
         sel = select_tests(self.COLLECTED, shard, {"src/lib.py"}, {"src/lib.py": new})
         # the ping-dependent test and the new test are selected, nothing else
         assert sel.selected == ["tests/test_a.py::test_a", "tests/test_c.py::test_c"]
@@ -152,15 +154,15 @@ class TestSelectTests:
 
     def test_same_hash_does_not_select(self):
         shard = make_shard()
-        fb = parse_blocks("def ping():\n    return 1\n")
+        fb = table_of("def ping():\n    return 1\n")
         shard.tests["tests/test_a.py::test_a"] = {("src/lib.py", "ping", fb.blocks["ping"])}
         sel = select_tests(self.COLLECTED, shard, {"src/lib.py"}, {"src/lib.py": fb})
         assert "tests/test_a.py::test_a" in sel.deselected
 
     def test_import_time_stale_selects_everyone(self):
         shard = make_shard()
-        old_conf = parse_blocks("X = 1\n")
-        new_conf = parse_blocks("X = 2\n")
+        old_conf = table_of("X = 1\n")
+        new_conf = table_of("X = 2\n")
         shard.import_deps = {("tests/conftest.py", MODULE_BLOCK, old_conf.blocks[MODULE_BLOCK])}
         sel = select_tests(
             self.COLLECTED,
@@ -174,7 +176,7 @@ class TestSelectTests:
 
     def test_import_time_fresh_deselects(self):
         shard = make_shard()
-        conf = parse_blocks("X = 1\n")
+        conf = table_of("X = 1\n")
         shard.import_deps = {("tests/conftest.py", MODULE_BLOCK, conf.blocks[MODULE_BLOCK])}
         sel = select_tests(
             self.COLLECTED,

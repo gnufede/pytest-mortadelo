@@ -349,9 +349,9 @@ class TestSpawnRuleUnit:
 
     @staticmethod
     def maps_for(path, source="def main():\n    return 1\n"):
-        from pytest_less.blocks import parse_blocks
+        from blocktable import table_of
 
-        return {path: parse_blocks(source)}
+        return {path: table_of(source)}
 
     def test_spawner_runs_even_with_no_changes(self):
         from pytest_less.selection import select_tests
@@ -394,11 +394,12 @@ class TestSpawnRuleUnit:
         assert "tests/test_o.py::test_o" in sel.deselected
 
     def test_fresh_recorded_py_file_never_triggers_the_weak_rule(self):
-        from pytest_less.blocks import parse_blocks
+        from blocktable import table_of
+
         from pytest_less.selection import select_tests
 
         shard = self.make_shard(unknown=True)
-        fb = parse_blocks("def main():\n    return 1\n")
+        fb = table_of("def main():\n    return 1\n")
         shard.tests["tests/test_o.py::test_o"] = {
             ("worker.py", "main", fb.blocks["main"])
         }
@@ -409,12 +410,13 @@ class TestSpawnRuleUnit:
         assert "tests/test_o.py::test_o" in sel.deselected
 
     def test_stale_recorded_py_file_triggers_the_weak_rule(self):
-        from pytest_less.blocks import parse_blocks
+        from blocktable import table_of
+
         from pytest_less.selection import select_tests
 
         shard = self.make_shard(unknown=True)
-        old = parse_blocks("def main():\n    return 1\n")
-        new = parse_blocks("def main():\n    return 2\n")
+        old = table_of("def main():\n    return 1\n")
+        new = table_of("def main():\n    return 2\n")
         shard.tests["tests/test_o.py::test_o"] = {
             ("worker.py", "main", old.blocks["main"])
         }

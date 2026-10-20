@@ -244,12 +244,12 @@ class GitStore:
         snapshot = self.load_files()
         return bool(snapshot and snapshot.get("all"))
 
-    def local_parse_store(self, cosmetic: bool) -> LocalParseStore | None:
+    def local_parse_store(self) -> LocalParseStore | None:
         """The repository-wide parse store (under the git directory), or None
         when the layout is not one the in-process layer models."""
         if self._repo is None:
             return None
-        return LocalParseStore.at(self._repo.commondir, cosmetic=cosmetic)
+        return LocalParseStore.at(self._repo.commondir)
 
     def tracked_files(self, limit: int) -> list[str] | None:
         """Every tracked file, or ``None`` if there are more than *limit* (or

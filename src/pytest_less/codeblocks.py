@@ -1,11 +1,10 @@
-"""Block hashes from compiled code objects instead of the AST.
+"""Block hashes from compiled code objects.
 
-``parse_blocks`` (blocks.py) walks and dumps a Python AST.  ``compile()`` is a
-C call -- cheaper than ``ast.parse`` alone, which has to build Python objects
--- and a code object already *is* a tree of blocks: one per ``def``, one per
-class body, one for the module.  This module computes the same block table
-from ``compile(source)``: 2.4 s -> 0.9 s for the 220 files / 8.8 MB a
-sqlalchemy record run touches.
+``compile()`` is a C call -- cheaper than ``ast.parse`` alone, which has to
+build Python objects -- and a code object already *is* a tree of blocks: one per
+``def``, one per class body, one for the module.  Hashing the 220 files / 8.8 MB
+a sqlalchemy record run touches takes 0.7 s this way (0.53 s of it the compiler);
+walking and dumping an AST took 2.4 s.
 
 What is hashed is the code compiled **from the file on disk**, never the code
 object that is running: pytest rewrites asserts in test modules (and other
@@ -23,11 +22,11 @@ What the hash is and is not sensitive to (each point is tested):
 * Anything the compiler discards cannot matter: ``1 + 0``, dead branches,
   bare string statements, annotations of local variables.  Equal bytecode is
   equal behavior.
-* **Docstrings are behavior** here: editing one changes the hash of its block
-  (and, for a class or module docstring, of the skeleton every importer
-  depends on).  The AST path's "cosmetic" filter is not available; it traded a
-  per-block docstring hash and a "reads ``__doc__``" scan for ignoring prose,
-  and this path prefers to select a few extra tests.
+* **Docstrings are behavior**: editing one changes the hash of its block (and,
+  for a class or module docstring, of the skeleton every importer depends on).
+  Ignoring prose needed a per-block docstring hash and a "reads ``__doc__``"
+  scan to stay safe, and on a codebase that reads docstrings itself (sqlalchemy)
+  it saved nothing; this prefers to select a few extra tests.
 * A class / module hash is a *skeleton*: ``def`` bodies are replaced by their
   signature, everything else (class-level statements, decorators, defaults,
   annotations, lambdas, comprehensions) is included.  Decorators, defaults
@@ -40,16 +39,15 @@ What the hash is and is not sensitive to (each point is tested):
   the *value* each ``LOAD_CONST`` loads.  A function's own table is a function
   of its own body, so its raw bytes are stable.
 
-Anything not modelled raises :class:`Unsupported` and the caller falls back to
-the AST path (PEP 695 generics / ``type`` statements, interpreters other than
-3.12 / 3.13).  Hashes carry a ``c<minor>`` prefix: the two algorithms (and two
-Python versions) can never be mistaken for each other, a mismatch is simply
-"changed".
+Anything not modelled raises :class:`Unsupported` (PEP 695 generics / ``type``
+statements, interpreters other than 3.12 / 3.13) and the file becomes a
+file-level dependency: any change to it re-runs the tests that executed it.
+Hashes carry a ``c<minor>`` prefix, so two Python versions can never be mistaken
+for each other: a mismatch is simply "changed".
 """
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import opcode
 import re
@@ -57,7 +55,7 @@ import sys
 import types
 import warnings
 
-from .blocks import MODULE_BLOCK, FileBlocks, scan_tree
+from .blocks import MODULE_BLOCK, FileBlocks
 
 SUPPORTED = sys.version_info[:2] in {(3, 12), (3, 13)}
 TAG = f"c{sys.version_info[1]}"  # bytecode differs between minor versions
@@ -89,7 +87,7 @@ _TYPE_STMT = re.compile(rb"^[ \t]*type[ \t]+[A-Za-z_]\w*[ \t]*(\[|=)", re.MULTIL
 
 
 class Unsupported(Exception):
-    """The file uses something this hasher does not model: use the AST path."""
+    """The file uses something this hasher does not model: the file is then a file-level dependency."""
 
 
 def _key(c: object) -> str:
@@ -275,96 +273,10 @@ class _Analysis:
             self.collect(c)
 
 
-class CompiledBlocks(FileBlocks):
-    """:class:`FileBlocks` built from a compiled module.
-
-    ``resolve`` is exact where the AST path guessed: a running code object is
-    matched by ``(co_qualname, co_firstlineno)``; code with no block of its own
-    (lambdas, comprehensions) belongs to its *lexical parent* -- the qualified
-    name with the last component stripped -- instead of to the innermost block
-    whose source span contains the line.  Module-level lambdas therefore map to
-    the module skeleton (which contains them) rather than to a file wildcard,
-    and a class declared ``global`` inside a function is found under its real
-    ``co_qualname``.
-    """
-
-    __slots__ = ("_by_name", "_markers_cache", "_source")
-    kind = "c"
-
-    def __init__(self, blocks, spans, by_name, source=None):
-        super().__init__(blocks, spans, (), {}, False)
-        self._by_name = by_name  # qualname -> [(first line, block id)]
-        self._source = source
-        self._markers_cache = None  # computed on first use (see ``markers``)
-
-    @classmethod
-    def restore(cls, blocks, spans, markers):
-        """Rebuild from a cache entry (the name index is derived from spans)."""
-        by_name: dict[str, list[tuple[int, str]]] = {}
-        for start, _end, block_id in spans:
-            entry = by_name.setdefault(block_id.split("~")[0], [])
-            if (start, block_id) not in entry:
-                entry.append((start, block_id))
-        fb = cls(blocks, spans, by_name)
-        fb._markers_cache = None if markers is None else tuple(markers)
-        return fb
-
-    def attach_source(self, data: bytes) -> None:
-        self._source = data
-
-    def known_markers(self) -> tuple[str, ...] | None:
-        return self._markers_cache
-
-    @property
-    def markers(self) -> tuple[str, ...]:  # type: ignore[override]
-        """Dynamic constructs, computed on first use.  Selection only asks
-        about files that *changed*, so recording never pays for it."""
-        got = self._markers_cache
-        if got is None:
-            src = self._source
-            # If the scan cannot run, say "dynamic": an empty tuple would
-            # switch the widening safety net off, the unsafe direction.
-            try:
-                got = (
-                    scan_tree(ast.parse(src))[0]
-                    if src is not None
-                    else ("unscanned@L0",)
-                )
-            except (SyntaxError, ValueError, RecursionError):
-                got = ("unscanned@L0",)
-            self._markers_cache = got
-        return got
-
-    @markers.setter
-    def markers(self, value) -> None:
-        self._markers_cache = value
-
-    def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
-        name = qualname
-        while True:
-            options = self._by_name.get(name)
-            if options is not None:
-                block_id = options[0][1]
-                if len(options) > 1:  # redefinitions: pick by source line
-                    best = -1
-                    for start, candidate in options:
-                        if start == firstlineno:
-                            block_id = candidate
-                            break
-                        if best < start <= firstlineno:
-                            best, block_id = start, candidate
-                return block_id, self.blocks[block_id]
-            cut = name.rfind(".")
-            if cut < 0:
-                break
-            name = name[:cut].removesuffix(".<locals>")
-        return MODULE_BLOCK, self.blocks[MODULE_BLOCK]
-
-
-def compile_blocks(source: bytes, *, filename: str = "<src>") -> CompiledBlocks | None:
+def compile_blocks(source: bytes, *, filename: str = "<src>") -> FileBlocks | None:
     """Block table of *source* from its compiled code; None if it does not
     compile.  Raises :class:`Unsupported` for constructs this hasher does not
-    model (the caller then uses ``parse_blocks``)."""
+    model (the caller then treats the file as a file-level dependency)."""
     if not SUPPORTED:
         raise Unsupported(f"python {sys.version_info[:2]}")
     if _TYPE_STMT.search(source):
@@ -386,14 +298,10 @@ def compile_blocks(source: bytes, *, filename: str = "<src>") -> CompiledBlocks 
     for qname, _, content in work.defs:
         distinct.setdefault(qname, set()).add(content)
     blocks: dict[str, str] = {}
-    spans: list[tuple[int, int, str]] = []
-    by_name: dict[str, list[tuple[int, str]]] = {}
+    spans: list[tuple[int, str]] = []
     for qname, start, content in work.defs:
         block_id = qname if len(distinct[qname]) == 1 else f"{qname}~{content}"
         blocks[block_id] = content
-        spans.append((start, start, block_id))
-        entry = by_name.setdefault(qname, [])
-        if (start, block_id) not in entry:
-            entry.append((start, block_id))
+        spans.append((start, block_id))
     blocks[MODULE_BLOCK] = module_digest
-    return CompiledBlocks(blocks, spans, by_name, source)
+    return FileBlocks(blocks, spans, None, source)

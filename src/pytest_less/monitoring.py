@@ -348,7 +348,6 @@ class FileMonitor:
     def __init__(
         self, root: Path, exclude_roots: tuple[Path, ...] = (),
         *, data_files: bool = False,
-        cosmetic: bool = True,
         parse_cache: ParseCache | None = None,
     ):
         self.root = Path(root).resolve()
@@ -390,11 +389,8 @@ class FileMonitor:
         # every test -- same policy as the import-time bucket).
         self.spawn_tests: set[str] = set()
         self.spawn_shared = False
-        # Block analysis (one AST parse per file, lazily).  ``cosmetic``
-        # strips docstrings before hashing (on by default).
-        self._blocks = BlockCache(
-            self.root, cosmetic=cosmetic, parse_cache=parse_cache
-        )
+        # Block analysis (one compile per file, lazily).
+        self._blocks = BlockCache(self.root, parse_cache=parse_cache)
         # Internals.
         self._active = False
         self._tool_id: int | None = None

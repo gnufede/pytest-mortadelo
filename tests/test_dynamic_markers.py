@@ -9,9 +9,9 @@ dynscan marks the *marker* at record time; we scan the *changed file at
 selection time* (no shard format change): a file that both contains a
 dynamic construct *and* has a stale recorded block is widened to file level
 -- every test that touched the file re-runs.  The staleness gate matters:
-it is what keeps the widening from firing on cosmetic edits (a docstring
-change under the (default) cosmetic filter produces no stale block, so Ley 2 never
-punches through Ley 1), and it only opens when some test really did execute
+it is what keeps the widening from firing on edits that change no block
+(comments, formatting: they produce no stale block, so Ley 2 never punches
+through Ley 1), and it only opens when some test really did execute
 the changed code -- the case where other, reflective tests may reach it
 through edges the recording never saw.
 """
@@ -19,9 +19,10 @@ through edges the recording never saw.
 import ast
 
 import pytest
+from blocktable import table_of
 from test_plugin import commit, git, run_less
 
-from pytest_less.blocks import find_dynamic_markers, parse_blocks
+from pytest_less.blocks import find_dynamic_markers
 from pytest_less.selection import Shard, select_tests
 
 
@@ -65,7 +66,7 @@ class TestMarkerDetection:
         )
 
     def test_plain_code_has_no_markers(self):
-        fb = parse_blocks("def f(x):\n    return x + 1\n\nclass K:\n    pass\n")
+        fb = table_of("def f(x):\n    return x + 1\n\nclass K:\n    pass\n")
         assert fb is not None
         assert fb.markers == ()
 
@@ -109,8 +110,8 @@ class TestWidening:
     """
 
     def test_marker_file_stale_widens_to_file_level(self):
-        old = parse_blocks(REFLECTIVE_OLD)
-        new = parse_blocks(REFLECTIVE_NEW)
+        old = table_of(REFLECTIVE_OLD)
+        new = table_of(REFLECTIVE_NEW)
         assert new.markers  # sanity: the file really is reflective
         shard = make_shard(
             {
@@ -127,8 +128,8 @@ class TestWidening:
         assert "dynamic markers" in sel.reason
 
     def test_same_edit_in_a_plain_file_stays_block_precise(self):
-        old = parse_blocks(PLAIN_OLD)
-        new = parse_blocks(PLAIN_NEW)
+        old = table_of(PLAIN_OLD)
+        new = table_of(PLAIN_NEW)
         assert not new.markers
         shard = make_shard(
             {
@@ -144,8 +145,8 @@ class TestWidening:
         assert USE in sel.deselected
 
     def test_marker_file_in_the_import_bucket_widens_everyone(self):
-        old = parse_blocks(REFLECTIVE_OLD)
-        new = parse_blocks(REFLECTIVE_NEW)
+        old = table_of(REFLECTIVE_OLD)
+        new = table_of(REFLECTIVE_NEW)
         shard = make_shard(
             {
                 USE: {("tests/test_use.py", "test_use", "h0")},
@@ -163,7 +164,7 @@ class TestWidening:
         assert "import-time" not in sel.reason
 
     def test_fresh_marker_file_never_widens(self):
-        fb = parse_blocks(REFLECTIVE_OLD)
+        fb = table_of(REFLECTIVE_OLD)
         shard = make_shard(
             {
                 USE: {("lib.py", "dispatch", fb.blocks["dispatch"])},
@@ -181,7 +182,7 @@ class TestWidening:
         # all for it): with nothing stale, the net stays quiet -- the
         # causal-closure argument says unreachable code cannot become
         # reachable through an edit alone.
-        fb = parse_blocks(REFLECTIVE_NEW)
+        fb = table_of(REFLECTIVE_NEW)
         shard = make_shard(
             {
                 USE: {("tests/test_use.py", "test_use", "h0")},
@@ -264,23 +265,12 @@ class TestDynamicE2E:
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
-    @pytest.mark.usefixtures("ast_hashing")
-    def test_docstring_edit_in_marker_file_stays_cosmetic(self, dynamic_project):
-        # The interlock: with the (default) cosmetic filter a prose-only edit
-        # produces no stale block, so the widening gate never opens (Ley 2
-        # without weakening Ley 1).
+    def test_docstring_edit_selects_the_executor(self, dynamic_project):
+        # A docstring is behavior.  dispatch's hash changed -> test_use via
+        # staleness, and the marker widening pulls in test_helper's file-mate
+        # too.
         run_less(dynamic_project, "-q").assert_outcomes(passed=3)
         write_lib(dynamic_project, "old", docstring='"A much better description."')
         result = run_less(dynamic_project, "-q")
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
-
-    def test_docstring_edit_without_cosmetic_selects_executor(self, dynamic_project):
-        # With --less-no-cosmetic prose is behavior.  dispatch's hash
-        # changed (the docstring) -> test_use via staleness, and the marker
-        # widening pulls in test_helper's file-mate too.
-        run_less(dynamic_project, "-q", "--less-no-cosmetic").assert_outcomes(passed=3)
-        write_lib(dynamic_project, "old", docstring='"A much better description."')
-        result = run_less(dynamic_project, "-q", "--less-no-cosmetic")
         result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
         result.assert_outcomes(passed=2)

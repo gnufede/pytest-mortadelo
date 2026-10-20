@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from .blocks import DYNAMIC_DEP, WILDCARD, Block, ParseCache
+from .blocks import DYNAMIC_DEP, Block, ParseCache
 from .fingerprint import TRACKED_LIMIT, build_snapshot
 from .gitstore import GitStore
 from .monitoring import FileMonitor
@@ -266,17 +266,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "(open() is wrapped). Part of the shard key: toggling it "
         "starts a fresh record run.",
     )
-    group.addoption(
-        "--less-no-cosmetic",
-        action="store_true",
-        default=False,
-        help="Hash docstrings as behavior. By default only code matters: "
-        "comments (invisible to the AST) and docstrings are ignored, so "
-        "prose-only edits select nothing -- except for tests that ran code "
-        "reading docstrings as data (__doc__, getdoc, doctest, help). "
-        "Automatically off under --doctest-modules/--doctest-glob. Part of "
-        "the shard key: toggling it starts a fresh record run.",
-    )
     parser.addini(
         "less_sync",
         help="git remote to sync the dependency shard with (e.g. 'origin'): "
@@ -287,14 +276,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "less_data_files",
         help="set to false to disable data-file tracking (on by default): "
         "non-Python files opened by tests recorded as file-level deps",
-        type="bool",
-        default=True,
-    )
-    parser.addini(
-        "less_cosmetic",
-        help="set to false to hash docstrings as behavior (on by default: "
-        "docstring-only edits select nothing, except for tests that ran "
-        "docstring-reading code)",
         type="bool",
         default=True,
     )
@@ -312,38 +293,6 @@ def _data_files_enabled(config) -> bool:
         return False
     try:
         if config.getini("less_data_files") is False:
-            return False
-    except Exception:  # pragma: no cover - ini not registered (embedders)
-        pass
-    return True
-
-
-def _doctest_args(args) -> bool:
-    """Whether the raw command line collects doctests (docstrings are tests)."""
-    return any(
-        a == "--doctest-modules" or a.startswith("--doctest-glob") for a in args
-    )
-
-
-def _cosmetic_enabled(config, args=()) -> bool:
-    """Whether the cosmetic (docstring) filter is on.
-
-    On by default (an opt-out feature): disable with --less-no-cosmetic or
-    `less_cosmetic = false`.  Docstrings are test input under pytest's
-    doctest collection, so the filter is also off then.  Like
-    :func:`_data_files_enabled`, this is called before options are parsed
-    (raw *args* are peeked by the early hook) and again after.
-    """
-    if getattr(config.option, "less_no_cosmetic", False):
-        return False
-    if getattr(config.option, "doctestmodules", False) or getattr(
-        config.option, "doctestglob", None
-    ):
-        return False
-    if _doctest_args(args):
-        return False
-    try:
-        if config.getini("less_cosmetic") is False:
             return False
     except Exception:  # pragma: no cover - ini not registered (embedders)
         pass
@@ -380,9 +329,6 @@ def pytest_load_initial_conftests(early_config, parser, args):
                     "--less-no-data-files" not in args
                     and _data_files_enabled(early_config)
                 )
-                cosmetic = "--less-no-cosmetic" not in args and _cosmetic_enabled(
-                    early_config, args
-                )
                 # Parse cache (shard blob, content-hash keyed): loaded now,
                 # before the tool is armed, so the git call is not observed
                 # and import-time parses already hit it.
@@ -393,14 +339,12 @@ def pytest_load_initial_conftests(early_config, parser, args):
                     )
                     parse_cache = ParseCache(
                         early_store.load_parse,
-                        cosmetic=cosmetic,
-                        local=early_store.local_parse_store(cosmetic),
+                        local=early_store.local_parse_store(),
                     )
                     parse_cache.preload()
                 monitor = FileMonitor(
                     root,
                     data_files=data_files,
-                    cosmetic=cosmetic,
                     parse_cache=parse_cache,
                 )
                 if monitor.activate():
@@ -496,19 +440,16 @@ class LessState:
                 # and --less from ini addopts): root conftest imports
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
-                cosmetic = _cosmetic_enabled(config)
                 parse_cache = None
                 if _parse_cache_enabled():
                     parse_cache = ParseCache(
-                    self.store.load_parse,
-                    cosmetic=cosmetic,
-                    local=self.store.local_parse_store(cosmetic),
-                )
+                        self.store.load_parse,
+                        local=self.store.local_parse_store(),
+                    )
                     parse_cache.preload()
                 self.monitor = FileMonitor(
                     self.root,
                     data_files=_data_files_enabled(config),
-                    cosmetic=cosmetic,
                     parse_cache=parse_cache,
                 )
                 self.monitor.activate()
@@ -952,52 +893,13 @@ class LessState:
         else:
             dynamic = (dynamic_now | ((old_dynamic or set()) - observed)) & set(tests)
 
-        # Docstring safety net (cosmetic filter): which files read docstrings
-        # as data (per file), and each block's docstring hash (per block,
-        # filled below next to the block table).  Unchanged files keep their
-        # previous info: re-deriving it would re-parse every dependency file,
-        # which a run that executed a few tests has not parsed.
         # The distinct blocks (a few thousand) already contain every file any
         # test depends on: derive the file sets from them instead of walking
-        # every test's every block (1.6M generator steps, twice, on a 2.5k-test
-        # suite).
+        # every test's every block (1.6M generator steps on a 2.5k-test suite).
         distinct: set[Block] = set(import_blocks)
         for deps in tests.values():
             distinct.update(deps)
         dep_files: set[str] = {b[0] for b in distinct}
-        doc_files = dep_files
-        old_readers = old_shard.doc_readers if old_shard is not None else set()
-        old_bdocs = old_shard.block_docs if old_shard is not None else {}
-        changed_now = self.changed
-        doc_readers: list[str] = []
-        for rel in sorted(doc_files):
-            if not rel.endswith(".py"):
-                continue
-            if (
-                old_shard is not None
-                and changed_now is not None
-                and rel not in changed_now
-            ):
-                if rel in old_readers:
-                    doc_readers.append(rel)
-                continue
-            fb = monitor.file_blocks(rel)
-            if fb is not None and fb.reads_docs:
-                doc_readers.append(rel)
-        # A block's recorded docstring only advances when every test sharing
-        # the block saw the new text: with selectors active not all of them
-        # ran, so the old value stays (the signal persists -- safe, merely
-        # over-selecting later).
-        freeze_docs = self.selectors_active or changed_now is None
-
-        def doc_for(block: Block) -> str:
-            rel, block_id, _ = block
-            if block_id == WILDCARD or not rel.endswith(".py"):
-                return ""
-            if block in old_bdocs and (freeze_docs or rel not in changed_now):
-                return old_bdocs[block]
-            fb = monitor.file_blocks(rel)
-            return fb.bdocs.get(block_id, "") if fb is not None else ""
 
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
@@ -1024,12 +926,8 @@ class LessState:
             # Tests that ran string-compiled / reflective code (None =
             # unknown) -> re-run when a .py file is stale or unrecorded.
             "dynamic": sorted(dynamic) if dynamic is not None else None,
-            # Cosmetic-filter safety net: files that read docstrings as data,
-            # and (parallel to ``blocks``) each block's docstring hash.
-            "doc_readers": doc_readers,
         }
         data["blocks"] = [list(b) for b in ordered]
-        data["bdocs"] = [doc_for(b) for b in ordered]
         meta = {
             "version": 1,
             "shard": self.store.shard,

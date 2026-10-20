@@ -1,37 +1,72 @@
 """Block hashes from compiled code (codeblocks.py).
 
-The point of the bytecode hasher is to give the same answers as the AST hasher
-about *what changed* at a fraction of the cost, so these tests pin the
-invariants it must keep (what an edit may and may not change) and compare it
-with the AST hasher on real code.
+Blocks are hashed from ``compile(source)``, so these tests pin the invariants
+that make that useful (what an edit may and may not change), how a running code
+object finds its block, and what happens to files the hasher does not model.
 """
 
-# ruff: noqa: F811  (shared fixtures are imported, then requested by name)
-import ast
 import os
 import subprocess
 import sys
 import types
-from pathlib import Path
 
 import pytest
-from test_cosmetic import doc_project, write_lib  # noqa: F401
-from test_plugin import run_less
+from test_plugin import commit, git, run_less
 
 from pytest_less import codeblocks
-from pytest_less.blocks import (
-    MODULE_BLOCK,
-    BlockCache,
-    LocalParseStore,
-    ParseCache,
-    hash_mode,
-    parse_blocks,
-)
+from pytest_less.blocks import MODULE_BLOCK, BlockCache, FileBlocks, ParseCache
 from pytest_less.codeblocks import TAG, Unsupported, compile_blocks
 
 pytestmark = pytest.mark.skipif(
     not codeblocks.SUPPORTED, reason="bytecode hashing needs Python 3.12 / 3.13"
 )
+
+
+@pytest.fixture
+def doc_project(pytester):
+    """A repo with two tests importing two functions from ``lib.py``."""
+    tests = pytester.path / "tests"
+    tests.mkdir()
+    (tests / "conftest.py").touch()
+    (tests / "lib.py").write_text(
+        "def documented():\n"
+        '    """Old prose."""\n'
+        "    return 1\n"
+        "\n"
+        "def plain():\n"
+        "    return 2\n"
+    )
+    (tests / "test_doc.py").write_text(
+        "def test_doc():\n"
+        "    import lib\n"
+        "    assert lib.documented() == 1\n"
+    )
+    (tests / "test_plain.py").write_text(
+        "def test_plain():\n"
+        "    import lib\n"
+        "    assert lib.plain() == 2\n"
+    )
+    (pytester.path / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+    git(pytester.path, "init", "-q")
+    git(pytester.path, "config", "user.email", "test@example.com")
+    git(pytester.path, "config", "user.name", "Test")
+    commit(pytester.path, "initial")
+    return pytester
+
+
+def write_lib(project, documented_body='    """Old prose."""\n    return 1'):
+    (project.path / "tests" / "lib.py").write_text(
+        "def documented():\n"
+        f"{documented_body}\n"
+        "\n"
+        "def plain():\n"
+        "    return 2\n"
+    )
+
+
+DOCSTRING_EDIT = '    """New and improved prose."""\n    return 1'
+COMMENT_EDIT = '    """Old prose."""\n    return 1  # a comment, invisible to the compiler'
+BODY_EDIT = '    """Old prose."""\n    return 1 + int(0)'
 
 
 def blocks(source: str) -> dict[str, str]:
@@ -204,7 +239,7 @@ class TestSensitivity:
         assert changed(KLASS, after) == {"outer", "outer.<locals>.inner"}
 
     def test_a_docstring_is_behavior_here(self):
-        # The AST hasher's cosmetic filter is not available: a docstring edit
+        # Docstrings are not ignored (there is no cosmetic filter): a docstring edit
         # selects.  (The safe direction: nothing is ever skipped because of it.)
         base = 'def f():\n    """Old."""\n    return None\n'
         assert changed(base, base.replace("Old", "New")) == {"f"}
@@ -245,7 +280,7 @@ class TestResolve:
         assert found["C.m.<locals>.<genexpr>"] == "C.m"
 
     def test_a_class_declared_global_is_found_under_its_real_qualname(self):
-        # The AST path builds ``g.<locals>.K``, which no code object carries.
+        # The qualname is ``K``, not ``g.<locals>.K``: the real ``co_qualname``.
         src = "def g():\n    global K\n    class K:\n        pass\n    return K\n"
         fb = compile_blocks(src.encode())
         assert "K" in fb.blocks and fb.resolve("K", 3)[0] == "K"
@@ -282,146 +317,98 @@ class TestMarkersAreLazy:
 
     def test_without_source_the_answer_is_dynamic_never_empty(self):
         fb = compile_blocks(self.SRC)
-        restored = type(fb).restore(fb.blocks, fb.spans, None)
+        restored = FileBlocks(fb.blocks, fb.spans, None)  # no bytes handed over
         assert restored.markers  # nothing to scan: widen, do not switch off
 
 
-class TestFallback:
-    def test_type_statements_use_the_ast_path(self):
+class TestUnsupportedFiles:
+    """What the hasher does not model becomes a file-level dependency."""
+
+    def test_type_statements_are_not_modelled(self):
         with pytest.raises(Unsupported):
             compile_blocks(b"type Alias = int\n")
 
-    def test_generics_use_the_ast_path(self):
+    def test_generics_are_not_modelled(self):
         with pytest.raises(Unsupported):
             compile_blocks(b"def f[T](x: T) -> T:\n    return x\n")
 
     def test_a_syntax_error_is_none(self):
         assert compile_blocks(b"def broken(:\n") is None
 
-    def test_block_cache_falls_back_per_file(self, tmp_path, bytecode_hashing):
+    def test_block_cache_gives_such_files_a_wildcard_dependency(self, tmp_path):
         (tmp_path / "a.py").write_text("def f():\n    return 1\n")
         (tmp_path / "b.py").write_text("type A = int\n")
         cache = BlockCache(tmp_path)
-        assert cache.file_blocks("a.py").kind == "c"
-        assert cache.file_blocks("b.py").kind == "a"  # unsupported: AST
-        assert cache.file_blocks("b.py").blocks[MODULE_BLOCK]
-        assert not cache.file_blocks("b.py").blocks[MODULE_BLOCK].startswith(TAG)
+        assert cache.file_blocks("a.py").blocks[MODULE_BLOCK].startswith(TAG)
+        assert cache.file_blocks("b.py") is None
+        assert cache.module_dep("b.py") == ("b.py", "*", "*")  # any change re-runs
 
-
-class TestAlgorithmKeys:
-    """An entry is only ever served to the algorithm that produced it."""
-
-    def test_mode_switch(self, monkeypatch):
-        monkeypatch.setenv("PYTEST_LESS_HASH", "ast")
-        assert hash_mode() == "ast"
-        monkeypatch.setenv("PYTEST_LESS_HASH", "bytecode")
-        assert hash_mode() == "bytecode"
-
-    def test_the_repository_store_is_per_algorithm(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("PYTEST_LESS_HASH", "ast")
-        a = LocalParseStore.at(tmp_path, cosmetic=True).directory
-        monkeypatch.setenv("PYTEST_LESS_HASH", "bytecode")
-        b = LocalParseStore.at(tmp_path, cosmetic=True).directory
-        assert a != b
-
-    def test_a_shard_cache_from_the_other_algorithm_is_ignored(
+    def test_an_unsupported_interpreter_is_file_level_throughout(
         self, tmp_path, monkeypatch
     ):
-        (tmp_path / "m.py").write_text("def f():\n    return 1\n")
-        monkeypatch.setenv("PYTEST_LESS_HASH", "ast")
-        ast_cache = ParseCache(None, cosmetic=False)
-        BlockCache(tmp_path, parse_cache=ast_cache).file_blocks("m.py")
-        stored = ast_cache.dump({"m.py"})
-        monkeypatch.setenv("PYTEST_LESS_HASH", "bytecode")
-        cache = ParseCache(lambda: stored, cosmetic=False)
-        bc = BlockCache(tmp_path, parse_cache=cache)
-        assert bc.file_blocks("m.py").kind == "c"
-        assert (bc.hits, bc.misses) == (0, 1)
+        monkeypatch.setattr(codeblocks, "SUPPORTED", False)
+        (tmp_path / "a.py").write_text("def f():\n    return 1\n")
+        with pytest.raises(Unsupported):
+            compile_blocks(b"x = 1\n")
+        assert BlockCache(tmp_path).file_blocks("a.py") is None
 
-    def test_round_trip_does_not_force_the_marker_scan(self, tmp_path, bytecode_hashing):
+    def test_an_edit_to_such_a_file_selects_what_executed_it(self, pytester):
+        tests = pytester.path / "tests"
+        tests.mkdir()
+        (tests / "conftest.py").touch()
+        (tests / "lib.py").write_text("type A = int\n\ndef f():\n    return 1\n")
+        (tests / "other.py").write_text("def g():\n    return 2\n")
+        for name, mod, call in (("a", "lib", "f"), ("b", "other", "g")):
+            (tests / f"test_{name}.py").write_text(
+                f"def test_{name}():\n    import {mod}\n    assert {mod}.{call}()\n"
+            )
+        (pytester.path / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+        git(pytester.path, "init", "-q")
+        git(pytester.path, "config", "user.email", "t@example.com")
+        git(pytester.path, "config", "user.name", "T")
+        commit(pytester.path, "initial")
+        run_less(pytester, "-q").assert_outcomes(passed=2)
+        (tests / "lib.py").write_text("type A = int\n\ndef f():\n    return 1  # c\n")
+        result = run_less(pytester, "-q")  # file level: even a comment re-runs it
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
+
+
+class TestCache:
+    def test_round_trip_does_not_force_the_marker_scan(self, tmp_path):
         (tmp_path / "m.py").write_text("def f(o, n):\n    return getattr(o, n)\n")
-        cache = ParseCache(None, cosmetic=False)
-        bc = BlockCache(tmp_path, parse_cache=cache)
-        fb = bc.file_blocks("m.py")
+        cache = ParseCache(None)
+        fb = BlockCache(tmp_path, parse_cache=cache).file_blocks("m.py")
         assert fb.known_markers() is None
         stored = cache.dump({"m.py"})
         assert stored["files"]["m.py"]["m"] is None
         again = BlockCache(
-            tmp_path, parse_cache=ParseCache(lambda: stored, cosmetic=False)
+            tmp_path, parse_cache=ParseCache(lambda: stored)
         ).file_blocks("m.py")
-        assert again.kind == "c" and again.blocks == fb.blocks
+        assert again.blocks == fb.blocks and again.spans == fb.spans
         assert again.markers  # lazy, from the bytes handed over on the hit
 
-
-class TestAgreesWithTheAstHasher:
-    """The same questions, asked of this repository's own source."""
-
-    ROOT = Path(__file__).resolve().parent.parent
-    FILES = sorted((ROOT / "src").rglob("*.py")) + sorted((ROOT / "tests").rglob("*.py"))
-
-    def test_same_blocks_and_same_resolution_on_every_file(self):
-        compared = 0
-        for path in self.FILES:
-            data = path.read_bytes()
-            try:
-                c = compile_blocks(data, filename=str(path))
-            except Unsupported:
-                continue
-            a = parse_blocks(data.decode(), cosmetic=False)
-            assert c is not None and a is not None, path
-            assert {k.split("~")[0] for k in c.blocks} == {
-                k.split("~")[0] for k in a.blocks
-            }, path
-            top = compile(data, str(path), "exec")
-            stack = [top]
-            while stack:
-                code = stack.pop()
-                stack += [k for k in code.co_consts if isinstance(k, types.CodeType)]
-                if code is top or code.co_name.startswith("<"):
-                    continue
-                ra = a.resolve(code.co_qualname, code.co_firstlineno)
-                rc = c.resolve(code.co_qualname, code.co_firstlineno)
-                assert ra[0].split("~")[0] == rc[0].split("~")[0], (path, code.co_qualname)
-                compared += 1
-        assert compared > 500
-
-    def test_a_real_edit_is_seen_by_both(self):
-        """Wrap the value of the first ``return`` in a call (never folded)."""
-        seen = 0
-        for path in self.FILES[:60]:
-            tree = ast.parse(path.read_text())
-            node = next(
-                (n for n in ast.walk(tree) if isinstance(n, ast.Return) and n.value),
-                None,
-            )
-            if node is None:
-                continue
-            base = ast.unparse(tree)
-            node.value = ast.Call(ast.Name("wrapped_x", ast.Load()), [node.value], [])
-            edited = ast.unparse(tree)
-            try:
-                c_changed = blocks(base) != blocks(edited)
-            except Unsupported:
-                continue
-            a_changed = parse_blocks(base).blocks != parse_blocks(edited).blocks
-            assert a_changed and c_changed, path
-            seen += 1
-        assert seen > 20
+    def test_a_cached_table_resolves_like_a_fresh_one(self, tmp_path):
+        (tmp_path / "m.py").write_text(KLASS)
+        cache = ParseCache(None)
+        fresh = BlockCache(tmp_path, parse_cache=cache).file_blocks("m.py")
+        hit = BlockCache(
+            tmp_path, parse_cache=ParseCache(lambda: cache.dump({"m.py"}))
+        ).file_blocks("m.py")
+        for name, line in (("Widget.method", 15), ("outer.<locals>.inner", 27),
+                           ("never_defined", 1), ("Widget.<lambda>", 12)):
+            assert hit.resolve(name, line) == fresh.resolve(name, line)
 
 
 class TestEndToEnd:
-    def test_default_mode_is_bytecode(self, monkeypatch):
-        monkeypatch.delenv("PYTEST_LESS_HASH", raising=False)
-        assert hash_mode() == "bytecode"
-
-    def test_a_docstring_edit_selects_the_executor(self, doc_project, bytecode_hashing):
+    def test_a_docstring_edit_selects_the_executor(self, doc_project):
         run_less(doc_project, "-q").assert_outcomes(passed=2)
         write_lib(doc_project, '    """New prose."""\n    return 1')
         result = run_less(doc_project, "-q")
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
 
-    def test_a_comment_or_folded_edit_selects_nothing(self, doc_project, bytecode_hashing):
+    def test_a_comment_or_folded_edit_selects_nothing(self, doc_project):
         run_less(doc_project, "-q").assert_outcomes(passed=2)
         for body in (
             '    """Old prose."""\n    # now with a comment\n    return 1',
@@ -432,7 +419,7 @@ class TestEndToEnd:
             assert result.ret == 5
             result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
 
-    def test_a_real_edit_selects_the_executor(self, doc_project, bytecode_hashing):
+    def test_a_real_edit_selects_the_executor(self, doc_project):
         run_less(doc_project, "-q").assert_outcomes(passed=2)
         write_lib(doc_project, '    """Old prose."""\n    return 1 + int(0)')
         result = run_less(doc_project, "-q")

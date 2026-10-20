@@ -30,9 +30,7 @@ Options:
 | `--less-force` | run all tests, but still record dependencies |
 | `--less-clean` | discard the stored data for this command before running |
 | `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
-| `--less-no-cosmetic` | AST hashing only (`PYTEST_LESS_HASH=ast`): hash docstrings as behavior; ini: `less_cosmetic = false`; automatically off under `--doctest-modules`. The default bytecode hashing always treats docstrings as behavior |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
-| `PYTEST_LESS_HASH=ast` | hash blocks from the AST instead of compiled bytecode (the cosmetic docstring filter lives there; ~1.7 s slower to analyze the 220 files of a cold sqlalchemy record) |
 | `PYTEST_LESS_PARSE_CACHE=0` | disable the `parse.json` read/write (cold-run measurements, debugging a suspected cache bug); the stored blob is carried over untouched |
 | `-p no:less` | disable the plugin entirely |
 
@@ -142,13 +140,13 @@ signal (`getattr`/`setattr` with computed names, `__getattr__`).
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
 
-#### Block hashes: compiled bytecode (default) or the AST
+#### Block hashes: compiled bytecode
 
 A block is hashed from **`compile(source)`** — a C call — not from a Python AST.
-The 220 files (8.8 MB) a sqlalchemy record run touches take 2.4 s through
-`ast.parse` + `ast.dump` and **0.7 s** through `compile` + a digest of each code
-object (0.53 s of that is the compiler itself); a cold record of the 2,480-test
-subset drops from +5.8 s to +4.0 s over plain pytest. The code hashed is always
+The 220 files (8.8 MB) a sqlalchemy record run touches take **0.7 s** through
+`compile` + a digest of each code object (0.53 s of that is the compiler
+itself); the AST this replaced took 2.4 s, and a cold record of the 2,480-test
+subset is +4.0 s over plain pytest instead of +5.8 s. The code hashed is always
 the file *on disk*, never the running code object: pytest rewrites asserts in
 test modules and other import hooks transform code, so live bytecode cannot be
 reproduced from source at selection time, but `compile(source)` can.
@@ -173,31 +171,34 @@ What the hash does and does not see, each point pinned by `tests/test_codeblocks
   function's own.
 - **Docstrings are behavior.** Editing one selects the tests that executed that
   block; a class or module docstring changes the skeleton, so it selects everything
-  that imported the module. The AST path's cosmetic filter traded a per-block
-  docstring hash and a "reads `__doc__`" net for ignoring prose; on a codebase
-  that reads docstrings itself it bought nothing — on sqlalchemy a method
-  docstring edit selected 1,185/2,480 tests and a class or module docstring
-  edit 2,480/2,480 *in both modes* — and the bytecode path never skips a test
-  because of a docstring. A codebase that never reads docstrings pays for this;
-  `PYTEST_LESS_HASH=ast` restores the filter.
+  that imported the module. Ignoring prose needs a per-block docstring hash and a
+  "reads `__doc__`" safety net to stay sound, and on a codebase that reads
+  docstrings itself it buys nothing: on sqlalchemy a method docstring edit
+  selected 1,185/2,480 tests and a class or module docstring edit 2,480/2,480
+  *with* the filter. The cost falls on codebases that never read docstrings.
 - **Lookup is exact**: a running code object is matched by
   `(co_qualname, co_firstlineno)`; lambdas and comprehensions belong to their
   *lexical parent*, not to whichever block's source span contains the line, and
   a class declared `global` inside a function is found under its real qualname.
-  Of 15,450 sqlalchemy code objects, 101 resolved differently from the AST path
-  and all 101 were cases where it had guessed.
+  Of 15,450 sqlalchemy code objects, 101 resolved differently from the AST
+  approach this replaced, and all 101 were cases where it had guessed.
 - **Hashes are tagged `c<minor>`** (`c13…`): bytecode differs between Python
   versions, so a shard recorded on 3.12 never matches 3.13 — it reads as
-  "changed", never as "unchanged" (neither algorithm is portable: 0 of 14,000
-  sqlalchemy block hashes match between 3.12 and 3.13 for the AST either, since
-  `ast.dump` itself changed). Files using PEP 695 generics / `type` statements,
-  and interpreters other than 3.12 / 3.13, fall back to the AST per file.
+  "changed", never as "unchanged" (an AST hash would not have been portable
+  either: 0 of 14,000 sqlalchemy block hashes match between 3.12 and 3.13, since
+  `ast.dump` itself changed).
+- **What the hasher does not model is a file-level dependency**: files using
+  PEP 695 generics or `type` statements, unparseable files, and every file on an
+  interpreter other than 3.12 / 3.13. Any change to such a file re-runs the tests
+  that executed it (the `*` wildcard block); nothing is ever skipped because the
+  hasher was unsure.
 - **Marker detection is lazy**: the dynamic-construct scan needs an AST, but
   selection only asks about files that *changed*, so recording never builds one.
   If the scan cannot run it reports "dynamic" (widen), never "none".
 
-Validation (not just unit tests): on 1,498 real sqlalchemy file edits (179,000
-blocks) the two hashers agree on 99.5% of blocks. Where the AST says "changed"
+Validation (not just unit tests, and done against the AST hasher this replaced):
+on 1,498 real sqlalchemy file edits (179,000
+blocks) the two hashers agreed on 99.5% of blocks. Where the AST says "changed"
 and bytecode says "same" (853 blocks), 842 are explained by a changed ancestor
 (the parent rule) and the other 11 by edits that cannot change behavior; where
 bytecode says "changed" and the AST says "same" (8 blocks), the cause is
@@ -275,7 +276,7 @@ refs/less/<shard>   →  lightweight commit
                             ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "doc_readers":[...], "bdocs":[hash per block-table entry]}
                             ├── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
                             ├── files.json  {"v":1, "at":ns, "files":{file:[size, mtime_ns, hash]}, "dirs":{dir:[subdirs]}}
-                            └── parse.json  {"v":2, "py":"3.13", "algo":"bytecode", "cosmetic":true, "files":{file:{"h":content-hash, "b":{block:[hash,docs-hash]}, "s":spans, "m":markers, "r":reads-docs}}}
+                            └── parse.json  {"v":3, "py":"3.13", "files":{file:{"h":content-hash, "b":{block:[hash,docs-hash]}, "s":spans, "m":markers, "r":reads-docs}}}
 ```
 
 - The shard key is a hash of the **normalized** invocation arguments
@@ -303,7 +304,7 @@ refs/less/<shard>   →  lightweight commit
   Every entry is verified against the current bytes on every use, so a stale
   entry is just a miss — whatever the working tree looked like when it was
   written (dirty, reverted, another branch). The blob is only valid for the
-  same Python minor version, cosmetic setting and analysis version
+  same Python minor version and analysis version
   (`PARSE_CACHE_VERSION`, bumped whenever hashing changes), is loaded before
   the monitor is armed (never on the no-change fast path) so import-time
   parses already hit it, can be disabled with `PYTEST_LESS_PARSE_CACHE=0`,
@@ -411,7 +412,7 @@ refs/less/<shard>   →  lightweight commit
   unchanged files again. `<git-dir>/pytest-less/parse-*` holds one tiny file per
   **content hash** (so two paths with identical bytes share an entry, a lookup
   is one small read, and nothing is rewritten), keyed per Python minor version
-  and cosmetic setting, written atomically, and bounded to 8,000 entries
+  written atomically, and bounded to 8,000 entries
   (oldest evicted). Like every cache here it is only trusted for the exact
   bytes it was built from. On the sqlalchemy subset: record 15.4 s → 12.8 s
   with the shard gone but the repository warm (220 files, 0 parsed).
@@ -555,31 +556,15 @@ from the shard's recorded fingerprints, plus new project `.py` files (see
   the file is widened to file level and every test that touched it re-runs
   (reported as `N widened by dynamic markers`) — reflective edges are the
   one place a recording can disagree with the next run, so this widens on
-  purpose. The staleness gate keeps cosmetic edits from widening, and
+  purpose. The staleness gate keeps edits that change no block (comments, formatting) from widening, and
 - the test is a **spawner** (`always`) and the state is not pristine: it runs
   (`N always re-run`); under `spawn_unknown`, every test runs when a changed `.py` file is stale
   or was never recorded (`N selected by the subprocess rule`),
 - the test is **runtime-dynamic** and some changed `.py` file was never
-  recorded (`N selected as runtime-dynamic`), or
-- the test ran a **docstring reader** and executed a block whose docstring
-  changed (`N selected by docstring readers`, see cosmetic edits below).
+  recorded (`N selected as runtime-dynamic`).
 
 Every widening is printed in the run summary — selection never widens
-silently. **Cosmetic edits** (AST hashing only, `PYTEST_LESS_HASH=ast`; the default
-bytecode hashing treats docstrings as behavior, see above): block hashes are computed from a
-docstring-stripped AST, so a comment or docstring-only change produces no
-stale block and selects nothing (comments and formatting are invisible to the
-AST regardless; annotations are kept — typing changes are observable).
-Docstrings are only *prose* for code that never reads them, so each shard also
-records, per block, the hash of the docstrings that block covers (`bdocs`) and
-the files that load docstrings as data (`__doc__`, `getdoc`, `cleandoc`,
-`doctest`, `pydoc`, `help`): a docstring-only edit still re-runs the tests that
-**executed that block and** ran a docstring reader. This restores exactly the
-behavior of an unfiltered run for those tests, so the net can never select more
-than having no cosmetic filter at all. (Assigning `fn.__doc__ = ...` is not
-reading.) The filter turns itself off under `--doctest-modules` /
-`--doctest-glob` (docstrings are test input); `--less-no-cosmetic` /
-`less_cosmetic = false` opts out manually.
+silently.
 
 - A qualified name defined more than once with different content
   (`@overload` stubs, property getter/setter pairs, conditional definitions)
@@ -604,12 +589,6 @@ reading.) The filter turns itself off under `--doctest-modules` /
 - The dynamic-marker widening only considers changed files with a *stale
   recorded block*; it cannot widen edits for which no recording exists at
   all (nothing stale → nothing widened — the causal-closure argument).
-- The cosmetic filter's docstring-reader net is static: a library that reads
-  docstrings on your behalf (e.g. a CLI framework building help text from
-  `__doc__`) is invisible to it — opt out with `--less-no-cosmetic` if your
-  tests depend on that. In a codebase whose own import machinery reads
-  docstrings (sqlalchemy's `decorator` helpers), every test is a "docstring
-  reader" and the filter degrades to unfiltered behavior — safe, just no gain.
 - Reflection with no runtime signal (`getattr`/`setattr` with a computed
   name, `__getattr__`) is only covered by the static markers: a stale block in
   a marker-bearing file widens to the whole file.

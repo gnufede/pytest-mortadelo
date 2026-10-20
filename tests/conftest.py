@@ -32,14 +32,3 @@ def _inner_runs_do_not_inherit_the_outer_plugin_env(monkeypatch):
     for name in _PLUGIN_ENV:
         monkeypatch.delenv(name, raising=False)
 
-
-@pytest.fixture
-def ast_hashing(monkeypatch):
-    """Hash blocks from the AST (the cosmetic docstring filter lives there)."""
-    monkeypatch.setenv("PYTEST_LESS_HASH", "ast")
-
-
-@pytest.fixture
-def bytecode_hashing(monkeypatch):
-    """Hash blocks from compiled code objects (the default where supported)."""
-    monkeypatch.setenv("PYTEST_LESS_HASH", "bytecode")

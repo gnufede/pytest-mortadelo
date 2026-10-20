@@ -1,14 +1,13 @@
-"""Unit tests for AST block analysis (blocks.py)."""
+"""Unit tests for block analysis (blocks.py, codeblocks.py)."""
 
 import textwrap
 
-import pytest
+from blocktable import table_of
 
 from pytest_less.blocks import (
     MODULE_BLOCK,
     WILDCARD,
     BlockCache,
-    parse_blocks,
 )
 
 SRC = textwrap.dedent(
@@ -38,7 +37,7 @@ SRC = textwrap.dedent(
 
 
 def blocks_of(src: str):
-    fb = parse_blocks(src)
+    fb = table_of(src)
     assert fb is not None
     return fb
 
@@ -154,10 +153,10 @@ class TestStructure:
         src = "if COND:\n    def f():\n        return 1\n"
         fb = blocks_of(src)
         assert "f" in fb.blocks
-        assert fb.blocks[MODULE_BLOCK] != parse_blocks("x = 1\n").blocks[MODULE_BLOCK]
+        assert fb.blocks[MODULE_BLOCK] != table_of("x = 1\n").blocks[MODULE_BLOCK]
 
     def test_syntax_error_is_none(self):
-        assert parse_blocks("def f(:\n    pass\n") is None
+        assert table_of("def f(:\n    pass\n") is None
 
 
 class TestHashing:
@@ -245,111 +244,3 @@ class TestBlockCache:
         assert cache.module_dep("missing.py") == ("missing.py", WILDCARD, WILDCARD)
         # one parse per file (cache)
         assert cache.file_blocks("good.py") is cache.file_blocks("good.py")
-
-
-# ---------------------------------------------------------------------------
-# The skeleton hash used to be computed on a deepcopy with function bodies
-# stubbed.  It is now computed in place (swap bodies, dump, restore) -- 5x
-# cheaper on big files.  Hashes MUST stay byte-identical, otherwise every
-# stored shard would go stale at once.
-
-
-def _legacy_skeleton_hashes(source: str, cosmetic: bool) -> dict[str, str]:
-    import ast
-    import copy
-
-    from pytest_less.blocks import _hash, _strip_docstrings
-
-    tree = ast.parse(source)
-    if cosmetic:
-        _strip_docstrings(tree)
-
-    def stub(t):
-        for n in ast.walk(t):
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                n.body = [ast.Pass()]
-        return t
-
-    out: dict[str, str] = {}
-
-    def visit(node, prefix, in_function):
-        for child in ast.iter_child_nodes(node):
-            if not isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
-                visit(child, prefix, in_function)
-                continue
-            qname = (
-                prefix + "." + ("<locals>." if in_function else "") + child.name
-                if prefix
-                else child.name
-            )
-            if isinstance(child, ast.ClassDef):
-                h = _hash(ast.dump(stub(copy.deepcopy(child)), include_attributes=False))
-                out.setdefault(qname, h)
-            visit(child, qname, not isinstance(child, ast.ClassDef))
-
-    visit(tree, "", False)
-    out["<module>"] = _hash(ast.dump(stub(tree), include_attributes=False))
-    return out
-
-
-def _corpus() -> list[str]:
-    import ast
-    import dataclasses
-    import inspect
-    import pathlib
-    import typing
-
-    import pytest_less
-
-    files = [ast.__file__, dataclasses.__file__, inspect.__file__, typing.__file__]
-    root = pathlib.Path(pytest_less.__file__).parent
-    files += [str(p) for p in root.glob("*.py")]
-    files += [str(p) for p in pathlib.Path(__file__).parent.glob("test_*.py")]
-    return files
-
-
-@pytest.mark.parametrize("cosmetic", [False, True])
-def test_skeleton_hashes_are_unchanged_by_the_in_place_algorithm(cosmetic):
-    import pathlib
-
-    from pytest_less.blocks import WILDCARD, parse_blocks
-
-    checked = 0
-    for path in _corpus():
-        source = pathlib.Path(path).read_text(encoding="utf-8")
-        legacy = _legacy_skeleton_hashes(source, cosmetic)
-        fb = parse_blocks(source, cosmetic=cosmetic)
-        assert fb is not None, path
-        for qname, expected in legacy.items():
-            got = fb.blocks.get(qname)
-            if got is None or got == WILDCARD:  # ambiguous duplicate: its id carries a hash
-                continue
-            assert got == expected, (path, qname)
-            checked += 1
-    assert checked > 100  # the corpus really exercised classes
-
-
-def test_hashing_does_not_mutate_the_tree_it_walks():
-    # In-place body swapping must restore everything: a second parse of the
-    # same source (and a function hash computed after a class hash) agree.
-    from pytest_less.blocks import parse_blocks
-
-    src = (
-        "class A:\n"
-        "    def m(self):\n"
-        "        def inner():\n"
-        "            return 1\n"
-        "        return inner\n"
-        "    class B:\n"
-        "        def n(self):\n"
-        "            return 2\n"
-        "def f():\n"
-        "    return A\n"
-    )
-    assert parse_blocks(src).blocks == parse_blocks(src).blocks
-    fb = parse_blocks(src)
-    assert {"A", "A.m", "A.m.<locals>.inner", "A.B", "A.B.n", "f", "<module>"} <= set(
-        fb.blocks
-    )

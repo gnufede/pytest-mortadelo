@@ -32,30 +32,23 @@ SRC = (
 )
 
 
-@pytest.fixture(autouse=True, params=["bytecode", "ast"])
-def hash_algo(request, monkeypatch):
-    """Every test here runs under both block-hashing algorithms."""
-    monkeypatch.setenv("PYTEST_LESS_HASH", request.param)
-    return request.param
-
-
-def fresh(source, *, cosmetic=True):
-    """The table the active algorithm computes for *source*, with no cache:
-    what a cached table must equal."""
+def fresh(source):
+    """The table computed for *source* with no cache: what a cached table
+    must equal."""
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "o.py"
         path.write_bytes(source if isinstance(source, bytes) else source.encode())
-        return BlockCache(Path(d), cosmetic=cosmetic).file_blocks("o.py")
+        return BlockCache(Path(d)).file_blocks("o.py")
 
 
 def fields(fb):
-    return (fb.blocks, fb.spans, fb.markers, fb.bdocs, fb.reads_docs)
+    return (fb.blocks, fb.spans, fb.markers)
 
 
-def make(tmp_path, source=SRC, *, cosmetic=True, stored=None):
+def make(tmp_path, source=SRC, *, stored=None):
     (tmp_path / "m.py").write_text(source)
-    cache = ParseCache((lambda: stored) if stored is not None else None, cosmetic=cosmetic)
-    return BlockCache(tmp_path, cosmetic=cosmetic, parse_cache=cache), cache
+    cache = ParseCache((lambda: stored) if stored is not None else None)
+    return BlockCache(tmp_path, parse_cache=cache), cache
 
 
 class TestRoundTrip:
@@ -69,7 +62,7 @@ class TestRoundTrip:
         again = second.file_blocks("m.py")
         assert (second.hits, second.misses) == (1, 0)
         assert fields(again) == fields(fb)
-        assert again.reads_docs is False and again.markers  # getattr(self, name)
+        assert again.markers  # getattr(self, name)
 
     def test_cached_table_equals_a_fresh_parse(self, tmp_path):
         first, cache = make(tmp_path)
@@ -98,8 +91,8 @@ class TestRoundTrip:
     def test_crlf_source_matches_read_text_semantics(self, tmp_path):
         crlf = 'X = """a\r\nb"""\r\ndef f():\r\n    return X\r\n'
         (tmp_path / "w.py").write_bytes(crlf.encode())
-        cache = ParseCache(None, cosmetic=True)
-        bc = BlockCache(tmp_path, cosmetic=True, parse_cache=cache)
+        cache = ParseCache(None)
+        bc = BlockCache(tmp_path, parse_cache=cache)
         got = bc.file_blocks("w.py")
         # the same file with universal newlines applied up front
         expected = fresh(crlf.replace("\r\n", "\n"))
@@ -107,14 +100,10 @@ class TestRoundTrip:
 
 
 class TestValidity:
-    def test_other_python_version_or_cosmetic_flag_is_ignored(self, tmp_path):
-        first, cache = make(tmp_path, cosmetic=True)
+    def test_other_python_version_is_ignored(self, tmp_path):
+        first, cache = make(tmp_path)
         first.file_blocks("m.py")
         stored = cache.dump({"m.py"})
-
-        other_mode, _ = make(tmp_path, cosmetic=False, stored=stored)
-        other_mode.file_blocks("m.py")
-        assert other_mode.hits == 0  # cosmetic flag differs
 
         stored_py = {**stored, "py": "2.7"}
         other_py, _ = make(tmp_path, stored=stored_py)
@@ -215,7 +204,6 @@ class TestEndToEnd:
             "tests/test_a.py",
             "tests/test_b.py",
         }
-        assert parse["cosmetic"] is True
 
     def test_incremental_run_reparses_only_what_changed(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
@@ -358,17 +346,21 @@ class TestLocalStore:
         assert store.evict(limit=5) == 6  # down to 90% of the limit: 4 left
         assert store.get(digests[0]) is None and store.get(digests[-1]) == {"n": 9}
 
-    def test_python_version_and_mode_get_separate_directories(self, tmp_path):
+    def test_each_python_version_gets_its_own_directory(self, tmp_path, monkeypatch):
+        import sys
+
         from pytest_less.blocks import LocalParseStore
 
-        a = LocalParseStore.at(tmp_path, cosmetic=True).directory
-        b = LocalParseStore.at(tmp_path, cosmetic=False).directory
-        assert a != b and "pytest-less" in a.parts
+        here = LocalParseStore.at(tmp_path).directory
+        assert "pytest-less" in here.parts
+        assert f"py{sys.version_info[0]}.{sys.version_info[1]}" in here.name
+        monkeypatch.setattr(sys, "version_info", (2, 7, 18, "final", 0))
+        assert LocalParseStore.at(tmp_path).directory != here
 
 
 class TestSharedAcrossShards:
-    def cache(self, store, stored=None, cosmetic=True):
-        return ParseCache((lambda: stored) if stored else None, cosmetic=cosmetic, local=store)
+    def cache(self, store, stored=None):
+        return ParseCache((lambda: stored) if stored else None, local=store)
 
     def test_a_second_shard_reuses_what_the_first_parsed(self, tmp_path):
         from pytest_less.blocks import LocalParseStore
@@ -377,14 +369,14 @@ class TestSharedAcrossShards:
         (tmp_path / "w").mkdir()
         (tmp_path / "w" / "m.py").write_text(SRC)
         first = self.cache(store)
-        a = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=first)
+        a = BlockCache(tmp_path / "w", parse_cache=first)
         fb = a.file_blocks("m.py")
         assert (a.hits, a.misses) == (0, 1)
         assert first.flush_local() == 1
 
         # a different shard: its own (empty) parse.json -- yet no parse needed
         second = self.cache(store)
-        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=second)
+        b = BlockCache(tmp_path / "w", parse_cache=second)
         again = b.file_blocks("m.py")
         assert (b.hits, b.misses, second.local_hits) == (1, 0, 1)
         assert fields(again) == fields(fb)
@@ -400,10 +392,10 @@ class TestSharedAcrossShards:
             (tmp_path / name).mkdir()
             (tmp_path / name / "m.py").write_text(SRC)
         first = self.cache(store)
-        BlockCache(tmp_path / "one", cosmetic=True, parse_cache=first).file_blocks("m.py")
+        BlockCache(tmp_path / "one", parse_cache=first).file_blocks("m.py")
         first.flush_local()
         second = self.cache(store)
-        other = BlockCache(tmp_path / "two", cosmetic=True, parse_cache=second)
+        other = BlockCache(tmp_path / "two", parse_cache=second)
         other.file_blocks("m.py")
         assert other.misses == 0
 
@@ -414,11 +406,11 @@ class TestSharedAcrossShards:
         (tmp_path / "w").mkdir()
         (tmp_path / "w" / "m.py").write_text(SRC)
         first = self.cache(store)
-        BlockCache(tmp_path / "w", cosmetic=True, parse_cache=first).file_blocks("m.py")
+        BlockCache(tmp_path / "w", parse_cache=first).file_blocks("m.py")
         first.flush_local()
         (tmp_path / "w" / "m.py").write_text(SRC.replace("return 1", "return 2"))
         second = self.cache(store)
-        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=second)
+        b = BlockCache(tmp_path / "w", parse_cache=second)
         fb = b.file_blocks("m.py")
         assert (b.hits, b.misses) == (0, 1)
         assert fb.blocks["f"] == fresh(SRC.replace("return 1", "return 2")).blocks["f"]
@@ -431,7 +423,7 @@ class TestSharedAcrossShards:
         (tmp_path / "w" / "m.py").write_text(SRC)
         digest = _content_hash(SRC.encode())
         store.put(digest, {"b": "garbage"})
-        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=self.cache(store))
+        b = BlockCache(tmp_path / "w", parse_cache=self.cache(store))
         assert b.file_blocks("m.py") is not None and b.hits == 0
 
 
