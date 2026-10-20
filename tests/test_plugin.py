@@ -721,7 +721,7 @@ class TestGitSpawnBudget:
     def test_an_edit_that_runs_tests_and_re_records_spawns_no_git(self, project, counted):
         run_outside(project, "-q")
         counted()
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         result = run_outside(project, "-q")
         result.assert_outcomes(passed=1)
         assert counted() == []

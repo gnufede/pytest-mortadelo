@@ -240,7 +240,7 @@ class TestBlockCache:
         dep = cache.module_dep("good.py")
         assert dep[0] == "good.py"
         assert dep[1] == MODULE_BLOCK
-        assert len(dep[2]) == 16
+        assert dep[2] and dep[2] != WILDCARD
         assert cache.module_dep("bad.py") == ("bad.py", WILDCARD, WILDCARD)
         assert cache.module_dep("missing.py") == ("missing.py", WILDCARD, WILDCARD)
         # one parse per file (cache)

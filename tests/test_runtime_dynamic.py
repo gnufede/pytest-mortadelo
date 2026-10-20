@@ -102,7 +102,7 @@ class TestSelection:
         # helper.py is executed only by test_plain: the dynamic test (which
         # reached lib by name) must not be dragged in by an edit it cannot see.
         (dyn_project.path / "tests" / "helper.py").write_text(
-            "def g():\n    return 1 + 1\n"
+            "def g():\n    return 2 + int(0)\n"
         )
         result = run_less(dyn_project, "-v")
         result.assert_outcomes(passed=1)
@@ -111,7 +111,7 @@ class TestSelection:
     def test_stale_edit_of_a_reached_module_selects_by_staleness(self, dyn_project):
         run_less(dyn_project, "-q")
         (dyn_project.path / "tests" / "lib.py").write_text(
-            "def f():\n    return 1 + 0\n"
+            "def f():\n    return 1 + int(0)\n"
         )
         result = run_less(dyn_project, "-v")
         # test_importmod executed lib.f -> ordinary staleness; test_eval and

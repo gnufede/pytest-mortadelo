@@ -455,7 +455,7 @@ class TestEndToEnd:
         # Recorded with an uncommitted edit; the edit is then thrown away.  The
         # tree now equals HEAD, so ``git diff <base>`` sees nothing -- but the
         # shard was recorded from different bytes.
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         run_less(project, "-q").assert_outcomes(passed=2)
         git(project.path, "checkout", "--", "tests/lib.py")
         result = run_less(project, "-v")
@@ -471,14 +471,14 @@ class TestEndToEnd:
         assert GitStore(project.path, shard_key(project)).load_files() is None
         result = run_less(project, "-q")
         assert result.ret == 5  # git diff path still decides correctly
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         run_less(project, "-q").assert_outcomes(passed=1)
         assert GitStore(project.path, shard_key(project)).load_files() is not None
 
     def test_forced_git_backend_never_reads_fingerprints(self, project, monkeypatch):
         run_less(project, "-q").assert_outcomes(passed=2)
         monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         result = run_less(project, "-v")
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(["*test_a.py::test_a PASSED*"])

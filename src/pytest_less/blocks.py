@@ -263,6 +263,22 @@ def _skeleton_dump(node: ast.AST) -> str:
             fn.body = body
 
 
+def hash_mode() -> str:
+    """Which algorithm hashes blocks: ``"bytecode"`` (the default where the
+    interpreter is supported) or ``"ast"``.
+
+    ``PYTEST_LESS_HASH=ast`` forces the AST path.  The mode is part of every
+    cache key (a file's entry is only ever served to the algorithm that made
+    it) and of every block hash (a ``c<minor>`` prefix), so the two can never
+    be compared to each other: a mismatch reads as "changed".
+    """
+    if os.environ.get("PYTEST_LESS_HASH", "").lower() == "ast":
+        return "ast"
+    from . import codeblocks
+
+    return "bytecode" if codeblocks.SUPPORTED else "ast"
+
+
 class FileBlocks:
     """Block table of one parsed Python file.
 
@@ -292,6 +308,15 @@ class FileBlocks:
         # safety net of the cosmetic filter.
         self.bdocs = bdocs or {}
         self.reads_docs = reads_docs
+
+    kind = "a"  # which algorithm built this table (serialized as "k")
+
+    def known_markers(self) -> tuple[str, ...] | None:
+        """The markers if already computed (the AST path always has them)."""
+        return self.markers
+
+    def attach_source(self, data: bytes) -> None:
+        """Hand over the file's bytes (only the lazy subclass needs them)."""
 
     def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
         """Map a code object to ``(block id, hash)``; None if unresolvable."""
@@ -398,7 +423,7 @@ def parse_blocks(source: str, *, cosmetic: bool = False) -> FileBlocks | None:
 # Bump when anything that feeds a block/docstring hash changes (the algorithm
 # in parse_blocks / scan_tree / block_docstring_hashes): a stored parse result
 # from another version must not be trusted.
-PARSE_CACHE_VERSION = 1
+PARSE_CACHE_VERSION = 2
 
 
 def _content_hash(data: bytes) -> str:
@@ -406,11 +431,13 @@ def _content_hash(data: bytes) -> str:
 
 
 def _file_to_json(fb: FileBlocks) -> dict:
+    markers = fb.known_markers()  # None: not computed yet (and not needed)
     return {
         "b": {k: [v, fb.bdocs.get(k, "")] for k, v in fb.blocks.items()},
         "s": [list(span) for span in fb.spans],
-        "m": list(fb.markers),
+        "m": None if markers is None else list(markers),
         "r": int(fb.reads_docs),
+        "k": fb.kind,
     }
 
 
@@ -418,6 +445,10 @@ def _file_from_json(d: dict) -> FileBlocks:
     blocks = {k: v[0] for k, v in d["b"].items()}
     bdocs = {k: v[1] for k, v in d["b"].items() if v[1]}
     spans = [(int(a), int(b), c) for a, b, c in d["s"]]
+    if d.get("k") == "c":
+        from .codeblocks import CompiledBlocks
+
+        return CompiledBlocks.restore(blocks, spans, d["m"])
     return FileBlocks(blocks, spans, tuple(d["m"]), bdocs, bool(d["r"]))
 
 
@@ -445,7 +476,10 @@ class LocalParseStore:
     @classmethod
     def at(cls, base: Path, *, cosmetic: bool) -> LocalParseStore:
         py = f"{sys.version_info[0]}.{sys.version_info[1]}"
-        name = f"parse-v{PARSE_CACHE_VERSION}-py{py}-{'c' if cosmetic else 'p'}"
+        name = (
+            f"parse-v{PARSE_CACHE_VERSION}-py{py}-{hash_mode()}-"
+            f"{'c' if cosmetic else 'p'}"
+        )
         return cls(Path(base) / "pytest-less" / name)
 
     def _path(self, digest: str) -> Path:
@@ -541,6 +575,7 @@ class ParseCache:
             "v": PARSE_CACHE_VERSION,
             "py": f"{sys.version_info[0]}.{sys.version_info[1]}",
             "cosmetic": self._cosmetic,
+            "algo": hash_mode(),
         }
 
     def preload(self) -> None:
@@ -646,6 +681,7 @@ class BlockCache:
         self.parse_cache = parse_cache
         self.hits = 0
         self.misses = 0
+        self._bytecode = hash_mode() == "bytecode"
         self._cache: dict[str, FileBlocks | None] = {}
 
     def file_blocks(self, rel: str) -> FileBlocks | None:
@@ -661,13 +697,23 @@ class BlockCache:
             digest = _content_hash(data)
             fb = self.parse_cache.lookup(rel, digest)
             if fb is not None:
+                fb.attach_source(data)
                 self.hits += 1
                 self._cache[rel] = fb
                 return fb
-        source = data.decode("utf-8", errors="replace")
-        if b"\r" in data:  # same universal-newline translation as read_text
-            source = source.replace("\r\n", "\n").replace("\r", "\n")
-        fb = parse_blocks(source, cosmetic=self.cosmetic)
+        fb = None
+        if self._bytecode:
+            from .codeblocks import Unsupported, compile_blocks
+
+            try:
+                fb = compile_blocks(data, filename=rel)
+            except Unsupported:
+                fb = None  # a construct it does not model: the AST path
+        if fb is None:
+            source = data.decode("utf-8", errors="replace")
+            if b"\r" in data:  # same universal-newline translation as read_text
+                source = source.replace("\r\n", "\n").replace("\r", "\n")
+            fb = parse_blocks(source, cosmetic=self.cosmetic)
         self.misses += 1
         if self.parse_cache is not None and fb is not None:
             self.parse_cache.store(rel, digest, fb)

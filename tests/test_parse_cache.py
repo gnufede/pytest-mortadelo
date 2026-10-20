@@ -12,11 +12,13 @@ so the cache can serve a stale table to nobody.
 import json
 import re
 import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 from test_plugin import commit, git, project, run_less  # noqa: F401
 
-from pytest_less.blocks import BlockCache, ParseCache, parse_blocks
+from pytest_less.blocks import BlockCache, ParseCache
 
 SRC = (
     '"mod"\n'
@@ -28,6 +30,22 @@ SRC = (
     "def f():\n"
     "    return 1\n"
 )
+
+
+@pytest.fixture(autouse=True, params=["bytecode", "ast"])
+def hash_algo(request, monkeypatch):
+    """Every test here runs under both block-hashing algorithms."""
+    monkeypatch.setenv("PYTEST_LESS_HASH", request.param)
+    return request.param
+
+
+def fresh(source, *, cosmetic=True):
+    """The table the active algorithm computes for *source*, with no cache:
+    what a cached table must equal."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "o.py"
+        path.write_bytes(source if isinstance(source, bytes) else source.encode())
+        return BlockCache(Path(d), cosmetic=cosmetic).file_blocks("o.py")
 
 
 def fields(fb):
@@ -57,9 +75,7 @@ class TestRoundTrip:
         first, cache = make(tmp_path)
         first.file_blocks("m.py")
         second, _ = make(tmp_path, stored=cache.dump({"m.py"}))
-        assert fields(second.file_blocks("m.py")) == fields(
-            parse_blocks(SRC, cosmetic=True)
-        )
+        assert fields(second.file_blocks("m.py")) == fields(fresh(SRC))
 
     def test_edited_content_is_a_miss_never_a_stale_hit(self, tmp_path):
         first, cache = make(tmp_path)
@@ -69,7 +85,7 @@ class TestRoundTrip:
         second, _ = make(tmp_path, source=edited, stored=stored)
         fb = second.file_blocks("m.py")
         assert (second.hits, second.misses) == (0, 1)
-        assert fb.blocks["f"] == parse_blocks(edited, cosmetic=True).blocks["f"]
+        assert fb.blocks["f"] == fresh(edited).blocks["f"]
 
     def test_reverting_to_cached_content_hits_again(self, tmp_path):
         first, cache = make(tmp_path)
@@ -85,7 +101,8 @@ class TestRoundTrip:
         cache = ParseCache(None, cosmetic=True)
         bc = BlockCache(tmp_path, cosmetic=True, parse_cache=cache)
         got = bc.file_blocks("w.py")
-        expected = parse_blocks((tmp_path / "w.py").read_text(), cosmetic=True)
+        # the same file with universal newlines applied up front
+        expected = fresh(crlf.replace("\r\n", "\n"))
         assert fields(got) == fields(expected)
 
 
@@ -202,7 +219,7 @@ class TestEndToEnd:
 
     def test_incremental_run_reparses_only_what_changed(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         result = run_less(project, "-v")
         result.assert_outcomes(passed=1)
         hits, parsed = parse_note(result)
@@ -211,7 +228,7 @@ class TestEndToEnd:
 
     def test_new_content_is_cached_for_the_next_run(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         run_less(project, "-q").assert_outcomes(passed=1)
         # lib.py's new content was cached by the run above.  Now change a
         # different executed file: only that one is parsed, lib.py is a hit.
@@ -219,7 +236,7 @@ class TestEndToEnd:
             "def test_b(always_false=False):\n"
             "    if always_false:\n"
             "        import other\n"
-            "    assert 2 == 1 + 1\n"
+            "    assert 2 == 1 + int(1)\n"
         )
         result = run_less(project, "-v")
         result.assert_outcomes(passed=1)
@@ -290,7 +307,7 @@ class TestKillSwitch:
         ref = self._ref(project)
         before = git(project.path, "rev-parse", f"{ref}:parse.json").stdout.strip()
 
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + 0\n")
+        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         monkeypatch.setenv("PYTEST_LESS_PARSE_CACHE", "0")
         result = run_less(project, "-v")
         result.assert_outcomes(passed=1)
@@ -315,7 +332,7 @@ class TestLocalStore:
     def entry(self, source=SRC):
         from pytest_less.blocks import _file_to_json
 
-        return _file_to_json(parse_blocks(source, cosmetic=True))
+        return _file_to_json(fresh(source))
 
     def test_put_get_round_trip_and_atomic_layout(self, store):
         assert store.get("ab" * 16) is None
@@ -404,7 +421,7 @@ class TestSharedAcrossShards:
         b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=second)
         fb = b.file_blocks("m.py")
         assert (b.hits, b.misses) == (0, 1)
-        assert fb.blocks["f"] == parse_blocks(SRC.replace("return 1", "return 2"), cosmetic=True).blocks["f"]
+        assert fb.blocks["f"] == fresh(SRC.replace("return 1", "return 2")).blocks["f"]
 
     def test_a_corrupt_local_entry_degrades_to_a_parse(self, tmp_path):
         from pytest_less.blocks import LocalParseStore, _content_hash

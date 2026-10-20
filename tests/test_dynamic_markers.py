@@ -264,6 +264,7 @@ class TestDynamicE2E:
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
 
+    @pytest.mark.usefixtures("ast_hashing")
     def test_docstring_edit_in_marker_file_stays_cosmetic(self, dynamic_project):
         # The interlock: with the (default) cosmetic filter a prose-only edit
         # produces no stale block, so the widening gate never opens (Ley 2

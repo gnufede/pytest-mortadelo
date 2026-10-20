@@ -19,6 +19,11 @@ from test_plugin import commit, git, run_less
 
 from pytest_less.blocks import parse_blocks
 
+# The cosmetic filter (docstrings ignored, with a safety net for code that reads
+# ``__doc__``) is a property of the AST hasher.  The bytecode hasher treats a
+# docstring as behavior: see test_codeblocks.py.
+pytestmark = pytest.mark.usefixtures("ast_hashing")
+
 
 @pytest.fixture
 def doc_project(pytester):
@@ -64,7 +69,7 @@ def write_lib(project, documented_body='    """Old prose."""\n    return 1'):
 
 DOCSTRING_EDIT = '    """New and improved prose."""\n    return 1'
 COMMENT_EDIT = '    """Old prose."""\n    return 1  # a comment, invisible to ast.dump'
-BODY_EDIT = '    """Old prose."""\n    return 1 + 0'
+BODY_EDIT = '    """Old prose."""\n    return 1 + int(0)'
 
 
 class TestCosmeticDefault:
