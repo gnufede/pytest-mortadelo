@@ -34,7 +34,6 @@ Options:
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `PYTEST_LESS_HASH=ast` | hash blocks from the AST instead of compiled bytecode (the cosmetic docstring filter lives there; ~1.7 s slower to analyze the 220 files of a cold sqlalchemy record) |
 | `PYTEST_LESS_PARSE_CACHE=0` | disable the `parse.json` read/write (cold-run measurements, debugging a suspected cache bug); the stored blob is carried over untouched |
-| `PYTEST_LESS_GIT_BACKEND=subprocess` | never read/write git objects in-process; use `git` commands for everything (triage, CI of the fallback path) |
 | `-p no:less` | disable the plugin entirely |
 
 If nothing changed and nothing failed, **zero tests run and pytest exits with
@@ -330,8 +329,9 @@ refs/less/<shard>   →  lightweight commit
   on any error — it steps aside and the original `git` command runs, so
   correctness never depends on it applying; only speed does. Mixed use is
   fine: a shard written in-process is an ordinary ref that git reads, and the
-  other way round. `PYTEST_LESS_GIT_BACKEND=subprocess` forces the fallback,
-  and CI runs the whole suite both ways on Python 3.12 and 3.13.
+  other way round. A clone's objects are packed, which the in-process reader
+  does not read, so on a fresh checkout reads go through `git` and writes (which
+  are always loose objects) stay in-process.
 
   Change detection does not use git in the common case either (next bullet).
   `load_meta` and the fingerprints are memoized on the run's single `GitStore`
@@ -370,9 +370,8 @@ refs/less/<shard>   →  lightweight commit
     run, and a file recorded **dirty** and later reverted is noticed (a diff
     against `HEAD` cannot see it).
   - shards without `files.json` (recorded before this), a snapshot it cannot
-    read, git being unable to answer the scoped question, and
-    `PYTEST_LESS_GIT_BACKEND=subprocess` all use `git diff` against the shard's
-    base commit as before. A randomized differential test checks the two agree
+    read, and git being unable to answer the scoped question all use `git diff`
+    against the shard's base commit as before. A randomized differential test checks the two agree
     on edits, touches, deletions, new and ignored files, and reverts.
   - rewriting a shard reuses the previous snapshot's hashes for files whose size
     and (old enough) mtime did not change, so it costs stats, not reads.

@@ -436,12 +436,6 @@ class TestSharedAcrossShards:
 
 
 class TestSharedEndToEnd:
-    @pytest.fixture(autouse=True)
-    def _in_process_layer(self, monkeypatch):
-        # The store lives under the git directory, which only the in-process
-        # layer knows; with PYTEST_LESS_GIT_BACKEND=subprocess there is none.
-        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)
-
     def test_a_different_command_does_not_re_parse(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
         # another shard (the argument is part of the key): cold shard, warm repo

@@ -28,13 +28,6 @@ from pytest_less.fingerprint import RACY_NS, build_snapshot, detect_changes
 from pytest_less.gitstore import GitStore
 
 
-@pytest.fixture(autouse=True)
-def _fingerprints_by_default(monkeypatch):
-    """These tests are about the fingerprint path: whatever backend the
-    surrounding run was forced to, each test chooses its own."""
-    monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)
-
-
 def write(root, rel, text="x = 1\n", age=None):
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,14 +467,6 @@ class TestEndToEnd:
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         run_less(project, "-q").assert_outcomes(passed=1)
         assert GitStore(project.path, shard_key(project)).load_files() is not None
-
-    def test_forced_git_backend_never_reads_fingerprints(self, project, monkeypatch):
-        run_less(project, "-q").assert_outcomes(passed=2)
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
-        result = run_less(project, "-v")
-        result.assert_outcomes(passed=1)
-        result.stdout.fnmatch_lines(["*test_a.py::test_a PASSED*"])
 
     def test_a_run_that_stops_early_does_not_hide_the_tests_it_never_ran(self, pytester):
         tests = pytester.path / "tests"

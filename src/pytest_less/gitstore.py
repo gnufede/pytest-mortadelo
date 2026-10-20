@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .blocks import LocalParseStore
 from .fingerprint import detect_changes
-from .gitobjects import Repo, Unsupported, backend_enabled
+from .gitobjects import Repo, Unsupported
 from .util import run_git
 
 # What the in-process object layer may raise when it meets something it does
@@ -78,9 +78,9 @@ class GitStore:
         # "fingerprints" (watched files only) or "git" (the whole repository).
         self.change_source = "git"
         # Reads/writes of refs and loose objects without spawning git; None
-        # when disabled (PYTEST_LESS_GIT_BACKEND=subprocess) or the layout is
-        # not one it models.
-        self._repo = Repo.discover(self.root) if backend_enabled() else None
+        # when the layout is not one it models (everything then goes through
+        # the ``git`` command).
+        self._repo = Repo.discover(self.root)
 
     def _git(self, *args: str, stdin: str | None = None, extra_env: dict | None = None) -> str:
         env = None
@@ -201,9 +201,9 @@ class GitStore:
         Prefers the shard's own fingerprints (:mod:`fingerprint`): no git in
         the common case, independent of any base commit (a rebase or amend
         does not invalidate anything), and correct for files that are
-        untracked or dirty at record time.  Shards without fingerprints,
-        ``PYTEST_LESS_GIT_BACKEND=subprocess``, and anything the fingerprints
-        cannot decide fall back to ``git diff`` against *base_commit*.
+        untracked or dirty at record time.  Shards without fingerprints, and
+        anything the fingerprints cannot decide, fall back to ``git diff``
+        against *base_commit*.
         """
         key = ("changes", base_commit)
         if self._memoize and key in self._memo:
@@ -211,12 +211,11 @@ class GitStore:
             return None if cached is None else set(cached)
         result = None
         source = "git"
-        if backend_enabled():
-            snapshot = self.load_files()
-            if snapshot is not None:
-                result = detect_changes(self.root, snapshot, self.project_files)
-                if result is not None:
-                    source = "fingerprints"
+        snapshot = self.load_files()
+        if snapshot is not None:
+            result = detect_changes(self.root, snapshot, self.project_files)
+            if result is not None:
+                source = "fingerprints"
         if result is None:
             result = self.changed_since(base_commit)
             source = "git"

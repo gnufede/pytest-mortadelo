@@ -677,7 +677,6 @@ class TestGitSpawnBudget:
         import os
         import shutil
 
-        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)  # the fast path
         real = shutil.which("git")
         log = tmp_path / "gitcalls.log"
         shim = tmp_path / "shim"

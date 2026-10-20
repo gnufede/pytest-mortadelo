@@ -14,15 +14,8 @@ import zlib
 
 import pytest
 
-from pytest_less.gitobjects import Repo, Unsupported, backend_enabled, toplevel
+from pytest_less.gitobjects import Repo, Unsupported, toplevel
 from pytest_less.gitstore import GitStore
-
-
-@pytest.fixture(autouse=True)
-def _in_process_by_default(monkeypatch):
-    """These tests are about the in-process layer: whatever backend the
-    surrounding run was forced to, each test chooses its own."""
-    monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)
 
 
 def git(path, *args, stdin=None, check=True, env=None):
@@ -128,11 +121,6 @@ class TestDiscovery:
         if proc.returncode != 0:
             pytest.skip("this git cannot create reftable repositories")
         assert Repo.discover(path) is None
-
-    def test_backend_switch(self, monkeypatch):
-        assert backend_enabled()
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
-        assert not backend_enabled()
 
 
 class TestRefs:
@@ -301,11 +289,17 @@ class TestWriting:
         git(repo, "fsck", "--no-dangling", "--strict")
 
 
+def not_modelled(monkeypatch):
+    """Make every repository look like a layout the in-process layer does not
+    model (reftable, SHA-256, ...): GitStore then uses the ``git`` command."""
+    monkeypatch.setattr(Repo, "discover", classmethod(lambda cls, start: None))
+
+
 @pytest.fixture(params=["in-process", "git"])
 def store(request, repo, monkeypatch):
-    """The same GitStore scenario under both backends."""
+    """The same GitStore scenario with and without the in-process layer."""
     if request.param == "git":
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
+        not_modelled(monkeypatch)
     s = GitStore(repo, "abc")
     assert (s._repo is None) == (request.param == "git")
     return s
@@ -354,11 +348,11 @@ class TestMixedBackends:
     def test_shard_written_in_process_is_read_by_git_and_back(self, repo, monkeypatch):
         fast = GitStore(repo, "abc")
         fast.save({"version": 2, "w": "py"}, {"version": 1}, parse={"v": 1})
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
-        slow = GitStore(repo, "abc")
-        assert slow.load_data() == {"version": 2, "w": "py"}
-        slow.save({"version": 2, "w": "git"}, {"version": 1})
-        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND")
+        with monkeypatch.context() as m:
+            not_modelled(m)
+            slow = GitStore(repo, "abc")
+            assert slow.load_data() == {"version": 2, "w": "py"}
+            slow.save({"version": 2, "w": "git"}, {"version": 1})
         assert GitStore(repo, "abc").load_data() == {"version": 2, "w": "git"}
         assert GitStore(repo, "abc").load_parse() == {"v": 1}  # carried over
 

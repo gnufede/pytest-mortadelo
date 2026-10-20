@@ -19,9 +19,6 @@ Whenever it meets anything it does not fully understand it raises
 :class:`Unsupported` (or returns ``None`` from :meth:`Repo.discover`), and the
 caller falls back to the corresponding ``git`` command.  Correctness never
 depends on this module being applicable -- only speed does.
-
-``PYTEST_LESS_GIT_BACKEND=subprocess`` disables it (cold-run measurements,
-triage, and CI runs of the fallback path).
 """
 
 from __future__ import annotations
@@ -55,10 +52,6 @@ _IDENTITY = "pytest-less <less@invalid>"
 
 class Unsupported(Exception):
     """This repository layout or object is outside what this module models."""
-
-
-def backend_enabled() -> bool:
-    return os.environ.get("PYTEST_LESS_GIT_BACKEND", "auto").strip().lower() != "subprocess"
 
 
 class Repo:
@@ -287,5 +280,5 @@ class Repo:
 def toplevel(start: Path | str) -> Path | None:
     """The repository's working-tree root, or None (no repo / unsupported:
     callers then ask ``git rev-parse --show-toplevel``)."""
-    repo = Repo.discover(start) if backend_enabled() else None
+    repo = Repo.discover(start)
     return repo.worktree if repo is not None else None

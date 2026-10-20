@@ -35,11 +35,6 @@ SPAWNER = "tests/test_spawn.py::test_spawn"
 OBSERVER = "tests/test_observer.py::test_observer"
 
 
-@pytest.fixture(autouse=True)
-def _fingerprints_by_default(monkeypatch):
-    monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)
-
-
 @pytest.fixture
 def child_project(pytester):
     """A test that spawns ``scripts/child.py`` -- a directory no recorded
@@ -174,19 +169,28 @@ class TestStillWokenByAnyChange:
         result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
 
 
+def drop_fingerprints(project):
+    """Rewrite the shard as an older version did: no ``files.json``, so change
+    detection has to ask ``git diff``."""
+    store = GitStore(project.path, _shard(project))
+    data, meta, parse = store.load_data(), store.load_meta(), store.load_parse()
+    store.delete()
+    store.save(data, meta, parse=parse)
+
+
 class TestGitBackend:
     def test_git_diff_covers_the_whole_repository_so_it_is_pristine_too(
-        self, child_project, monkeypatch
+        self, child_project
     ):
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
         run_less(child_project, "-q").assert_outcomes(passed=2)
+        drop_fingerprints(child_project)
         result = run_less(child_project, "-q")
         assert result.ret == 5
         result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
 
-    def test_and_an_edit_anywhere_wakes_it(self, child_project, monkeypatch):
-        monkeypatch.setenv("PYTEST_LESS_GIT_BACKEND", "subprocess")
+    def test_and_an_edit_anywhere_wakes_it(self, child_project):
         run_less(child_project, "-q")
+        drop_fingerprints(child_project)
         (child_project.path / "scripts" / "child.py").write_text('print("v1")  # y\n')
         run_less(child_project, "-q").assert_outcomes(passed=1)
 
