@@ -28,6 +28,7 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
+from .blocks import LocalParseStore
 from .fingerprint import detect_changes
 from .gitobjects import Repo, Unsupported, backend_enabled
 from .util import run_git
@@ -66,6 +67,9 @@ class GitStore:
         # a store used directly must always see the current state.
         self._memoize = memoize
         self._memo: dict = {}
+        # Which mechanism produced the last ``changed_files`` answer:
+        # "fingerprints" (watched files only) or "git" (the whole repository).
+        self.change_source = "git"
         # Reads/writes of refs and loose objects without spawning git; None
         # when disabled (PYTEST_LESS_GIT_BACKEND=subprocess) or the layout is
         # not one it models.
@@ -196,18 +200,60 @@ class GitStore:
         """
         key = ("changes", base_commit)
         if self._memoize and key in self._memo:
-            cached = self._memo[key]
+            cached, self.change_source = self._memo[key]
             return None if cached is None else set(cached)
         result = None
+        source = "git"
         if backend_enabled():
             snapshot = self.load_files()
             if snapshot is not None:
                 result = detect_changes(self.root, snapshot, self.project_files)
+                if result is not None:
+                    source = "fingerprints"
         if result is None:
             result = self.changed_since(base_commit)
+            source = "git"
+        self.change_source = source
         if self._memoize:
-            self._memo[key] = None if result is None else set(result)
+            self._memo[key] = (None if result is None else set(result), source)
         return result
+
+    def is_pristine(self, base_commit: str | None, changed: set[str] | None) -> bool:
+        """Whether *nothing* observable changed since the shard was recorded.
+
+        True only if (1) *changed* is empty, (2) ``HEAD`` is still the commit
+        the shard was recorded at, and (3) that emptiness covers everything a
+        child process could have read: ``git diff`` + untracked cover the whole
+        repository, and fingerprints do once the snapshot was widened to every
+        tracked file (``"all"``).  Tests that spawn a process normally re-run
+        every time; at a pristine state they do not.  Last call to
+        :meth:`changed_files` must be the one that produced *changed*.
+        """
+        if changed is None or changed or not base_commit:
+            return False
+        if self.head() != base_commit:
+            return False
+        if self.change_source == "git":
+            return True
+        snapshot = self.load_files()
+        return bool(snapshot and snapshot.get("all"))
+
+    def local_parse_store(self, cosmetic: bool) -> LocalParseStore | None:
+        """The repository-wide parse store (under the git directory), or None
+        when the layout is not one the in-process layer models."""
+        if self._repo is None:
+            return None
+        return LocalParseStore.at(self._repo.commondir, cosmetic=cosmetic)
+
+    def tracked_files(self, limit: int) -> list[str] | None:
+        """Every tracked file, or ``None`` if there are more than *limit* (or
+        git cannot say).  One spawn, made only when a shard is written."""
+        try:
+            out = run_git(self.root, "ls-files", "-z")
+        except (subprocess.CalledProcessError, OSError):
+            return None
+        files = [p for p in out.split("\0") if p]
+        return files if len(files) <= limit else None
 
     # -- shard persistence -------------------------------------------------
 

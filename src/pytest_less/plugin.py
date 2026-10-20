@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 from .blocks import DYNAMIC_DEP, WILDCARD, Block, ParseCache
-from .fingerprint import build_snapshot
+from .fingerprint import TRACKED_LIMIT, build_snapshot
 from .gitstore import GitStore
 from .monitoring import FileMonitor
 from .selection import (
@@ -136,9 +136,11 @@ def _fast_conditions(store, meta) -> tuple[set[str] | None, bool, bool]:
         f for f in meta["dep_files"] if isinstance(f, str)
     }:
         return changed, False, False
-    if _always_rerun(meta):
-        # Tests that spawned a process carry no dependencies and must run
-        # every time: there is no "nothing to do" shortcut.
+    if _always_rerun(meta) and not store.is_pristine(meta.get("base_commit"), changed):
+        # Tests that spawned a process carry no dependencies, so any change
+        # at all (or a new commit) re-runs them: no "nothing to do" shortcut.
+        # At a pristine state -- nothing changed, same commit, everything a
+        # child could read watched -- the answer is the same as last time.
         return changed, False, False
     dep_files = {f for f in meta["dep_files"] if isinstance(f, str)}
     candidates = {
@@ -386,11 +388,13 @@ def pytest_load_initial_conftests(early_config, parser, args):
                 # and import-time parses already hit it.
                 parse_cache = None
                 if _parse_cache_enabled():
+                    early_store = _shared_store(
+                        early_config, root, early_config.invocation_params.args
+                    )
                     parse_cache = ParseCache(
-                        _shared_store(
-                            early_config, root, early_config.invocation_params.args
-                        ).load_parse,
+                        early_store.load_parse,
                         cosmetic=cosmetic,
+                        local=early_store.local_parse_store(cosmetic),
                     )
                     parse_cache.preload()
                 monitor = FileMonitor(
@@ -445,6 +449,9 @@ class LessState:
         # ask the same questions of the same shard).
         self.new_maps: dict = {}
         self.ctx = None
+        # Nothing changed since the recording (see GitStore.is_pristine):
+        # always-run tests are skipped too.
+        self.pristine = False
 
     # -- setup ----------------------------------------------------------
 
@@ -492,7 +499,11 @@ class LessState:
                 cosmetic = _cosmetic_enabled(config)
                 parse_cache = None
                 if _parse_cache_enabled():
-                    parse_cache = ParseCache(self.store.load_parse, cosmetic=cosmetic)
+                    parse_cache = ParseCache(
+                    self.store.load_parse,
+                    cosmetic=cosmetic,
+                    local=self.store.local_parse_store(cosmetic),
+                )
                     parse_cache.preload()
                 self.monitor = FileMonitor(
                     self.root,
@@ -602,12 +613,15 @@ class LessState:
         self.changed = changed
         if changed is None:
             return
+        self.pristine = self.store.is_pristine(self.shard.base_commit, changed)
         self.new_maps = self._new_maps(changed)
         # Widening facts shared with select_tests (same builder, same
         # predicate -- a test can never run under one and be skipped under
         # the other).  If a shared import-time dependency went stale, or a
         # dynamic-marker file widens to *all* tests, nothing is skippable.
-        ctx = self.ctx = build_context(self.shard, changed, self.new_maps)
+        ctx = self.ctx = build_context(
+            self.shard, changed, self.new_maps, pristine=self.pristine
+        )
         if ctx.import_stale or ctx.dynamic_global:
             return
         # Which files still have at least one test that will run?  A test
@@ -716,7 +730,12 @@ class LessState:
             return
         else:
             selection = select_tests(
-                collected, self.shard, self.changed, self.new_maps, ctx=self.ctx
+                collected,
+                self.shard,
+                self.changed,
+                self.new_maps,
+                ctx=self.ctx,
+                pristine=self.pristine,
             )
         if self.skipped_test_ids:
             # Only report tests whose files were genuinely not collected;
@@ -1034,16 +1053,28 @@ class LessState:
         parse = None
         if monitor.parse_cache is not None:
             parse = monitor.parse_cache.dump({f for f in dep_files if f.endswith(".py")})
+            monitor.parse_cache.flush_local()
             hits, parsed = monitor.parse_stats
             if config.getoption("verbose", 0) > 0 and hits + parsed:
+                shared = monitor.parse_cache.local_hits
                 self.notes.append(
-                    f"less: parse cache: {hits} hit(s), {parsed} file(s) parsed"
+                    f"less: parse cache: {hits} hit(s)"
+                    + (f" ({shared} from the repository cache)" if shared else "")
+                    + f", {parsed} file(s) parsed"
                 )
         # Fingerprints of what the shard now describes: the next run's change
         # detection compares against them instead of asking git.
         digests = monitor.parse_cache.used if monitor.parse_cache is not None else {}
+        # A child process may read any tracked file, so when a test spawns one
+        # the snapshot is widened to all of them: that is what makes "nothing
+        # changed" provable, and lets the next rerun at this commit skip it.
+        tracked = self.store.tracked_files(TRACKED_LIMIT) if always else None
         snapshot = build_snapshot(
-            self.root, dep_files, digests, previous=self.store.load_files()
+            self.root,
+            dep_files,
+            digests,
+            previous=self.store.load_files(),
+            extra_files=tracked,
         )
         self.store.save(data, meta, parse=parse, files=snapshot)
         if self.sync_remote and self.sync_mode in ("push", "both"):

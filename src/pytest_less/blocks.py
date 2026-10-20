@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -419,6 +421,86 @@ def _file_from_json(d: dict) -> FileBlocks:
     return FileBlocks(blocks, spans, tuple(d["m"]), bdocs, bool(d["r"]))
 
 
+# Per repository, per (Python minor, cosmetic) -- shared by every shard.
+LOCAL_PARSE_LIMIT = 8_000
+
+
+class LocalParseStore:
+    """Parse results shared by **every shard** of a repository.
+
+    The shard's ``parse.json`` only knows what that one command recorded, so a
+    different command (``pytest tests/unit`` after ``pytest tests``), a cleaned
+    shard, or another branch's first record parsed the same unchanged files
+    again -- 2.5 s of a 15 s record on a 220-file set.  This is one tiny file
+    per *content hash* under the git directory (``<git-dir>/pytest-less/``),
+    so a lookup is one small read (no big blob to load, nothing to rewrite)
+    and two paths holding the same bytes share an entry.  Like every other
+    cache here it is only ever trusted for the exact bytes it was built from,
+    and it is bounded (:data:`LOCAL_PARSE_LIMIT` entries, oldest evicted).
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+
+    @classmethod
+    def at(cls, base: Path, *, cosmetic: bool) -> LocalParseStore:
+        py = f"{sys.version_info[0]}.{sys.version_info[1]}"
+        name = f"parse-v{PARSE_CACHE_VERSION}-py{py}-{'c' if cosmetic else 'p'}"
+        return cls(Path(base) / "pytest-less" / name)
+
+    def _path(self, digest: str) -> Path:
+        return self.directory / digest[:2] / f"{digest}.json"
+
+    def get(self, digest: str) -> dict | None:
+        try:
+            entry = json.loads(self._path(digest).read_bytes())
+        except (OSError, ValueError):
+            return None
+        return entry if isinstance(entry, dict) else None
+
+    def put(self, digest: str, entry: dict) -> bool:
+        """Store *entry* atomically; True if a new file was written."""
+        path = self._path(digest)
+        if path.exists():
+            return False
+        tmp = path.with_name(f".tmp-{os.getpid()}-{digest[:8]}")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(json.dumps(entry).encode())
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+        return True
+
+    def evict(self, limit: int = LOCAL_PARSE_LIMIT) -> int:
+        """Drop the oldest entries beyond *limit*; returns how many."""
+        found: list[tuple[float, Path]] = []
+        try:
+            for bucket in os.scandir(self.directory):
+                if not bucket.is_dir():
+                    continue
+                for item in os.scandir(bucket.path):
+                    if item.name.endswith(".json"):
+                        found.append((item.stat().st_mtime, Path(item.path)))
+        except OSError:
+            return 0
+        if len(found) <= limit:
+            return 0
+        found.sort()
+        removed = 0
+        for _, path in found[: len(found) - int(limit * 0.9)]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+
 class ParseCache:
     """Parse results keyed by file *content hash*.
 
@@ -433,8 +515,17 @@ class ParseCache:
     branch).  It lives in the shard (``parse.json``) and travels with it.
     """
 
-    def __init__(self, loader=None, *, cosmetic: bool = False) -> None:
+    def __init__(
+        self,
+        loader=None,
+        *,
+        cosmetic: bool = False,
+        local: LocalParseStore | None = None,
+    ) -> None:
         self._loader = loader
+        self._local = local
+        self._from_local: set[str] = set()
+        self.local_hits = 0
         self._cosmetic = cosmetic
         self._loaded = loader is None
         self._header_ok = True
@@ -477,13 +568,45 @@ class ParseCache:
         self.preload()
         entry = self.fresh.get(rel) or self.entries.get(rel)
         if entry is None or entry.get("h") != digest:
-            return None
+            return self._lookup_local(rel, digest)
         try:
             fb = _file_from_json(entry)
         except Exception:  # corrupt / foreign entry: a miss, never a crash
             return None
         self.used[rel] = digest
         return fb
+
+    def _lookup_local(self, rel: str, digest: str) -> FileBlocks | None:
+        """The repository-wide store: another shard may have parsed these
+        exact bytes.  A hit is adopted into this shard's own blob."""
+        if self._local is None:
+            return None
+        entry = self._local.get(digest)
+        if entry is None:
+            return None
+        try:
+            fb = _file_from_json(entry)
+        except Exception:
+            return None
+        self.fresh[rel] = {**entry, "h": digest}
+        self.used[rel] = digest
+        self._from_local.add(rel)
+        self.local_hits += 1
+        return fb
+
+    def flush_local(self) -> int:
+        """Publish what this run parsed to the repository-wide store."""
+        if self._local is None:
+            return 0
+        written = 0
+        for rel, entry in self.fresh.items():
+            if rel in self._from_local:
+                continue
+            body = {k: v for k, v in entry.items() if k != "h"}
+            written += self._local.put(entry["h"], body)
+        if written >= 25:  # a cold run: keep the store bounded
+            self._local.evict()
+        return written
 
     def store(self, rel: str, digest: str, fb: FileBlocks) -> None:
         entry = _file_to_json(fb)

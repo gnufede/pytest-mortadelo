@@ -15,6 +15,10 @@ At record time we store a **snapshot**:
     ``{reldir: [subdirectory names]}`` for the watched directories: every
     directory that holds a dependency file, and all of its ancestors up to the
     repository root.
+``names``
+    Only in widened mode (see below): ``{reldir: [file names]}``, so that *any*
+    new non-hidden file in a watched directory -- not just a ``.py`` -- counts
+    as new.
 ``at``
     When the snapshot was taken (``time.time_ns()``), for the racy-clean rule.
 
@@ -34,6 +38,15 @@ rules stay git's job, but a repository with a huge untracked tree no longer
 pays for listing it on every run.  Hidden directories, ``__pycache__``,
 ``*.egg-info`` and the usual environment directories are never reported as new.
 
+When a recorded test spawns a process, the snapshot is **widened to every
+tracked file** (``"all": true``): a child may read any file the parent never
+touched, so "nothing changed" is only provable if everything is watched.  That
+is what lets a rerun at the same commit skip such tests instead of always
+re-running them (see :meth:`GitStore.is_pristine`).  Files above
+:data:`EXTRA_HASH_LIMIT` are fingerprinted by stat alone (a differing mtime
+counts as a change: never read, never hashed), and a repository with more than
+:data:`TRACKED_LIMIT` tracked files is not widened at all.
+
 Hashing uses the same function as the parse cache, so the digest of a
 dependency file in the snapshot is the digest the block hashes were computed
 from.  If the file changed between being parsed and being snapshotted, its
@@ -52,6 +65,13 @@ from .blocks import _content_hash
 from .util import _EXCLUDED_SEGMENTS
 
 SNAPSHOT_VERSION = 1
+
+# Widening to every tracked file (shards with spawning tests) is bounded: a
+# big repository keeps the old "spawners always re-run" behavior rather than
+# stat'ing a six-figure file list on every run.
+TRACKED_LIMIT = 30_000
+# Beyond this size a widened (non-dependency) file is fingerprinted by stat only.
+EXTRA_HASH_LIMIT = 1_000_000
 
 # A file modified within this window before the snapshot may have been written
 # again within the same timestamp tick (coarse filesystems: 1-2 s): never
@@ -78,6 +98,7 @@ def _fingerprint(
     digest: str | None,
     previous: list | None = None,
     trusted_before: int = 0,
+    max_bytes: int | None = None,
 ) -> list | None:
     """``[size, mtime_ns, hash]`` for *path*, or None if it cannot be read.
 
@@ -94,6 +115,8 @@ def _fingerprint(
     """
     try:
         st = path.stat()
+        if max_bytes is not None and st.st_size > max_bytes:
+            return [st.st_size, st.st_mtime_ns, ""]  # stat-only: never read
         if (
             previous is not None
             and previous[1] >= 0
@@ -116,11 +139,15 @@ def build_snapshot(
     dep_files: Iterable[str],
     digests: Mapping[str, str] | None = None,
     previous: Mapping | None = None,
+    extra_files: Iterable[str] | None = None,
 ) -> dict:
     """The snapshot to store next to a freshly recorded shard.
 
     *previous* is the snapshot being replaced (if any): its hashes are reused
     for files that provably did not change since (see :func:`_fingerprint`).
+
+    *extra_files* (every tracked file, when some recorded test spawns a
+    process) are fingerprinted too and mark the snapshot ``"all": true``.
     """
     at = time.time_ns()
     digests = digests or {}
@@ -143,11 +170,14 @@ def build_snapshot(
 
     files: dict[str, list] = {}
     dirs: dict[str, list[str]] = {}
+    names: dict[str, list[str]] = {}
+    widened = extra_files is not None
     for directory in sorted(watched):
         base = root / directory if directory else root
         try:
             with os.scandir(base) as entries:
                 subdirs: list[str] = []
+                listed: list[str] = []
                 for entry in entries:
                     name = entry.name
                     try:
@@ -157,7 +187,10 @@ def build_snapshot(
                     if is_dir:
                         if not _skip_dir(name):
                             subdirs.append(name)
-                    elif name.endswith(".py"):
+                        continue
+                    if widened and not name.startswith("."):
+                        listed.append(name)
+                    if name.endswith(".py"):
                         rel = _join(directory, name)
                         record = _fingerprint(
                             root / rel, digests.get(rel), old_files.get(rel), trusted_before
@@ -167,6 +200,8 @@ def build_snapshot(
         except OSError:
             continue
         dirs[directory] = sorted(subdirs)
+        if widened:
+            names[directory] = sorted(listed)
 
     for rel in deps:
         if rel not in files:
@@ -175,7 +210,25 @@ def build_snapshot(
             )
             if record is not None:
                 files[rel] = record
-    return {"v": SNAPSHOT_VERSION, "at": at, "files": files, "dirs": dirs}
+    if extra_files is not None:
+        for rel in extra_files:
+            if rel in files or not isinstance(rel, str) or not rel:
+                continue
+            record = _fingerprint(
+                root / rel, None, old_files.get(rel), trusted_before, EXTRA_HASH_LIMIT
+            )
+            if record is not None:
+                files[rel] = record
+    snapshot = {
+        "v": SNAPSHOT_VERSION,
+        "at": at,
+        "files": files,
+        "dirs": dirs,
+        "all": widened,
+    }
+    if widened:
+        snapshot["names"] = names
+    return snapshot
 
 
 def detect_changes(
@@ -219,6 +272,9 @@ def detect_changes(
             continue
         if mtime >= 0 and st.st_mtime_ns == mtime and mtime < trusted_before:
             continue  # same size, same mtime, comfortably older than the snapshot
+        if not digest:
+            changed.add(rel)  # stat-only entry (large file): cannot be verified
+            continue
         try:
             now = _content_hash((root / rel).read_bytes())
         except OSError:
@@ -227,9 +283,13 @@ def detect_changes(
         if now != digest:
             changed.add(rel)
 
+    names = snapshot.get("names") if snapshot.get("all") else None
     suspects: list[str] = []
     for directory, known in dirs.items():
         known_dirs = set(known) if isinstance(known, list) else set()
+        known_names = (
+            set(names.get(directory, ())) if isinstance(names, dict) else None
+        )
         try:
             with os.scandir(root / directory if directory else root) as entries:
                 for entry in entries:
@@ -243,6 +303,10 @@ def detect_changes(
                         if name in known_dirs or child in dirs or _skip_dir(name):
                             continue
                         suspects.append(child + "/")
+                    elif known_names is not None:
+                        # widened: any new non-hidden file counts, not just .py
+                        if name not in known_names and not name.startswith("."):
+                            suspects.append(_join(directory, name))
                     elif name.endswith(".py") and _join(directory, name) not in files:
                         suspects.append(_join(directory, name))
         except FileNotFoundError:
@@ -258,7 +322,7 @@ def detect_changes(
             return None
         for rel in project:
             parts = PurePosixPath(rel).parts
-            if rel.endswith(".py") and not any(
+            if (names is not None or rel.endswith(".py")) and not any(
                 _skip_dir(p) for p in parts[:-1]
             ):
                 changed.add(rel)

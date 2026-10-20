@@ -230,6 +230,9 @@ class _Context:
     dynamic_global: bool  # ... of which one is in the shared import bucket
     spawn_active: bool  # some changed .py is stale or was never recorded
     unrecorded_py: bool = False  # some changed .py was never recorded
+    # Nothing changed since the recording, at the same commit, with everything
+    # a child process could read watched: tests that always re-run do not.
+    pristine: bool = False
     import_files: set[str] = field(default_factory=set)
     # Recorded blocks (not stale) whose docstring text changed.
     doc_changed: set[Block] = field(default_factory=set)
@@ -252,7 +255,10 @@ def _is_candidate_py(rel: str) -> bool:
 
 
 def build_context(
-    shard: Shard, changed: set[str], maps: dict[str, FileBlocks | None]
+    shard: Shard,
+    changed: set[str],
+    maps: dict[str, FileBlocks | None],
+    pristine: bool = False,
 ) -> _Context:
     """Compute the per-run widening facts (one pass over the shard)."""
     import_stale = False
@@ -304,6 +310,7 @@ def build_context(
         (changed_py & stale_files) | (changed_py - recorded)
     )
     return _Context(
+        pristine=pristine,
         unrecorded_py=bool(changed_py - recorded),
         changed=changed,
         maps=maps,
@@ -325,7 +332,7 @@ def affected_reason(
     The single predicate shared by collection planning and selection, so a
     test can never run under one and be skipped under the other.
     """
-    if nodeid in shard.always:
+    if nodeid in shard.always and not ctx.pristine:
         return "always"
     if ctx.import_stale:
         return "import"
@@ -352,6 +359,7 @@ def select_tests(
     changed: set[str] | None,
     maps: dict[str, FileBlocks | None] | None = None,
     ctx: _Context | None = None,
+    pristine: bool = False,
 ) -> Selection:
     """Decide which of *collected* tests should run."""
     maps = maps or {}
@@ -376,7 +384,7 @@ def select_tests(
     # no longer re-runs the world -- only module skeletons and the blocks
     # that actually executed at import time (module-level calls included) do.
     if ctx is None:
-        ctx = build_context(shard, changed, maps)
+        ctx = build_context(shard, changed, maps, pristine=pristine)
     selected: list[str] = []
     deselected: list[str] = []
     n_affected = n_failed = n_new = n_dynamic = n_spawn = 0
@@ -384,7 +392,7 @@ def select_tests(
     always = shard.always
     for nodeid in collected:
         deps = shard.tests.get(nodeid)
-        if nodeid in always:
+        if nodeid in always and not ctx.pristine:
             selected.append(nodeid)
             n_always += 1
         elif deps is None:
@@ -423,6 +431,11 @@ def select_tests(
         )
     if n_always:
         reason += f"; {n_always} always re-run (spawn subprocesses)"
+    elif ctx.pristine and always & set(collected):
+        reason += (
+            f"; {len(always & set(collected))} always-run test(s) skipped: "
+            "nothing changed since the recorded commit"
+        )
     if n_spawn:
         reason += f"; {n_spawn} selected by the subprocess rule"
     if n_runtime:

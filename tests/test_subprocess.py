@@ -54,7 +54,9 @@ def spawn_project(pytester):
     (tests / "test_observer.py").write_text(
         "def test_observer():\n    assert True\n"
     )
-    (pytester.path / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+    (pytester.path / ".gitignore").write_text(
+        ".pytest_cache/\n__pycache__/\nrunpytest-*\nstdout\nstderr\n"
+    )
     git(pytester.path, "init", "-q")
     git(pytester.path, "config", "user.email", "test@example.com")
     git(pytester.path, "config", "user.name", "Test")
@@ -101,19 +103,17 @@ class TestSpawnRecording:
         # worker.py is a child-only file: no recorded dependency knows it.
         assert "worker.py" not in meta["dep_files"]
 
-    def test_no_change_rerun_runs_only_the_spawner(self, spawn_project):
-        # Forced re-run: there is no "nothing to do" shortcut while a
-        # spawner is recorded (and so no fast path either).
+    def test_no_change_rerun_skips_the_spawner_too(self, spawn_project):
+        # Nothing changed, same commit, and the snapshot watches every tracked
+        # file (a child could read any of them): the answer is the answer
+        # from last time -- "no change" beats "always run".
         run_less(spawn_project, "-q")
-        result = run_less(spawn_project, "-v")
-        result.assert_outcomes(passed=1)
-        result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
-        result.stdout.fnmatch_lines(["*always re-run (spawn subprocesses)*"])
-        result.stdout.fnmatch_lines(["*test_spawn.py::test_spawn PASSED*"])
-        result.stdout.no_fnmatch_line("*fast path*")
-        # ... and it stays a spawner (still never recorded).
+        result = run_less(spawn_project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+        result.stdout.fnmatch_lines(["*fast path*"])
         data = shard_data(spawn_project.path)
-        assert data["always"] == ["tests/test_spawn.py::test_spawn"]
+        assert data["always"] == ["tests/test_spawn.py::test_spawn"]  # still a spawner
 
     def test_a_test_that_stops_spawning_is_recorded_again(self, spawn_project):
         run_less(spawn_project, "-q")
