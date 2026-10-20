@@ -46,17 +46,21 @@ jobs:
           exit "$code"
 
   tests:
-    # The plain suite on every supported Python, with both git backends: the
-    # in-process object layer (default) and the forced `git` subprocess
-    # fallback that it must always be able to hand over to.
+    # The plain suite on every supported Python, with both git backends (the
+    # in-process object layer and the forced `git` subprocess fallback it must
+    # always be able to hand over to) and both block-hashing algorithms (the
+    # default compiled-bytecode hasher and the AST one it falls back to per
+    # file, and which owns the cosmetic docstring filter).
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python: ["3.12", "3.13"]
         git_backend: [auto, subprocess]
+        hash: [bytecode, ast]
     env:
       PYTEST_LESS_GIT_BACKEND: ${{ matrix.git_backend }}
+      PYTEST_LESS_HASH: ${{ matrix.hash }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
