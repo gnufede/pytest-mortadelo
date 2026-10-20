@@ -120,6 +120,12 @@ except KeyError:  # pragma: no cover - future bytecode without import ops
     _IMPORT_FROM_OP = None
     _EXTENDED_ARG_OP = None
     _LOAD_CONST_OP = None
+# 3.14 loads small ints (0..255, so every import level) with LOAD_SMALL_INT, whose
+# argument *is* the value; before that they were LOAD_CONST (an index).
+_LOAD_SMALL_INT_OP = opcode.opmap.get("LOAD_SMALL_INT")
+# 3.15 (PEP 810) packs lazy/eager flags into the low two bits of IMPORT_NAME's
+# operand; the co_names index is above them.
+_IMPORT_NAME_SHIFT = 2 if sys.version_info >= (3, 15) else 0
 
 # On Python 3.13+ code.co_code returns the original (unadaptive) bytecode
 # snapshot, so a byte-level presence test for the import opcodes is sound:
@@ -127,7 +133,11 @@ except KeyError:  # pragma: no cover - future bytecode without import ops
 # contains no import bytecode and can skip disassembly entirely (roughly
 # three quarters of code objects).  On 3.12 co_code may reflect the live
 # adaptive array; there we always disassemble.
-_FAST_IMPORT_PRECHECK = sys.version_info >= (3, 13) and _IMPORT_NAME_OP is not None
+# (Validated on 3.13 - 3.15, see tests/test_import_scan.py; on anything newer
+# the bytecode may have changed shape again, so it stays on ``dis``.)
+_FAST_IMPORT_PRECHECK = (
+    (3, 13) <= sys.version_info[:2] <= (3, 15) and _IMPORT_NAME_OP is not None
+)
 
 # Whether the "silence after attribution, re-arm on bucket change" scheme is
 # available: re-arming needs sys.monitoring.restart_events(), which clears the
@@ -160,11 +170,14 @@ def _free_tool(tool_id: int) -> None:
 
 
 def _operand_name(code, instruction) -> str | None:
-    """The co_names entry referenced by an IMPORT_NAME/IMPORT_FROM operand."""
-    try:
-        value = code.co_names[instruction.arg]
-    except (IndexError, TypeError):
-        return None
+    """The module / attribute name an IMPORT_NAME / IMPORT_FROM refers to.
+
+    ``dis`` has already decoded the operand (``argval``).  Indexing
+    ``co_names[arg]`` by hand is wrong from 3.15 on, where IMPORT_NAME carries
+    lazy/eager flags in its low two bits and the name index above them: the
+    index then falls off the table and the import silently disappears.
+    """
+    value = instruction.argval
     return value if isinstance(value, str) else None
 
 
@@ -189,8 +202,9 @@ def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
     """The same list, found by scanning the raw bytecode for the two opcodes.
 
     Cost is proportional to the number of imports, not to the size of the
-    code.  Python >= 3.13 only (``co_code`` is the un-instrumented, un-adapted
-    original there, which the byte-level import precheck already relies on).
+    code.  Python 3.13 - 3.15 only (``co_code`` is the un-instrumented,
+    un-adapted original there, which the byte-level import precheck already
+    relies on).
     Returns ``None`` -- use ``dis`` -- whenever the surrounding instructions
     are not the plain ``LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME``
     shape, so an unusual code path can never produce a different answer.
@@ -217,7 +231,7 @@ def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
             shift += 8
             start -= 2
         try:
-            name = names[arg]
+            name = names[arg >> _IMPORT_NAME_SHIFT if op == _IMPORT_NAME_OP else arg]
         except IndexError:
             return None
         if not isinstance(name, str):
@@ -225,36 +239,67 @@ def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
         if op == _IMPORT_FROM_OP:
             out.append(("IMPORT_FROM", name, 0))
             continue
-        # ``LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME``: the level is
-        # the instruction two before (what ``_static_level`` reads from dis).
-        # Only the plain shape is decoded here -- both loads single-unit, no
-        # EXTENDED_ARG prefix on the level -- anything else defers to dis.
-        if (
-            start < 4
-            or co[start - 2] != _LOAD_CONST_OP
-            or co[start - 4] != _LOAD_CONST_OP
-            or (start >= 6 and co[start - 6] == _EXTENDED_ARG_OP)
-        ):
+        # The level is an int load among the two units before IMPORT_NAME,
+        # nearest first: the fromlist (None or a tuple, never an int) may or
+        # may not be pushed depending on the version, and the level is loaded
+        # with LOAD_CONST (an index) or LOAD_SMALL_INT (the value itself).
+        # Only single-unit loads are decoded; anything else defers to dis.
+        level = _level_before(co, start, consts)
+        if level is None:
             return None
-        value = consts[co[start - 3]]
-        level = value if isinstance(value, int) else 0
         out.append(("IMPORT_NAME", name, level))
     return out
+
+
+def _level_before(co: bytes, start: int, consts: tuple) -> int | None:
+    """The relative-import level pushed before the IMPORT_NAME at byte *start*,
+    or None if the two units before it are not a plain int load.  Mirrors
+    :func:`_static_level` (which reads the same fact from ``dis``)."""
+    for back in (2, 4):
+        at = start - back
+        if at < 0:
+            return None
+        if at >= 2 and co[at - 2] == _EXTENDED_ARG_OP:
+            return None  # a multi-unit load: not decoded here
+        op = co[at]
+        if op == _LOAD_SMALL_INT_OP and _LOAD_SMALL_INT_OP is not None:
+            return co[at + 1]
+        if op == _LOAD_CONST_OP:
+            value = consts[co[at + 1]]
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        # Anything else in the fromlist slot (a LOAD_CONST of None / a tuple,
+        # 3.15's LOAD_COMMON_CONSTANT, ...): the level is one load further
+        # back.  Past that, defer to dis.
+    return None
 
 
 def _static_level(instrs, index: int) -> int:
     """Best-effort static read of the relative-import *level* stack operand.
 
-    ``IMPORT_NAME`` pops ``fromlist`` (TOS) and ``level`` (TOS1); the compiler
-    emits ``LOAD_CONST <level>; LOAD_CONST <fromlist>; IMPORT_NAME`` for every
-    import statement, so the level is (almost always) the instruction two
-    slots before the IMPORT_NAME.  If we cannot find it we assume 0 (absolute
-    import), which keeps the approximation conservative.
+    ``IMPORT_NAME`` pops the fromlist and the level; the level is an int load
+    (``LOAD_CONST`` before 3.14, ``LOAD_SMALL_INT`` after) among the two
+    instructions before it, nearest first.  The fromlist is ``None`` or a
+    tuple, never an int, so the first int load is the level -- on every
+    version (3.15 pushes a ``None`` fromlist with ``LOAD_COMMON_CONSTANT``).
+    If none is found, assume 0 (an absolute import).  ``EXTENDED_ARG`` prefixes
+    (a load whose operand needs more than one byte, e.g. in a module with more
+    than 255 constants) are separate instructions in ``dis`` and are skipped,
+    as the stdlib's own ``dis._find_imports`` does; counting them made
+    ``from ._path import x`` read as level 0 in such modules.
     """
-    if index >= 2:
-        prev = instrs[index - 2]
-        if prev.opname == "LOAD_CONST" and isinstance(prev.argval, int):
+    seen = 0
+    for k in range(index - 1, -1, -1):
+        prev = instrs[k]
+        if prev.opname == "EXTENDED_ARG":
+            continue
+        if prev.opname in ("LOAD_CONST", "LOAD_SMALL_INT") and isinstance(
+            prev.argval, int
+        ) and not isinstance(prev.argval, bool):
             return prev.argval
+        seen += 1
+        if seen == 2:
+            break
     return 0
 
 
