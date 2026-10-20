@@ -1089,6 +1089,13 @@ class FileMonitor:
             # directory that pytest put on sys.path).  The index values are
             # already repo-relative; importlib needs the conversion.
             try:
+                # find_spec("a.b") imports "a" when it is not loaded.  The
+                # recorder must not execute imports no test ran: if the parent
+                # is not loaded, nothing it could resolve to is a repo file
+                # (repo files are in the index above), so leave it.
+                parent = dotted.rpartition(".")[0]
+                if parent and parent not in sys.modules:
+                    raise LookupError(dotted)
                 spec = importlib.util.find_spec(dotted)
                 # Only real files count: builtin modules report "built-in",
                 # frozen modules report synthetic locations, namespace
@@ -1109,17 +1116,22 @@ class FileMonitor:
         return origin
 
     def _pkg_prefix(self, own_rel: str) -> list[str]:
-        """Dotted package prefix for a repo file, e.g. ``pkg/sub/mod.py`` ->
-        ``["pkg", "sub"]`` when each level has an ``__init__.py``."""
+        """Dotted package prefix for a repo file: ``pkg/sub/mod.py`` ->
+        ``["pkg", "sub"]``, and ``lib/pkg/sub/mod.py`` -> ``["pkg", "sub"]``
+        too when ``lib`` is a source root (no ``__init__.py``).
+
+        Walks **up** from the file's directory while each one is a package --
+        the rule :func:`_build_module_index` names files by.  (Walking down
+        from the repo root stops at ``lib/`` and yields ``[]``, so every
+        relative import in a ``src/`` or ``lib/`` layout resolved to a
+        nonexistent top-level name and contributed no dependency.)"""
         cached = self._pkg_prefix_cache.get(own_rel)
         if cached is not None:
             return cached
         parts = own_rel.split("/")[:-1]
-        prefix: list[str] = []
-        for i in range(1, len(parts) + 1):
-            if (self.root.joinpath(*parts[:i]) / "__init__.py").exists():
-                prefix = parts[:i]
-            else:
-                break
+        top = len(parts)
+        while top > 0 and (self.root.joinpath(*parts[:top]) / "__init__.py").exists():
+            top -= 1
+        prefix = parts[top:]
         self._pkg_prefix_cache[own_rel] = prefix
         return prefix

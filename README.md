@@ -53,8 +53,14 @@ code block that starts, the plugin scans its bytecode for `IMPORT_NAME` /
 is the conservative treatment of dynamic imports: an `import` inside a branch
 that never runs is still recorded as a dependency of the test that executed
 the surrounding block. Relative imports are resolved against the importing
-file's package; unresolvable names are skipped (if the import really runs,
-the imported module's own `PY_START` captures it anyway).
+file's package, found the way the module index names files (walking *up* from
+the file while each directory is a package, so `src/` and `lib/` layouts work
+as well as a package at the repository root). Resolution never imports
+anything: a dotted name whose parent package is not already loaded is not
+looked up. Unresolvable names are skipped, and this matters more than it
+sounds: only the **first** test to import a module runs its module code and
+records it through that module's own `PY_START`; every later test gets a
+`sys.modules` hit, so for them this scan is the only record of the edge.
 
 Events are bucketed by phase:
 
