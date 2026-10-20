@@ -189,8 +189,9 @@ What the hash does and does not see, each point pinned by `tests/test_codeblocks
   and all 101 were cases where it had guessed.
 - **Hashes are tagged `c<minor>`** (`c13…`): bytecode differs between Python
   versions, so a shard recorded on 3.12 never matches 3.13 — it reads as
-  "changed", never as "unchanged" (the AST hashes were mostly portable across
-  minors; this is the price). Files using PEP 695 generics / `type` statements,
+  "changed", never as "unchanged" (neither algorithm is portable: 0 of 14,000
+  sqlalchemy block hashes match between 3.12 and 3.13 for the AST either, since
+  `ast.dump` itself changed). Files using PEP 695 generics / `type` statements,
   and interpreters other than 3.12 / 3.13, fall back to the AST per file.
 - **Marker detection is lazy**: the dynamic-construct scan needs an AST, but
   selection only asks about files that *changed*, so recording never builds one.
