@@ -40,7 +40,7 @@ What the hash is and is not sensitive to (each point is tested):
   of its own body, so its raw bytes are stable.
 
 Anything not modelled raises :class:`Unsupported` (PEP 695 generics / ``type``
-statements, interpreters other than 3.12 / 3.13) and the file becomes a
+statements, interpreters newer than 3.15) and the file becomes a
 file-level dependency: any change to it re-runs the tests that executed it.
 Hashes carry a ``c<minor>`` prefix, so two Python versions can never be mistaken
 for each other: a mismatch is simply "changed".
@@ -57,7 +57,11 @@ import warnings
 
 from .blocks import MODULE_BLOCK, FileBlocks
 
-SUPPORTED = sys.version_info[:2] in {(3, 12), (3, 13)}
+# Validated range (the invariants in tests/test_codeblocks.py, a corpus-scale
+# line-shift check, mutation testing, and sqlalchemy end to end, per version).
+# A newer interpreter may have changed the bytecode again: it gets file-level
+# dependencies until it is validated, never a guess.
+SUPPORTED = (3, 12) <= sys.version_info[:2] <= (3, 15)
 TAG = f"c{sys.version_info[1]}"  # bytecode differs between minor versions
 
 _CO_OPTIMIZED = 0x1
@@ -76,14 +80,33 @@ _STORE_NAME = _OP["STORE_NAME"]
 _LOAD_CONST = _OP["LOAD_CONST"]
 # (opcode.hasconst lists pseudo-instructions too, numbered >= 256: they never
 # appear in co_code, and formatting them into a pattern would match byte 0x10.)
-_CONST_OPS = sorted(set(opcode.hasconst) & {o for o in _OP.values() if o < 256})
+# 3.14 loads small ints (0..255) with LOAD_SMALL_INT, whose operand *is* the value
+# (no constant-table index): the injected __firstlineno__ is one of them.
+_LOAD_SMALL_INT = _OP.get("LOAD_SMALL_INT")
+_CONST_OPS = sorted(
+    (set(opcode.hasconst) | ({_LOAD_SMALL_INT} - {None})) & {o for o in _OP.values() if o < 256}
+)
 _CONST_OP_RE = re.compile(b"[" + b"".join(b"\\x%02x" % o for o in _CONST_OPS) + b"]")
 
-# Stored by the compiler itself in every 3.13 class body, derived from things
+# Stored by the compiler itself in every 3.13+ class body, derived from things
 # that have their own blocks (the class's line, its methods' bodies).
 _MASKED_STORES = frozenset({"__firstlineno__", "__static_attributes__"})
 
 _TYPE_STMT = re.compile(rb"^[ \t]*type[ \t]+[A-Za-z_]\w*[ \t]*(\[|=)", re.MULTILINE)
+
+
+def _masked_store_follows(raw: bytes, names: tuple, pos: int) -> bool:
+    """Whether the instruction at byte *pos* (after any EXTENDED_ARG prefixes)
+    is a STORE_NAME of a name the compiler injects."""
+    hi = 0
+    while pos < len(raw) and raw[pos] == _EXTENDED_ARG:
+        hi = (hi << 8) | raw[pos + 1]
+        pos += 2
+    return (
+        pos < len(raw)
+        and raw[pos] == _STORE_NAME
+        and names[(hi << 8) | raw[pos + 1]] in _MASKED_STORES
+    )
 
 
 class Unsupported(Exception):
@@ -216,6 +239,17 @@ class _Analysis:
             at = m.start()
             if at & 1:
                 continue  # an argument byte that happens to equal an opcode
+            if raw[at] == _LOAD_SMALL_INT:
+                # The operand is the value itself, which is behavior (``x = 5``)
+                # -- except the class's own line number, injected by the compiler.
+                if masks and _masked_store_follows(raw, names, at + 2):
+                    # The compiler picks LOAD_SMALL_INT up to line 255 and a
+                    # LOAD_CONST beyond: write one canonical form, or a class
+                    # crossing line 255 would change.
+                    canon[at] = _LOAD_CONST
+                    canon[at + 1] = 0
+                    keys.append("<masked>")  # as the LOAD_CONST form does
+                continue
             arg = raw[at + 1]
             shift = 8
             j = at - 2
@@ -226,20 +260,9 @@ class _Analysis:
                 j -= 2
             canon[at + 1] = 0
             const = consts[arg]
-            if masks and raw[at] == _LOAD_CONST:
-                # LOAD_CONST value; [EXTENDED_ARG...]; STORE_NAME <name>
-                store = at + 2
-                hi = 0
-                while store < len(raw) and raw[store] == _EXTENDED_ARG:
-                    hi = (hi << 8) | raw[store + 1]
-                    store += 2
-                if (
-                    store < len(raw)
-                    and raw[store] == _STORE_NAME
-                    and names[(hi << 8) | raw[store + 1]] in _MASKED_STORES
-                ):
-                    keys.append("<masked>")
-                    continue
+            if masks and raw[at] == _LOAD_CONST and _masked_store_follows(raw, names, at + 2):
+                keys.append("<masked>")  # LOAD_CONST value; [EXTENDED_ARG...]; STORE_NAME <name>
+                continue
             if type(const) is types.CodeType:
                 if skeleton and self._is_def(const):
                     keys.append("D" + self._stub(const))

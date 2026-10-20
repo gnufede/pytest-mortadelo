@@ -138,6 +138,14 @@ class TestInvariants:
         for lead in range(12):
             assert changed("\n" * 4 + source, "\n" * lead + source) == set(), lead
 
+    def test_a_class_crossing_line_255_does_not_change(self):
+        # 3.14+ loads the class's own line with LOAD_SMALL_INT up to 255 and
+        # with LOAD_CONST beyond: a different opcode, same meaning.
+        source = "class C:\n    x = 5\n    def m(self):\n        return 1\n"
+        base = blocks("\n" * 240 + source)
+        for lead in range(246, 270):
+            assert blocks("\n" * lead + source) == base, lead
+
     def test_a_method_gaining_an_attribute_does_not_change_the_class(self):
         # ``__static_attributes__`` lists self.x assignments of *method bodies*.
         before = "class C:\n    def m(self):\n        return 1\n"
@@ -150,7 +158,6 @@ class TestInvariants:
         # in the table and a bare string statement leaves a NOP, so *adding*
         # those over-selects -- the safe side.  Editing them does not.)
         pairs = [
-            ("def f(a):\n    return a + 1\n", "def f(a):\n    return a + (0 + 1)\n"),
             ("def f(a):\n    return a + 1\n", "def f(a):\n  return (a +\n         1)\n"),
             (  # the text of a no-op string statement
                 "def f(a):\n    b = a\n    'one'\n    return a + 1\n",
@@ -169,6 +176,12 @@ class TestInvariants:
                 "from os import path as path\n",
             ),
         ]
+        if sys.version_info < (3, 14):
+            # 3.14+ folds in the flow graph and leaves the folded operand
+            # behind in co_consts, unreferenced: that edit over-selects there.
+            pairs.append(
+                ("def f(a):\n    return a + 1\n", "def f(a):\n    return a + (0 + 1)\n")
+            )
         for before, after in pairs:
             assert changed(before, after) == set(), (before, after)
 
@@ -215,16 +228,35 @@ class TestSensitivity:
         # (``self.size`` in the property) are untouched
         assert changed(KLASS, after) == {"Widget", MODULE_BLOCK}
 
-    def test_decorator_default_and_annotation_belong_to_the_parent(self):
+    def test_decorator_and_default_belong_to_the_parent(self):
         # They are evaluated by the enclosing scope, so they change *its*
         # block -- which always runs when the function object is created.
         base = "class C:\n    def m(self, x=1) -> int:\n        return x\n"
         for edit in (
             base.replace("x=1", "x=2"),
-            base.replace("-> int", "-> str"),
             base.replace("    def m", "    @staticmethod\n    def m"),
         ):
             assert "C" in changed(base, edit), edit
+
+    def test_annotation_edits_follow_the_interpreters_evaluation_model(self):
+        base = "class C:\n    def m(self, x=1) -> int:\n        return x\n"
+        edit = changed(base, base.replace("-> int", "-> str"))
+        if sys.version_info < (3, 14):
+            # evaluated eagerly by the enclosing scope
+            assert "C" in edit
+        else:
+            # PEP 649: annotations live in their own lazily-run __annotate__
+            # function, a block of its own.  Only a test that evaluated it
+            # (get_type_hints, dataclasses, ...) depends on it, and it is
+            # recorded like any other executed block.
+            assert "C" not in edit and MODULE_BLOCK not in edit
+            assert edit and all(k.endswith("__annotate__") for k in edit), edit
+
+    def test_adding_an_annotation_changes_the_parent_on_every_version(self):
+        # A new __annotate__ child appears (3.14+) / the annotation tuple does
+        # (before): either way the enclosing block sees it.
+        base = "class C:\n    def m(self, x):\n        return x\n"
+        assert "C" in changed(base, base.replace("(self, x)", "(self, x: int)"))
 
     def test_a_renamed_argument_changes_function_and_class(self):
         base = "class C:\n    def m(self, x):\n        return x\n"
@@ -300,6 +332,35 @@ class TestResolve:
         assert len(ids) == 2 and all("~" in k for k in ids)
         getter, setter = fb.resolve("C.v", 2)[0], fb.resolve("C.v", 5)[0]
         assert getter != setter
+
+    def test_every_def_and_class_resolves_to_its_own_block(self):
+        # Including 3.14's ``__annotate__`` functions, which several definitions
+        # of one scope share a qualname for (told apart by their first line),
+        # and redefinitions with the same qualname.
+        src = (
+            "def g(a: int, b: str) -> int:\n    return a\n"
+            "def h(c: float) -> int:\n    return 1\n"
+            "x: int = 1\n"
+            "class K:\n    y: int = 2\n"
+            "    def m(self, d: bytes) -> None: ...\n"
+            "    def n(self, e: list) -> None: ...\n"
+            "    @property\n    def p(self): return 1\n"
+            "    @p.setter\n    def p(self, v: int): pass\n"
+            "def outer():\n    def inner(z: int) -> int:\n        return z\n    return inner\n"
+        )
+        fb = compile_blocks(src.encode())
+        top = compile(src, "m.py", "exec")
+        checked = 0
+        stack = [top]
+        while stack:
+            code = stack.pop()
+            stack += [c for c in code.co_consts if isinstance(c, types.CodeType)]
+            if code is top or code.co_name.startswith("<"):
+                continue
+            block_id, _ = fb.resolve(code.co_qualname, code.co_firstlineno)
+            assert block_id.split("~")[0] == code.co_qualname, (code.co_qualname, block_id)
+            checked += 1
+        assert checked >= 8
 
     def test_unknown_code_belongs_to_the_module(self):
         fb = compile_blocks(b"x = 1\n")
@@ -398,6 +459,49 @@ class TestCache:
         for name, line in (("Widget.method", 15), ("outer.<locals>.inner", 27),
                            ("never_defined", 1), ("Widget.<lambda>", 12)):
             assert hit.resolve(name, line) == fresh.resolve(name, line)
+
+
+class TestAnnotationsEndToEnd:
+    """Only a test that *evaluated* an annotation depends on its text (3.14+)."""
+
+    @pytest.fixture
+    def annotated(self, pytester):
+        tests = pytester.path / "tests"
+        tests.mkdir()
+        (tests / "conftest.py").touch()
+        (tests / "lib.py").write_text("def f(x: int) -> int:\n    return x\n")
+        (tests / "test_hints.py").write_text(
+            "def test_hints():\n"
+            "    import typing, lib\n"
+            "    assert typing.get_type_hints(lib.f)['x'] is int\n"
+        )
+        (tests / "test_calls.py").write_text(
+            "def test_calls():\n    import lib\n    assert lib.f(1) == 1\n"
+        )
+        (pytester.path / ".gitignore").write_text(".pytest_cache/\n__pycache__/\n")
+        git(pytester.path, "init", "-q")
+        git(pytester.path, "config", "user.email", "t@example.com")
+        git(pytester.path, "config", "user.name", "T")
+        commit(pytester.path, "initial")
+        return pytester
+
+    def test_the_test_that_read_the_annotation_reruns(self, annotated):
+        run_less(annotated, "-q").assert_outcomes(passed=2)
+        (annotated.path / "tests" / "lib.py").write_text(
+            "def f(x: float) -> int:\n    return x\n"
+        )
+        result = run_less(annotated, "-v")
+        # it changed what get_type_hints returns, so that test must rerun --
+        # on every version
+        assert "test_hints.py::test_hints" in result.stdout.str()
+        result.stdout.fnmatch_lines(["*test_hints.py::test_hints*"])
+        if sys.version_info >= (3, 14):
+            # test_calls never evaluated an annotation: nothing it ran changed
+            result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
+            assert "test_calls.py::test_calls PASSED" not in result.stdout.str()
+        else:
+            # eagerly evaluated by the module: the skeleton changed for everyone
+            result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
 
 
 class TestEndToEnd:

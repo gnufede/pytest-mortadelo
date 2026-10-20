@@ -18,7 +18,7 @@ Dependencies are ``Block`` triples ``(repo-relative file, block id, content
 hash)``.  A ``WILDCARD`` block id means "any change to this file re-runs" (the
 file-level fallback for code we cannot map to a block: files the hasher does
 not model -- PEP 695 generics, ``type`` statements, an interpreter other than
-3.12 / 3.13 -- unparseable files, and non-Python data files recorded by
+newer than 3.15 -- unparseable files, and non-Python data files recorded by
 wrapping ``open``).
 
 A *dynamic marker* is a reflective construct (computed ``getattr``,

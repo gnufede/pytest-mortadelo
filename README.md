@@ -11,7 +11,9 @@ Minimal **test impact analysis (TIA)** for pytest.
 | import-time dependencies | everything imported before tests start is a dependency of *every* test |
 | change detection | **file fingerprints** recorded with the shard (size, mtime, content hash) — no git in the common case; `git diff` is the fallback |
 
-Requires **Python 3.12+** (for `sys.monitoring`) and a git repository.
+Requires **Python 3.12+** (for `sys.monitoring`) and a git repository. Blocks are
+hashed on 3.12 – 3.15; on a newer interpreter every file is a file-level
+dependency (see below) until the hasher is validated for it.
 
 ## Usage
 
@@ -153,7 +155,7 @@ reproduced from source at selection time, but `compile(source)` can.
 
 What the hash does and does not see, each point pinned by `tests/test_codeblocks.py`:
 
-- **Layout, comments and line numbers are invisible.** CPython 3.13 injects
+- **Layout, comments and line numbers are invisible.** CPython 3.13+ injects
   `__firstlineno__` (the class's own line) and `__static_attributes__` (the
   attributes assigned in *method bodies*) into every class body; both are masked,
   or adding a line above a class would change it, and adding `self.x = 1` to a
@@ -182,6 +184,31 @@ What the hash does and does not see, each point pinned by `tests/test_codeblocks
   a class declared `global` inside a function is found under its real qualname.
   Of 15,450 sqlalchemy code objects, 101 resolved differently from the AST
   approach this replaced, and all 101 were cases where it had guessed.
+- **3.14 and 3.15 changed what a code object looks like**, and each change was
+  found by a test rather than by reading release notes:
+  - *Annotations became code* (PEP 649): every annotated `def`, class or module
+    gets a lazily-run `__annotate__` function, a block of its own. Editing an
+    annotation changes that block and nothing else, so it selects exactly the
+    tests that **evaluated** it (`get_type_hints`, dataclasses, ...) — more
+    precise than before, when the enclosing scope evaluated annotations eagerly
+    and the whole skeleton changed. Adding or removing an annotation still
+    changes the enclosing block. Decorators and defaults are unchanged.
+  - *Small ints* are loaded with `LOAD_SMALL_INT` (the operand is the value), so
+    the class line number the compiler injects is no longer a constant. It is
+    masked in both forms, and in one canonical form: it switches from
+    `LOAD_SMALL_INT` to `LOAD_CONST` at line 256, which otherwise changed a
+    class that merely crossed that line.
+  - *Import statements:* 3.14 loads the relative-import level with
+    `LOAD_SMALL_INT`; 3.15 (PEP 810) packs lazy/eager flags into the low two
+    bits of `IMPORT_NAME`'s operand, so `co_names[arg]` is the wrong entry and
+    the import silently vanished. A `lazy import` is recorded like any import.
+  - Folded arithmetic leaves its operand behind in `co_consts` (unreferenced),
+    so adding `x + (0 + 1)` over-selects on 3.14+ (the safe side).
+  Validated per version: the suite, ~850 real files re-hashed with every line
+  number shifted (no hash may change), exact resolution of every `def`/class,
+  5,000 random mutations of sqlalchemy functions (none missed that changes
+  behavior), and the sqlalchemy subset recorded and re-selected with the same
+  counts as 3.13.
 - **Hashes are tagged `c<minor>`** (`c13…`): bytecode differs between Python
   versions, so a shard recorded on 3.12 never matches 3.13 — it reads as
   "changed", never as "unchanged" (an AST hash would not have been portable
@@ -189,7 +216,7 @@ What the hash does and does not see, each point pinned by `tests/test_codeblocks
   `ast.dump` itself changed).
 - **What the hasher does not model is a file-level dependency**: files using
   PEP 695 generics or `type` statements, unparseable files, and every file on an
-  interpreter other than 3.12 / 3.13. Any change to such a file re-runs the tests
+  interpreter newer than 3.15. Any change to such a file re-runs the tests
   that executed it (the `*` wildcard block); nothing is ever skipped because the
   hasher was unsure.
 - **Marker detection is lazy**: the dynamic-construct scan needs an AST, but
@@ -238,9 +265,10 @@ What was done, in order of effect:
   `dis.get_instructions` decoded whole module-level code objects in pure Python
   (~1 ms each) to find a few instructions. The scan finds the two opcodes in the
   raw bytecode (cost ∝ number of imports) and defers to `dis` for anything that
-  is not the plain `LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME` shape,
-  and on Python 3.12. It agrees with `dis` on all 5,171 import instructions of
-  the 3.13 standard library and this repository.
+  is not the plain `level; fromlist; IMPORT_NAME` shape, and on Python 3.12. It
+  agrees with `dis` on every import instruction of the 3.13, 3.14 and 3.15
+  standard libraries and of this repository (the byte-level path is limited to
+  those versions).
 - `finish`: file sets derived from the few thousand distinct blocks instead of
   1.6M generator steps (−0.08 s); compact JSON and a sorted block table, so
   `data.json` compresses to 0.70 MB instead of 0.94 MB.
@@ -273,10 +301,10 @@ For every pytest **command** the data is stored in a dedicated ref:
 
 ```
 refs/less/<shard>   →  lightweight commit
-                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...], "doc_readers":[...], "bdocs":[hash per block-table entry]}
+                            ├── data.json   {"version":2, "blocks":[[file,block,hash]...], "tests":{nodeid:[block-id...]}, "import_deps":[...], "failed":[...], "always":[...], "spawn_unknown":false, "dynamic":[...]}
                             ├── meta.json   {"version":1, "shard":..., "base_commit":..., "created":...}
                             ├── files.json  {"v":1, "at":ns, "files":{file:[size, mtime_ns, hash]}, "dirs":{dir:[subdirs]}}
-                            └── parse.json  {"v":3, "py":"3.13", "files":{file:{"h":content-hash, "b":{block:[hash,docs-hash]}, "s":spans, "m":markers, "r":reads-docs}}}
+                            └── parse.json  {"v":3, "py":"3.13", "files":{file:{"h":content-hash, "b":{block:hash}, "s":[[first-line, block]...], "m":markers-or-null}}}
 ```
 
 - The shard key is a hash of the **normalized** invocation arguments
