@@ -43,6 +43,13 @@ _SYNC_ENV = {"GIT_TERMINAL_PROMPT": "0"}
 _SYNC_TIMEOUT = 30.0
 
 
+def _compact(obj) -> bytes:
+    """JSON without the padding after ``,`` and ``:`` -- ~15% fewer bytes to
+    compress, hash and write for the big index lists, readable by any JSON
+    reader."""
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
 def _parse_iso(value) -> object:
     if not value or not isinstance(value, str):
         return None
@@ -358,13 +365,13 @@ class GitStore:
         self, data: dict, meta: dict, parse: dict | None, snapshot: dict | None
     ) -> None:
         files = {
-            "data.json": json.dumps(data).encode(),
-            "meta.json": json.dumps(meta).encode(),
+            "data.json": _compact(data),
+            "meta.json": _compact(meta),
         }
         reuse: dict[str, str] = {}
         for name, content in (("parse.json", parse), ("files.json", snapshot)):
             if content is not None:
-                files[name] = json.dumps(content).encode()
+                files[name] = _compact(content)
             else:
                 # Carry the stored blob over by id (it may even be packed).
                 existing = self._repo.blob_sha_in_ref(self.ref, name)

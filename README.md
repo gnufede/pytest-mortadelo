@@ -142,6 +142,66 @@ signal (`getattr`/`setattr` with computed names, `__getattr__`).
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
 
+#### What recording costs, and where it goes
+
+On the sqlalchemy ORM subset (2,480 tests; plain pytest ≈ 9–10 s) a record run
+adds **+3.0 s with a warm repository cache and +6.0 s cold** (it was +4.5 s and
++7.5 s before the work below). Layers measured by ablation (variants of the
+same run with parts switched off); the last row is what remains by subtraction:
+
+| layer (warm, 2.4M events) | cost |
+|---|---|
+| CPython itself: dispatch + re-instrumenting after each `restart_events()` (a no-op Python callback, nothing else) | ~1.1 s |
+| the callback's lookup | ~0.4 s |
+| first-start analysis of 11.6k code objects | ~0.2 s (was 0.6) |
+| bucket update, `finish` (0.35 s), hooks and wrappers (by subtraction) | ~1.3 s |
+
+What was done, in order of effect:
+
+- **Lookup by `id(code)`, not by the code object** (−0.7 s). `dict.get(code)`
+  *hashes the code object*, which walks its constants, names and nested code:
+  226 ns on average on real sqlalchemy code, 2–5 µs for the heavy functions
+  that run in nearly every test (`assert_compile`, `visit_insert`), against
+  37 ns for the int. The cell keeps the code object alive, so an id is never
+  reused.
+- **A held reference to the current bucket's set** (−0.2 s). The callback does
+  `sink.update(deps)`; the old `_bucket()` was a method call with phase checks
+  and a `setdefault(nodeid, set())` that allocated a throwaway empty set on
+  every event.
+- **Byte scan for imports instead of `dis`** (−0.65 s warm). The analysis looks
+  for `IMPORT_NAME` / `IMPORT_FROM` to over-approximate import dependencies;
+  `dis.get_instructions` decoded whole module-level code objects in pure Python
+  (~1 ms each) to find a few instructions. The scan finds the two opcodes in the
+  raw bytecode (cost ∝ number of imports) and defers to `dis` for anything that
+  is not the plain `LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME` shape,
+  and on Python 3.12. It agrees with `dis` on all 5,171 import instructions of
+  the 3.13 standard library and this repository.
+- `finish`: file sets derived from the few thousand distinct blocks instead of
+  1.6M generator steps (−0.08 s); compact JSON and a sorted block table, so
+  `data.json` compresses to 0.70 MB instead of 0.94 MB.
+
+What did **not** help, so nobody has to try it again:
+
+- Instrumenting only repo code with *local* events (so the third of callbacks
+  that are stdlib/pytest never fire): prototyped, saves 0.4 s (−13%), and a
+  missed code object would silently lose a dependency. Rejected.
+- Attributing at module granularity or sampling tests: unsound or loses the
+  per-test precision that is the point.
+- Re-arming selectively: `restart_events()` is global and `DISABLE` cannot be
+  undone per location, so the fire count (≈ 985 distinct code objects per test)
+  is the floor of an event-driven design.
+- pytest's capture machinery looked guilty in a sampling profile (`suspend` /
+  `resume` absorbed 38% of the extra samples); the tax is identical with
+  `-s`, `--capture=sys` and `--capture=fd` — a sampling artifact (syscalls
+  release the GIL).
+
+The dependencies recorded are unchanged by all this: re-recording with the old
+and new code (hash seed fixed, GC off) agrees on 1.64M (test, block) pairs to
+within the run-to-run noise of the *same* code (6 vs 7 tests of 2,480). With the
+GC on, which test a weakref/`gc` callback lands in (`_remove_linecache_entry`,
+`_collection_gced`, …) depends on allocation timing, so it moves between runs
+of any version.
+
 ### 2. Storage: JSON shards in git refs (never a commit)
 
 For every pytest **command** the data is stored in a dedicated ref:

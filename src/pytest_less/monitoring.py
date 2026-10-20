@@ -110,16 +110,16 @@ def _candidate_tool_ids():
         if tool_id not in _PREFERRED_TOOL_IDS:
             yield tool_id
 
-# Sentinel for "no cache cell for this code object yet" (distinct from a
-# cached empty dependency set, which is a legitimate cell).
-_NO_CELL = object()
-
 try:
     _IMPORT_NAME_OP = opcode.opmap["IMPORT_NAME"]
     _IMPORT_FROM_OP = opcode.opmap["IMPORT_FROM"]
+    _EXTENDED_ARG_OP = opcode.opmap["EXTENDED_ARG"]
+    _LOAD_CONST_OP = opcode.opmap["LOAD_CONST"]
 except KeyError:  # pragma: no cover - future bytecode without import ops
     _IMPORT_NAME_OP = None
     _IMPORT_FROM_OP = None
+    _EXTENDED_ARG_OP = None
+    _LOAD_CONST_OP = None
 
 # On Python 3.13+ code.co_code returns the original (unadaptive) bytecode
 # snapshot, so a byte-level presence test for the import opcodes is sound:
@@ -135,6 +135,13 @@ _FAST_IMPORT_PRECHECK = sys.version_info >= (3, 13) and _IMPORT_NAME_OP is not N
 # object after attribution would lose its events for all later tests, so the
 # callback keeps the always-firing behavior instead.
 _REARM = _sys_monitoring is not None and hasattr(_sys_monitoring, "restart_events")
+# What the callback returns: DISABLE silences a code object until the next
+# restart_events().  Dep-less code is silenced unconditionally; code with
+# dependencies only when the per-test re-arm is available (otherwise it must
+# keep firing).  Module constants: one global lookup instead of an attribute
+# chain and a branch per call.
+_DISABLE = _sys_monitoring.DISABLE if _sys_monitoring is not None else None
+_DISABLE_ATTRIBUTED = _DISABLE if _REARM else None
 
 
 def _use_tool(tool_id: int, name: str) -> None:
@@ -159,6 +166,80 @@ def _operand_name(code, instruction) -> str | None:
     except (IndexError, TypeError):
         return None
     return value if isinstance(value, str) else None
+
+
+def _imports_via_dis(code) -> list[tuple[str, str | None, int]]:
+    """``[(op, name, level)]`` for every IMPORT_NAME / IMPORT_FROM, via ``dis``.
+
+    The reference implementation: correct on every supported version, but it
+    decodes the *whole* code object in pure Python (~1 ms for a module-level
+    block) just to find a handful of instructions.
+    """
+    instrs = list(dis.get_instructions(code, show_caches=False))
+    out: list[tuple[str, str | None, int]] = []
+    for i, ins in enumerate(instrs):
+        if ins.opname == "IMPORT_NAME":
+            out.append(("IMPORT_NAME", _operand_name(code, ins), _static_level(instrs, i)))
+        elif ins.opname == "IMPORT_FROM":
+            out.append(("IMPORT_FROM", _operand_name(code, ins), 0))
+    return out
+
+
+def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
+    """The same list, found by scanning the raw bytecode for the two opcodes.
+
+    Cost is proportional to the number of imports, not to the size of the
+    code.  Python >= 3.13 only (``co_code`` is the un-instrumented, un-adapted
+    original there, which the byte-level import precheck already relies on).
+    Returns ``None`` -- use ``dis`` -- whenever the surrounding instructions
+    are not the plain ``LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME``
+    shape, so an unusual code path can never produce a different answer.
+    """
+    co = code.co_code
+    names = code.co_names
+    consts = code.co_consts
+    hits: list[tuple[int, int]] = []  # (byte offset, opcode)
+    for op in (_IMPORT_NAME_OP, _IMPORT_FROM_OP):
+        marker = bytes((op,))
+        pos = co.find(marker)
+        while pos != -1:
+            if pos % 2 == 0:  # an opcode, not the argument byte of the previous unit
+                hits.append((pos, op))
+            pos = co.find(marker, pos + 1)
+    hits.sort()
+    out: list[tuple[str, str | None, int]] = []
+    for pos, op in hits:
+        arg = co[pos + 1]
+        start = pos
+        shift = 8
+        while start >= 2 and co[start - 2] == _EXTENDED_ARG_OP:
+            arg |= co[start - 1] << shift
+            shift += 8
+            start -= 2
+        try:
+            name = names[arg]
+        except IndexError:
+            return None
+        if not isinstance(name, str):
+            return None
+        if op == _IMPORT_FROM_OP:
+            out.append(("IMPORT_FROM", name, 0))
+            continue
+        # ``LOAD_CONST level; LOAD_CONST fromlist; IMPORT_NAME``: the level is
+        # the instruction two before (what ``_static_level`` reads from dis).
+        # Only the plain shape is decoded here -- both loads single-unit, no
+        # EXTENDED_ARG prefix on the level -- anything else defers to dis.
+        if (
+            start < 4
+            or co[start - 2] != _LOAD_CONST_OP
+            or co[start - 4] != _LOAD_CONST_OP
+            or (start >= 6 and co[start - 6] == _EXTENDED_ARG_OP)
+        ):
+            return None
+        value = consts[co[start - 3]]
+        level = value if isinstance(value, int) else 0
+        out.append(("IMPORT_NAME", name, level))
+    return out
 
 
 def _static_level(instrs, index: int) -> int:
@@ -294,7 +375,16 @@ class FileMonitor:
         self._key: tuple = ("import",)  # current attribution bucket
         self.import_deps: set[Block] = set()
         self.collect_deps: set[Block] = set()
-        self.test_deps: dict[str, set[Block]] = {}
+        self._test_deps: dict[str, set[Block]] = {}
+        # Where the callback puts dependencies right now: the current bucket's
+        # set, held directly so the hot path is ``sink.update(deps)`` -- no
+        # method call, no phase checks, no ``setdefault(nodeid, set())`` that
+        # allocated a throwaway set on every event.  Swapped when the bucket
+        # changes (``_update_key``) or the test spawns a process.
+        self._trash: set[Block] = set()  # attribution that is not recorded
+        self._cur_nid: str | None = None
+        self._cur_set: set[Block] | None = None
+        self._sink: set[Block] = self.import_deps
         # Subprocess boundary: tests that spawned a process during
         # their run, plus a shared mark for collect-phase spawns (affects
         # every test -- same policy as the import-time bucket).
@@ -316,18 +406,23 @@ class FileMonitor:
         # path (~7M redundant dispatches per sqlalchemy run), and could lose
         # deps for code that only ever executes in busy regions.
         self._pending: list = []
-        # code object -> mutable [deps, last_bucket] cell.  Strong refs keep
-        # the code objects (and their ids) alive for the whole run.  Deps are
-        # re-attributed only when the bucket changes, so a code block that
-        # starts a thousand times inside one test costs a tuple comparison
-        # per event after the first.
-        self._code_cache: dict = {}
+        # id(code object) -> mutable [deps, last_bucket, code] cell.  The cell
+        # holds the code object, so its id stays valid (never reused) for the
+        # whole run.  Keyed by id, not by the code object: ``dict.get(code)``
+        # *hashes the code object*, which walks its constants, names and
+        # nested code -- 226 ns on average for real sqlalchemy code, 2-5 us for
+        # the heavy functions that run in nearly every test, against 37 ns for
+        # the int.  Deps are re-attributed only when the bucket changes, so a
+        # code block that starts a thousand times inside one test costs a tuple
+        # comparison per event after the first.
+        self._code_cache: dict[int, list] = {}
         self._spec_cache: dict[str, str | None] = {}
         self._module_index: dict[str, str] | None = None
         self._resolve_cache: dict[
             tuple[str | None, int, str | None], tuple[frozenset[str], str | None]
         ] = {}
         self._pkg_prefix_cache: dict[str, list[str]] = {}
+        self._dotted_cache: dict[str, frozenset[str]] = {}
 
     # -- phase / attribution target ------------------------------------
 
@@ -349,13 +444,49 @@ class FileMonitor:
         self._nodeid = value
         self._update_key()
 
+    @property
+    def test_deps(self) -> dict[str, set[Block]]:
+        """Per-test dependency sets.  An entry exists once its test has
+        recorded something (a test that executed no repository code has none,
+        exactly as before); the current test's set is published on access."""
+        self._publish_current()
+        return self._test_deps
+
+    def _publish_current(self) -> None:
+        nodeid, current = self._cur_nid, self._cur_set
+        if nodeid is not None and current and nodeid not in self._test_deps:
+            self._test_deps[nodeid] = current
+
+    def _select_sink(self) -> None:
+        """Point ``_sink`` at the bucket for the current phase / test."""
+        phase, nodeid = self._phase, self._nodeid
+        if phase == "test" and nodeid is not None:
+            if nodeid in self.spawn_tests:
+                self._cur_nid, self._cur_set = nodeid, None
+                self._sink = self._trash
+            else:
+                existing = self._test_deps.get(nodeid)
+                current = existing if existing is not None else set()
+                self._cur_nid, self._cur_set = nodeid, current
+                self._sink = current
+            return
+        self._cur_nid = self._cur_set = None
+        if phase == "collect":
+            self._sink = self.collect_deps
+        elif phase == "import":
+            self._sink = self.import_deps
+        else:  # "done", or a test phase between tests
+            self._sink = self._trash
+
     def _update_key(self) -> None:
         if self._phase == "test" and self._nodeid is not None:
             new_key = ("test", self._nodeid)
         else:
             new_key = (self._phase,)
         if new_key != self._key:
+            self._publish_current()  # the finished test's set, before moving on
             self._key = new_key
+            self._select_sink()
             # Attribution bucket changed (the next test started): re-arm
             # every silenced code object so its dependency is attributed to
             # the new test on its next start.  Note that restart_events()
@@ -571,7 +702,9 @@ class FileMonitor:
             return
         try:
             if self._phase == "test" and self._nodeid is not None:
+                self._publish_current()  # what it recorded before the spawn stays
                 self.spawn_tests.add(self._nodeid)
+                self._sink = self._trash  # collection stops for this test
             elif self._phase == "collect":
                 self.spawn_shared = True
         except Exception:  # pragma: no cover - never break the call we wrap
@@ -642,27 +775,26 @@ class FileMonitor:
         Never let a monitoring bug break the user's test run.
         """
         try:
-            cell = self._code_cache.get(code, _NO_CELL)
-            if cell is _NO_CELL:
+            cell = self._code_cache.get(id(code))
+            if cell is None:
                 return self._first_start(code)
-            if cell[1] is self._key:
+            key = self._key
+            if cell[1] is key:
                 # Already attributed to this bucket: re-silence.  A foreign
                 # restart_events() (another monitor in this process, or a
                 # co-resident tool) may have re-armed us; this restores the
                 # one-event-per-bucket invariant without extra work.
-                return _sys_monitoring.DISABLE if _REARM else None
+                return _DISABLE_ATTRIBUTED
             deps = cell[0]
             if not deps:
-                return _sys_monitoring.DISABLE
-            self._bucket(deps)
-            cell[1] = self._key
+                return _DISABLE
+            self._sink.update(deps)
+            cell[1] = key
             # Attributed to the current bucket: silence this code object
             # until the bucket changes (the next test start re-arms everything
             # via restart_events()).  A code block that runs a thousand times
             # inside one test now fires exactly once for it.
-            if _REARM:
-                return _sys_monitoring.DISABLE
-            return None
+            return _DISABLE_ATTRIBUTED
         except Exception:  # pragma: no cover - defensive
             return None
 
@@ -684,7 +816,7 @@ class FileMonitor:
                 # of Python-level calls -- re-entered the cold path as an
                 # uncached miss (~7M redundant dispatches per sqlalchemy
                 # run).
-                self._code_cache[code] = [frozenset(), None]
+                self._code_cache[id(code)] = [frozenset(), None, code]
                 return _sys_monitoring.DISABLE
             self._pending.append(code)
             return None
@@ -695,8 +827,8 @@ class FileMonitor:
             deps = frozenset()
         finally:
             self._busy = False
-        cell = [deps, None]
-        self._code_cache[code] = cell
+        cell = [deps, None, code]
+        self._code_cache[id(code)] = cell
         if deps:
             self._bucket(deps)
             cell[1] = self._key
@@ -711,7 +843,7 @@ class FileMonitor:
         """Analyze code objects that first started inside a busy region."""
         while self._pending:
             code = self._pending.pop()
-            cell = self._code_cache.get(code)
+            cell = self._code_cache.get(id(code))
             if cell is not None:
                 # Queued and analyzed since (nested drains): just keep the
                 # attribution current.
@@ -722,18 +854,9 @@ class FileMonitor:
             self._first_start(code)  # busy is False here; nested events re-queue
 
     def _bucket(self, deps) -> None:
-        phase = self._phase
-        if phase == "test":
-            nodeid = self._nodeid
-            # A test that spawned a process is no longer recorded: its
-            # dependencies would be incomplete, so collection stops and the
-            # recorder drops it (it is simply re-run next time).
-            if nodeid is not None and nodeid not in self.spawn_tests:
-                self.test_deps.setdefault(nodeid, set()).update(deps)
-        elif phase == "collect":
-            self.collect_deps.update(deps)
-        elif phase == "import":
-            self.import_deps.update(deps)
+        """Attribute *deps* to the current bucket (cold paths; the hot path
+        updates ``_sink`` directly)."""
+        self._sink.update(deps)
 
     # -- analysis ------------------------------------------------------
 
@@ -782,12 +905,11 @@ class FileMonitor:
                 # check over the original snapshot): nothing to resolve.
                 return frozenset(deps)
         last_full: str | None = None
-        instrs = list(dis.get_instructions(code, show_caches=False))
-        for i, ins in enumerate(instrs):
-            op = ins.opname
+        events = _imports_via_bytes(code) if _FAST_IMPORT_PRECHECK else None
+        if events is None:
+            events = _imports_via_dis(code)
+        for op, name, level in events:
             if op == "IMPORT_NAME":
-                name = _operand_name(code, ins)
-                level = _static_level(instrs, i)
                 resolved, full = self._resolve_module(name, level, own)
                 for rel in resolved:
                     # Importing a module executes its module-level code: the
@@ -799,7 +921,7 @@ class FileMonitor:
                 # ``from pkg import attr`` where attr is a submodule.  If it
                 # is a plain attribute the resolution simply fails and we
                 # skip it -- conservative in the right direction.
-                attr = _operand_name(code, ins)
+                attr = name
                 if attr and last_full:
                     for rel in self._resolve_dotted(f"{last_full}.{attr}"):
                         deps.add(self._blocks.module_dep(rel))
@@ -845,13 +967,17 @@ class FileMonitor:
 
     def _resolve_dotted(self, dotted: str) -> frozenset[str]:
         """Resolve a dotted module path, including every ancestor package."""
+        cached = self._dotted_cache.get(dotted)
+        if cached is not None:
+            return cached
         files: set[str] = set()
         parts = [p for p in dotted.split(".") if p]
         for i in range(1, len(parts) + 1):
             origin = self._spec_origin(".".join(parts[:i]))
             if origin:
                 files.add(origin)
-        return frozenset(files)
+        result = self._dotted_cache[dotted] = frozenset(files)
+        return result
 
     def module_dep(self, rel: str) -> Block:
         """Import-time dependency on a module (its skeleton)."""

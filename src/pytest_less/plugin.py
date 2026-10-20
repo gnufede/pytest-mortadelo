@@ -871,7 +871,8 @@ class LessState:
             own = monitor.test_deps.get(nodeid)
             if own is not None and nodeid in self.finished:
                 extra = module_collect.get(module_rel, set()) if module_rel else set()
-                tests[nodeid] = own | extra
+                # (no copy when there is nothing to add: the monitor is done)
+                tests[nodeid] = own | extra if extra else own
             elif nodeid in old_tests:
                 # Not run this time (deselected or interrupted): keep the
                 # previous block set; the shared import deps cover the rest.
@@ -956,9 +957,15 @@ class LessState:
         # filled below next to the block table).  Unchanged files keep their
         # previous info: re-deriving it would re-parse every dependency file,
         # which a run that executed a few tests has not parsed.
-        doc_files: set[str] = {b[0] for b in import_blocks}
+        # The distinct blocks (a few thousand) already contain every file any
+        # test depends on: derive the file sets from them instead of walking
+        # every test's every block (1.6M generator steps, twice, on a 2.5k-test
+        # suite).
+        distinct: set[Block] = set(import_blocks)
         for deps in tests.values():
-            doc_files.update(b[0] for b in deps)
+            distinct.update(deps)
+        dep_files: set[str] = {b[0] for b in distinct}
+        doc_files = dep_files
         old_readers = old_shard.doc_readers if old_shard is not None else set()
         old_bdocs = old_shard.block_docs if old_shard is not None else {}
         changed_now = self.changed
@@ -994,25 +1001,20 @@ class LessState:
 
         # Serialize with a dedup table: shared blocks (import-time and
         # common helpers) are stored once.
-        table: dict[Block, int] = {}
-        ordered: list[Block] = []
-
-        def index(block: Block) -> int:
-            i = table.get(block)
-            if i is None:
-                i = len(ordered)
-                ordered.append(block)
-                table[block] = i
-            return i
+        # Every distinct block is indexed once; each test's list is then a
+        # C-speed lookup (``map`` over a dict) instead of ~1.6M Python-level
+        # ``index()`` calls on a 2.5k-test suite.  The table is sorted, so a
+        # file's blocks are adjacent and the (sorted) per-test index lists
+        # become runs -- which also compresses better.
+        ordered: list[Block] = sorted(distinct)
+        table: dict[Block, int] = {b: i for i, b in enumerate(ordered)}
+        lookup = table.__getitem__
 
         data = {
             "version": DATA_VERSION,
             "blocks": [list(b) for b in ordered],  # filled below
-            "tests": {
-                nid: sorted({index(b) for b in tests[nid]})
-                for nid in sorted(tests)
-            },
-            "import_deps": sorted({index(b) for b in import_blocks}),
+            "tests": {nid: sorted(map(lookup, tests[nid])) for nid in sorted(tests)},
+            "import_deps": sorted(map(lookup, import_blocks)),
             "failed": sorted(self.failed),
             # Tests that spawned a process: no dependencies, re-run every
             # time.  ``spawn_unknown``: the culprit of a collect-phase spawn
@@ -1028,9 +1030,6 @@ class LessState:
         }
         data["blocks"] = [list(b) for b in ordered]
         data["bdocs"] = [doc_for(b) for b in ordered]
-        dep_files: set[str] = {b[0] for b in import_blocks}
-        for deps in tests.values():
-            dep_files.update(b[0] for b in deps)
         meta = {
             "version": 1,
             "shard": self.store.shard,
