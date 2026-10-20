@@ -184,7 +184,7 @@ def read_parse(project):
 
 
 def parse_note(result):
-    m = re.search(r"parse cache: (\d+) hit\(s\), (\d+) file\(s\) parsed", result.stdout.str())
+    m = re.search(r"parse cache: (\d+) hit\(s\)(?: \(\d+ from the repository cache\))?, (\d+) file\(s\) parsed", result.stdout.str())
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
@@ -298,3 +298,151 @@ class TestKillSwitch:
         assert parse_note(result) is None
         after = git(project.path, "rev-parse", f"{ref}:parse.json").stdout.strip()
         assert after == before
+
+
+# ---------------------------------------------------------------------------
+# The repository-wide store: every shard of a repository shares what any of
+# them parsed (one tiny file per content hash under the git directory).
+
+
+class TestLocalStore:
+    @pytest.fixture
+    def store(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore
+
+        return LocalParseStore(tmp_path / "store")
+
+    def entry(self, source=SRC):
+        from pytest_less.blocks import _file_to_json
+
+        return _file_to_json(parse_blocks(source, cosmetic=True))
+
+    def test_put_get_round_trip_and_atomic_layout(self, store):
+        assert store.get("ab" * 16) is None
+        assert store.put("ab" * 16, {"x": 1}) is True
+        assert store.get("ab" * 16) == {"x": 1}
+        assert store.put("ab" * 16, {"x": 2}) is False  # never overwritten
+        assert store.get("ab" * 16) == {"x": 1}
+        leftovers = list(store.directory.rglob(".tmp-*"))
+        assert leftovers == []
+
+    def test_corrupt_file_is_a_miss(self, store):
+        store.put("cd" * 16, {"x": 1})
+        (store.directory / "cd" / f"{'cd' * 16}.json").write_text("{not json")
+        assert store.get("cd" * 16) is None
+
+    def test_eviction_keeps_the_newest(self, store):
+        import os
+
+        digests = [f"{i:02x}" * 16 for i in range(10)]
+        for n, digest in enumerate(digests):
+            store.put(digest, {"n": n})
+            os.utime(store.directory / digest[:2] / f"{digest}.json", (1000 + n, 1000 + n))
+        assert store.evict(limit=5) == 6  # down to 90% of the limit: 4 left
+        assert store.get(digests[0]) is None and store.get(digests[-1]) == {"n": 9}
+
+    def test_python_version_and_mode_get_separate_directories(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore
+
+        a = LocalParseStore.at(tmp_path, cosmetic=True).directory
+        b = LocalParseStore.at(tmp_path, cosmetic=False).directory
+        assert a != b and "pytest-less" in a.parts
+
+
+class TestSharedAcrossShards:
+    def cache(self, store, stored=None, cosmetic=True):
+        return ParseCache((lambda: stored) if stored else None, cosmetic=cosmetic, local=store)
+
+    def test_a_second_shard_reuses_what_the_first_parsed(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore
+
+        store = LocalParseStore(tmp_path / "store")
+        (tmp_path / "w").mkdir()
+        (tmp_path / "w" / "m.py").write_text(SRC)
+        first = self.cache(store)
+        a = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=first)
+        fb = a.file_blocks("m.py")
+        assert (a.hits, a.misses) == (0, 1)
+        assert first.flush_local() == 1
+
+        # a different shard: its own (empty) parse.json -- yet no parse needed
+        second = self.cache(store)
+        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=second)
+        again = b.file_blocks("m.py")
+        assert (b.hits, b.misses, second.local_hits) == (1, 0, 1)
+        assert fields(again) == fields(fb)
+        # and it is adopted into that shard's own blob
+        assert second.dump({"m.py"})["files"]["m.py"]["h"] == first.used["m.py"]
+        assert second.flush_local() == 0  # nothing new to publish
+
+    def test_the_same_bytes_at_another_path_share_an_entry(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore
+
+        store = LocalParseStore(tmp_path / "store")
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+            (tmp_path / name / "m.py").write_text(SRC)
+        first = self.cache(store)
+        BlockCache(tmp_path / "one", cosmetic=True, parse_cache=first).file_blocks("m.py")
+        first.flush_local()
+        second = self.cache(store)
+        other = BlockCache(tmp_path / "two", cosmetic=True, parse_cache=second)
+        other.file_blocks("m.py")
+        assert other.misses == 0
+
+    def test_changed_bytes_are_a_miss_never_a_stale_hit(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore
+
+        store = LocalParseStore(tmp_path / "store")
+        (tmp_path / "w").mkdir()
+        (tmp_path / "w" / "m.py").write_text(SRC)
+        first = self.cache(store)
+        BlockCache(tmp_path / "w", cosmetic=True, parse_cache=first).file_blocks("m.py")
+        first.flush_local()
+        (tmp_path / "w" / "m.py").write_text(SRC.replace("return 1", "return 2"))
+        second = self.cache(store)
+        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=second)
+        fb = b.file_blocks("m.py")
+        assert (b.hits, b.misses) == (0, 1)
+        assert fb.blocks["f"] == parse_blocks(SRC.replace("return 1", "return 2"), cosmetic=True).blocks["f"]
+
+    def test_a_corrupt_local_entry_degrades_to_a_parse(self, tmp_path):
+        from pytest_less.blocks import LocalParseStore, _content_hash
+
+        store = LocalParseStore(tmp_path / "store")
+        (tmp_path / "w").mkdir()
+        (tmp_path / "w" / "m.py").write_text(SRC)
+        digest = _content_hash(SRC.encode())
+        store.put(digest, {"b": "garbage"})
+        b = BlockCache(tmp_path / "w", cosmetic=True, parse_cache=self.cache(store))
+        assert b.file_blocks("m.py") is not None and b.hits == 0
+
+
+class TestSharedEndToEnd:
+    @pytest.fixture(autouse=True)
+    def _in_process_layer(self, monkeypatch):
+        # The store lives under the git directory, which only the in-process
+        # layer knows; with PYTEST_LESS_GIT_BACKEND=subprocess there is none.
+        monkeypatch.delenv("PYTEST_LESS_GIT_BACKEND", raising=False)
+
+    def test_a_different_command_does_not_re_parse(self, project):
+        run_less(project, "-q").assert_outcomes(passed=2)
+        # another shard (the argument is part of the key): cold shard, warm repo
+        result = run_less(project, "-v", "tests/test_a.py")
+        result.assert_outcomes(passed=1)
+        hits, parsed = parse_note(result)
+        assert parsed == 0 and hits >= 1
+        result.stdout.fnmatch_lines(["*from the repository cache*"])
+
+    def test_the_store_lives_inside_the_git_directory(self, project):
+        run_less(project, "-q")
+        entries = list((project.path / ".git" / "pytest-less").rglob("*.json"))
+        assert entries, "expected parse entries under .git/pytest-less"
+        # nothing leaked into the working tree
+        status = git(project.path, "status", "--porcelain", "-uall").stdout
+        assert "pytest-less" not in status
+
+    def test_the_kill_switch_disables_it_too(self, project, monkeypatch):
+        monkeypatch.setenv("PYTEST_LESS_PARSE_CACHE", "0")
+        run_less(project, "-q").assert_outcomes(passed=2)
+        assert not (project.path / ".git" / "pytest-less").exists()

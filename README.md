@@ -108,8 +108,10 @@ are wrapped (`subprocess.Popen`, `os.system`, `os.fork`/`forkpty`,
 which also covers `multiprocessing`). Coverage cannot follow a
 child process, so when a test spawns one the monitor **stops collecting for
 that test, writes no dependencies for it, and lists it in the shard's
-`always` key: it re-runs every time** (reported as `N always re-run (spawn
-subprocesses)`; a recorded spawner also rules out the no-change fast path).
+`always` key: it re-runs whenever anything changed** (reported as `N always
+re-run (spawn subprocesses)`) — *unless* the state is **pristine**, in which
+case "no change" beats "always run" and it is skipped like everything else
+(see below).
 The classic e2b blind spot — edit the child-only `worker.py`, watch the test
 fail with "0 tests selected" — cannot happen. A test that stops spawning is
 recorded normally again on its next run. A spawn during *collection* has an
@@ -253,6 +255,44 @@ refs/less/<shard>   →  lightweight commit
     never ran as must-rerun: the snapshot is refreshed by that run, so a test
     that kept its old block hashes would otherwise look fresh.
 
+- **Pristine: "no change" beats "always run".** A test that spawns a process
+  has no recorded dependencies (coverage cannot follow a child), so it used to
+  re-run on *every* run — on this repo's own suite 198 of 400 tests, which made
+  a rerun with nothing changed take 41.9 s, the same as a cold run. The reason
+  for the rule also says when it can be relaxed: if nothing observable changed,
+  the outcome is last time's outcome. A state is **pristine** only when all of
+  these hold, and otherwise the old behavior applies:
+  1. the change check reports nothing;
+  2. `HEAD` is still the commit the shard was recorded at (an in-process read —
+     a new commit, even an empty one, wakes the spawners once; the re-record
+     makes the state pristine again);
+  3. that check covered everything a child could read. `git diff` + untracked
+     covers the whole repository; fingerprints only cover what they watch, so
+     when a recorded test spawns, the snapshot is **widened** at record time to
+     every tracked file (`"all": true`, one `git ls-files`, capped at 30,000
+     files — beyond that nothing is widened and spawners keep re-running;
+     files over 1 MB are fingerprinted by stat alone, a differing mtime counting
+     as a change) and lists every file name in the watched directories, so even
+     a brand-new untracked file only a child could read counts as a change
+     (hidden and gitignored files do not).
+
+  Measured on this suite: rerun with nothing changed 41.9 s → 0.4 s, no git
+  process spawned. Honest limits: a file read **only by a child** that is
+  untracked *and* sits in a directory no dependency lives in, or a tracked
+  file's content changed without its mtime/size changing on an old file
+  (the same blind spot as git's stat cache), is not seen.
+- **Repository-wide parse store.** The shard's `parse.json` only knows what that
+  one command recorded, so a different command (`pytest tests/unit` after
+  `pytest tests`), a cleaned shard, or a new branch's first record parsed
+  unchanged files again. `<git-dir>/pytest-less/parse-*` holds one tiny file per
+  **content hash** (so two paths with identical bytes share an entry, a lookup
+  is one small read, and nothing is rewritten), keyed per Python minor version
+  and cosmetic setting, written atomically, and bounded to 8,000 entries
+  (oldest evicted). Like every cache here it is only trusted for the exact
+  bytes it was built from. On the sqlalchemy subset: record 15.4 s → 12.8 s
+  with the shard gone but the repository warm (220 files, 0 parsed).
+  `PYTEST_LESS_PARSE_CACHE=0` disables it along with `parse.json`.
+
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 
 #### Automatic sync (recommended)
@@ -392,8 +432,8 @@ from the shard's recorded fingerprints, plus new project `.py` files (see
   (reported as `N widened by dynamic markers`) — reflective edges are the
   one place a recording can disagree with the next run, so this widens on
   purpose. The staleness gate keeps cosmetic edits from widening, and
-- the test is a **spawner** (`always`): it runs every time (`N always re-run`);
-  under `spawn_unknown`, every test runs when a changed `.py` file is stale
+- the test is a **spawner** (`always`) and the state is not pristine: it runs
+  (`N always re-run`); under `spawn_unknown`, every test runs when a changed `.py` file is stale
   or was never recorded (`N selected by the subprocess rule`),
 - the test is **runtime-dynamic** and some changed `.py` file was never
   recorded (`N selected as runtime-dynamic`), or
@@ -427,9 +467,11 @@ reading.) The filter turns itself off under `--doctest-modules` /
   (an edit inside one branch re-runs tests exercising another). Deliberate:
   finer units need line-level recording, which is the storage curve that
   killed line-level formats (IMPROVEMENTS item 11 has the full analysis).
-- Spawners always re-run — the price of fail-safe: a suite whose tests
-  shell out heavily (this repo's own pytester tests: ~half the suite) gets
-  little skipping from them. Spawns made by a conftest *at startup* are not
+- Spawners re-run on *any* change — the price of fail-safe: a suite whose
+  tests shell out heavily (this repo's own pytester tests: ~half the suite)
+  gets little skipping from them once something changed (an edit, even a
+  comment, wakes them all; only a rerun with nothing changed is free).
+  Spawns made by a conftest *at startup* are not
   tracked (their in-process effects still are, via the import-time bucket),
   and child reads of data files are not tracked (data-file tracking covers
   the pytest process only). Monitoring inside the child would be the
