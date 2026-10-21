@@ -354,35 +354,28 @@ refs/less/<shard>   →  lightweight commit
   lives in the shard it travels with `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
   dependency set. A cold first record parses everything, as before.
 
-- **Git spawn budget.** Every git call is a process spawn — a few ms on a quiet
-  machine, a quarter of a second where endpoint scanning slows `exec`. Most of
-  what the plugin asks git is plain file access, so `gitobjects.py` does it
-  in-process: finding the toplevel (a directory walk; plain repos, linked
-  worktrees and submodules), `HEAD`, refs (loose files, then `packed-refs`),
-  reading **loose** objects (`zlib` plus the `type size\0` header), and writing
-  the shard (loose blobs, a tree, a parentless commit, then the ref moved with
-  git's own `<ref>.lock` protocol). Writing the 12 MB shard takes 39 ms
-  against 165 ms and six spawns through `hash-object` / `mktree` /
-  `commit-tree` / `update-ref`; the trees it builds are byte-identical to
-  `git mktree`'s, and `git fsck --strict` is clean.
+- **Git spawn budget.** Every git call is a process spawn — about 10 ms from a
+  small process, several times that from inside a large pytest process, and a
+  quarter of a second where endpoint scanning slows `exec`. The plugin reads and
+  writes the shard through a handful of plumbing commands (`rev-parse`,
+  `cat-file`, `hash-object`, `mktree`, `commit-tree`, `update-ref`), and change
+  detection uses file fingerprints instead of asking git (next bullet). A cold
+  record or an edit that re-records spawns 13 git processes, a no-change rerun
+  3, and a run that selects nothing 5; the number is a constant, never per file
+  or per test, and tests pin that budget and that `git diff` / `git status` /
+  unscoped `ls-files` are never asked. `load_meta` and the fingerprints are
+  memoized on the run's single `GitStore` (invalidated by save / delete / sync
+  pull), and planning and selection share one context. A run that selects
+  nothing learned nothing new, so it does not rewrite the shard.
 
-  It deliberately does **not** model packed objects (git may pack the shard
-  later via `gc` / `maintenance`), alternates, SHA-256 repositories, reftable,
-  `GIT_DIR`-style relocation, or a held ref lock. In any of those cases — or
-  on any error — it steps aside and the original `git` command runs, so
-  correctness never depends on it applying; only speed does. Mixed use is
-  fine: a shard written in-process is an ordinary ref that git reads, and the
-  other way round. A clone's objects are packed, which the in-process reader
-  does not read, so on a fresh checkout reads go through `git` and writes (which
-  are always loose objects) stay in-process.
-
-  Change detection does not use git in the common case either (next bullet).
-  `load_meta` and the fingerprints are memoized on the run's single `GitStore`
-  (invalidated by save / delete / sync pull), and planning and selection share
-  one context. Result: a cold record, a no-change rerun, a run that selects
-  nothing, and an edit that re-records all spawn **no** git process (they used
-  to spawn 14, 10, 23 and 23). Tests pin the budget. A run that selects nothing
-  learned nothing new, so it does not rewrite the shard.
+  An earlier version did the plumbing in-process (a directory walk for the
+  toplevel, loose-object reads, writing the shard's blobs, tree, commit and ref
+  by hand) and spawned none. Measured over whole sessions it saved 30–135 ms per
+  run on a 30-test project (a record or a one-test edit ran about twice as fast)
+  and 40–500 ms on a 2,480-test suite (1–5%). That is not worth ~300 lines of
+  git-object code, a second code path for everything it did not model (packed
+  objects, SHA-256, reftable, a held lock) and the tests to keep the two
+  identical, so it was removed.
 - **File fingerprints (`files.json`).** `git diff <base>` plus `git ls-files
   --others` answer a question selection does not actually have: they report
   every file that differs from a commit, and the second one scans the whole
@@ -430,8 +423,7 @@ refs/less/<shard>   →  lightweight commit
   the outcome is last time's outcome. A state is **pristine** only when all of
   these hold, and otherwise the old behavior applies:
   1. the change check reports nothing;
-  2. `HEAD` is still the commit the shard was recorded at (an in-process read —
-     a new commit, even an empty one, wakes the spawners once; the re-record
+  2. `HEAD` is still the commit the shard was recorded at (a new commit, even an empty one, wakes the spawners once; the re-record
      makes the state pristine again);
   3. that check covered everything a child could read. `git diff` + untracked
      covers the whole repository; fingerprints only cover what they watch, so

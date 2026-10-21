@@ -98,7 +98,7 @@ class TestSkippedWhenNothingChanged:
         snapshot = GitStore(pytester.path, _shard(pytester)).load_files()
         assert snapshot["all"] is False and "unrelated.txt" not in snapshot["files"]
 
-    def test_pristine_rerun_spawns_no_git_process(self, child_project, tmp_path, monkeypatch):
+    def test_pristine_rerun_only_reads_the_shard_and_head(self, child_project, tmp_path, monkeypatch):
         run_less(child_project, "-q")
         real = shutil.which("git")
         log = tmp_path / "calls.log"
@@ -110,7 +110,15 @@ class TestSkippedWhenNothingChanged:
         monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
         result = child_project.run(sys.executable, "-m", "pytest", "--less", "-q")
         assert result.ret == 5
-        assert not log.exists() or log.read_text().strip() == ""
+        subs = [
+            next(w for w in line.split()[2:] if not w.startswith("-"))
+            for line in log.read_text().splitlines()
+            if line.strip()
+        ]
+        # the toplevel, HEAD (is it still the recorded commit?) and the shard
+        # blobs -- and never a question about the working tree
+        assert len(subs) <= 6, subs
+        assert not {"diff", "status", "ls-files", "add", "hash-object", "commit-tree"} & set(subs), subs
 
 
 class TestStillWokenByAnyChange:

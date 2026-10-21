@@ -663,14 +663,26 @@ def run_outside(project, *args):
     return project.run(sys.executable, "-m", "pytest", "--less", *args)
 
 
+def git_subcommands(calls: list[str]) -> list[str]:
+    """The git subcommand of each logged call (lines look like
+    ``-C <dir> [--option ...] <sub> ...``)."""
+    return [next(w for w in line.split()[2:] if not w.startswith("-")) for line in calls]
+
+
+# Change detection compares file fingerprints (fingerprint.py) instead of asking
+# ``git diff`` / ``git status`` / ``git ls-files --others``: 98 + 790 ms on a
+# 10k-file repository.  None of these may appear in a run, whatever it does.
+NEVER_ASKED = {"diff", "status", "diff-index", "diff-files", "add"}
+
+
 class TestGitSpawnBudget:
-    """Every git call is a process spawn: a few ms on a quiet machine, a
-    quarter of a second where endpoint scanning slows exec.  Refs, blobs,
-    HEAD, the toplevel and the shard write are in-process (gitobjects), and
-    change detection compares file fingerprints (fingerprint.py) instead of
-    asking ``git diff`` / ``git ls-files --others`` -- 98 + 790 ms on a
-    10k-file repository.  Git is only asked, once and about those paths
-    alone, when a *new* file or directory appears.  Pin it."""
+    """Every git call is a process spawn: ~10 ms from a small process, several
+    times that from inside a large pytest process, a quarter of a second where
+    endpoint scanning slows exec.  The shard is read and written through a
+    handful of plumbing commands, and change detection compares fingerprints.
+    Pin the shape: a small constant per run -- never per file or per test --
+    and git is only asked, once and about those paths alone, when a *new* file
+    or directory appears."""
 
     @pytest.fixture
     def counted(self, project, tmp_path, monkeypatch):
@@ -693,37 +705,48 @@ class TestGitSpawnBudget:
 
         return calls
 
-    def test_a_cold_record_spawns_no_git_at_all(self, project, counted):
+    def test_a_cold_record_has_a_small_constant_budget(self, project, counted):
         counted()
         result = run_outside(project, "-q")
         result.assert_outcomes(passed=2)
-        assert counted() == []
+        subs = git_subcommands(counted())
+        assert len(subs) <= 15, subs  # measured: 13 (4 reads, 7 for the shard write, 2 rev-parse)
+        assert not NEVER_ASKED & set(subs), subs
+        assert "ls-files" not in subs, subs
 
-    def test_no_change_rerun_spawns_no_git(self, project, counted):
+    def test_no_change_rerun_only_reads_the_shard(self, project, counted):
         run_outside(project, "-q")
         counted()  # discard the record run
         result = run_outside(project, "-q")
         assert result.ret == 5
-        assert counted() == []
+        subs = git_subcommands(counted())
+        assert len(subs) <= 4, subs  # measured: 3 (toplevel + two shard blobs)
+        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
+        assert not {"hash-object", "mktree", "commit-tree", "update-ref"} & set(subs), subs
 
-    def test_run_that_selects_nothing_spawns_no_git_and_rewrites_nothing(
-        self, project, counted
-    ):
+    def test_run_that_selects_nothing_rewrites_nothing(self, project, counted):
         run_outside(project, "-q")
         counted()
         # other.py is a dead-branch dependency: editing it stales nothing.
         (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
         result = run_outside(project, "-q")
         assert result.ret == 5
-        assert counted() == []
+        subs = git_subcommands(counted())
+        assert len(subs) <= 6, subs  # measured: 5
+        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
+        assert not {"hash-object", "mktree", "commit-tree", "update-ref"} & set(subs), subs
 
-    def test_an_edit_that_runs_tests_and_re_records_spawns_no_git(self, project, counted):
+    def test_an_edit_that_runs_tests_and_re_records_has_the_record_budget(
+        self, project, counted
+    ):
         run_outside(project, "-q")
         counted()
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         result = run_outside(project, "-q")
         result.assert_outcomes(passed=1)
-        assert counted() == []
+        subs = git_subcommands(counted())
+        assert len(subs) <= 15, subs  # measured: 13
+        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
 
     def test_a_new_file_costs_one_scoped_query(self, project, counted):
         run_outside(project, "-q")
@@ -731,8 +754,10 @@ class TestGitSpawnBudget:
         (project.path / "tests" / "extra.py").write_text("X = 1\n")
         run_outside(project, "-q")
         calls = counted()
-        assert len(calls) == 1, calls
-        assert " ls-files " in f" {calls[0]} " and "tests/extra.py" in calls[0]
+        queries = [c for c in calls if " ls-files " in f" {c} "]
+        assert len(queries) == 1, calls
+        assert "tests/extra.py" in queries[0]
+        assert not NEVER_ASKED & set(git_subcommands(calls)), calls
 
     def test_an_ignored_new_file_is_confirmed_once_and_not_reported(self, project, counted):
         (project.path / ".gitignore").write_text(
@@ -744,7 +769,9 @@ class TestGitSpawnBudget:
         (project.path / "tests" / "generated_version.py").write_text("V = 1\n")
         result = run_outside(project, "-q")
         assert result.ret == 5  # ignored: no candidate, nothing selected
-        assert len(counted()) == 1
+        subs = git_subcommands(counted())
+        assert subs.count("ls-files") == 1, subs
+        assert not NEVER_ASKED & set(subs), subs
 
 
 class TestHermeticEnvironment:

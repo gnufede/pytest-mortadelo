@@ -24,18 +24,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import zlib
 from datetime import datetime
 from pathlib import Path
 
 from .fingerprint import detect_changes
-from .gitobjects import Repo, Unsupported
 from .util import run_git
-
-# What the in-process object layer may raise when it meets something it does
-# not model (packed objects, odd layouts, a held lock): the caller then asks
-# git instead.  Correctness never depends on the fast path applying.
-_FALLBACK = (Unsupported, OSError, ValueError, KeyError, IndexError, zlib.error)
 
 # Sync operations must never hang or prompt for credentials during a test run.
 _SYNC_ENV = {"GIT_TERMINAL_PROMPT": "0"}
@@ -76,10 +69,6 @@ class GitStore:
         # Which mechanism produced the last ``changed_files`` answer:
         # "fingerprints" (watched files only) or "git" (the whole repository).
         self.change_source = "git"
-        # Reads/writes of refs and loose objects without spawning git; None
-        # when the layout is not one it models (everything then goes through
-        # the ``git`` command).
-        self._repo = Repo.discover(self.root)
 
     def _git(self, *args: str, stdin: str | None = None, extra_env: dict | None = None) -> str:
         env = None
@@ -116,11 +105,6 @@ class GitStore:
 
     def head(self) -> str | None:
         """Current HEAD commit sha, or None on an unborn branch."""
-        if self._repo is not None:
-            try:
-                return self._repo.head()
-            except _FALLBACK:
-                pass
         try:
             return run_git(self.root, "rev-parse", "HEAD").strip() or None
         except subprocess.CalledProcessError:
@@ -248,12 +232,7 @@ class GitStore:
 
     def _read_blob(self, name: str) -> bytes | None:
         """Content of ``<ref>:<name>``, or None when the shard or the entry
-        does not exist.  In-process for loose objects; git otherwise."""
-        if self._repo is not None:
-            try:
-                return self._repo.blob_in_ref(self.ref, name)
-            except _FALLBACK:
-                pass
+        does not exist."""
         try:
             proc = subprocess.run(
                 ["git", "-C", str(self.root), "cat-file", "blob", f"{self.ref}:{name}"],
@@ -316,21 +295,10 @@ class GitStore:
 
         *parse* and *files* are the new parse.json / files.json content;
         ``None`` carries the existing blob over untouched (by object id: it
-        is not even read).
-
-        Written in-process (zlib + sha1 + a ref lock: 39ms for 12 MB against
-        165ms and six spawns through ``hash-object`` / ``mktree`` /
-        ``commit-tree`` / ``update-ref``); git does it when the layout is not
-        one the in-process writer models, or anything goes wrong.
+        is not even read).  Written through ``hash-object`` / ``mktree`` /
+        ``commit-tree`` / ``update-ref``.
         """
-        if self._repo is not None:
-            try:
-                self._save_in_process(data, meta, parse, files)
-                self._forget_ref_state()
-                return
-            except _FALLBACK:
-                pass
-        self._save_with_git(data, meta, parse, files)
+        self._write_shard(data, meta, parse, files)
         self._forget_ref_state()
 
     def _forget_ref_state(self) -> None:
@@ -343,40 +311,20 @@ class GitStore:
             ):
                 del self._memo[key]
 
-    def _save_in_process(
-        self, data: dict, meta: dict, parse: dict | None, snapshot: dict | None
-    ) -> None:
-        files = {
-            "data.json": _compact(data),
-            "meta.json": _compact(meta),
-        }
-        reuse: dict[str, str] = {}
-        for name, content in (("parse.json", parse), ("files.json", snapshot)):
-            if content is not None:
-                files[name] = _compact(content)
-            else:
-                # Carry the stored blob over by id (it may even be packed).
-                existing = self._repo.blob_sha_in_ref(self.ref, name)
-                if existing:
-                    reuse[name] = existing
-        self._repo.write_shard(
-            self.ref, files, f"pytest-less shard {self.shard}", reuse=reuse
-        )
-
-    def _save_with_git(
+    def _write_shard(
         self, data: dict, meta: dict, parse: dict | None, snapshot: dict | None
     ) -> None:
         data_blob = self._git(
-            "hash-object", "-w", "--stdin", stdin=json.dumps(data)
+            "hash-object", "-w", "--stdin", stdin=_compact(data).decode()
         ).strip()
         meta_blob = self._git(
-            "hash-object", "-w", "--stdin", stdin=json.dumps(meta)
+            "hash-object", "-w", "--stdin", stdin=_compact(meta).decode()
         ).strip()
         optional: dict[str, str | None] = {}
         for name, content in (("parse.json", parse), ("files.json", snapshot)):
             if content is not None:
                 optional[name] = self._git(
-                    "hash-object", "-w", "--stdin", stdin=json.dumps(content)
+                    "hash-object", "-w", "--stdin", stdin=_compact(content).decode()
                 ).strip()
             else:
                 optional[name] = self._ref_sha(f"{self.ref}:{name}")
@@ -484,11 +432,6 @@ class GitStore:
         return f"shard pushed to '{remote}'"
 
     def _ref_sha(self, ref: str) -> str | None:
-        if self._repo is not None and ":" not in ref:
-            try:
-                return self._repo.read_ref(ref)
-            except _FALLBACK:
-                pass
         try:
             sha = run_git(self.root, "rev-parse", "--verify", "--quiet", ref)
             return sha.strip() or None
