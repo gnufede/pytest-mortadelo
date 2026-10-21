@@ -33,7 +33,6 @@ Options:
 | `--less-clean` | discard the stored data for this command before running |
 | `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
-| `PYTEST_LESS_PARSE_CACHE=0` | disable the `parse.json` read/write (cold-run measurements, debugging a suspected cache bug); the stored blob is carried over untouched |
 | `-p no:less` | disable the plugin entirely |
 
 If nothing changed and nothing failed, **zero tests run and pytest exits with
@@ -253,7 +252,7 @@ provably equivalent changes the block or an ancestor.
 #### What recording costs, and where it goes
 
 On the sqlalchemy ORM subset (2,480 tests; plain pytest ≈ 9–10 s) a record run
-adds **+2.3 s with a warm repository cache and +4.0 s cold** (it was +4.5 s and
+adds **+2.3 s with a warm parse cache and +4.0 s cold** (it was +4.5 s and
 +7.5 s before the work below and the bytecode hashing above). Layers measured by ablation (variants of the
 same run with parts switched off); the last row is what remains by subtraction:
 
@@ -351,8 +350,7 @@ refs/less/<shard>   →  lightweight commit
   same Python minor version and analysis version
   (`PARSE_CACHE_VERSION`, bumped whenever hashing changes), is loaded before
   the monitor is armed (never on the no-change fast path) so import-time
-  parses already hit it, can be disabled with `PYTEST_LESS_PARSE_CACHE=0`,
-  and is carried over by object id when nothing new was parsed. Because it
+  parses already hit it, and is carried over by object id when nothing new was parsed. Because it
   lives in the shard it travels with `pull`/`push`. Cost: about 0.5 MB compressed per shard on a 220-file
   dependency set. A cold first record parses everything, as before.
 
@@ -450,17 +448,6 @@ refs/less/<shard>   →  lightweight commit
   untracked *and* sits in a directory no dependency lives in, or a tracked
   file's content changed without its mtime/size changing on an old file
   (the same blind spot as git's stat cache), is not seen.
-- **Repository-wide parse store.** The shard's `parse.json` only knows what that
-  one command recorded, so a different command (`pytest tests/unit` after
-  `pytest tests`), a cleaned shard, or a new branch's first record parsed
-  unchanged files again. `<git-dir>/pytest-less/parse-*` holds one tiny file per
-  **content hash** (so two paths with identical bytes share an entry, a lookup
-  is one small read, and nothing is rewritten), keyed per Python minor version
-  written atomically, and bounded to 8,000 entries
-  (oldest evicted). Like every cache here it is only trusted for the exact
-  bytes it was built from. On the sqlalchemy subset: record 15.4 s → 12.8 s
-  with the shard gone but the repository warm (220 files, 0 parsed).
-  `PYTEST_LESS_PARSE_CACHE=0` disables it along with `parse.json`.
 
 Plain `git push`, `git fetch` and `git clone` do **not** transfer these refs.
 

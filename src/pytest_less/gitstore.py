@@ -28,7 +28,6 @@ import zlib
 from datetime import datetime
 from pathlib import Path
 
-from .blocks import LocalParseStore
 from .fingerprint import detect_changes
 from .gitobjects import Repo, Unsupported
 from .util import run_git
@@ -126,15 +125,6 @@ class GitStore:
             return run_git(self.root, "rev-parse", "HEAD").strip() or None
         except subprocess.CalledProcessError:
             return None
-
-    def commit_exists(self, sha: str | None) -> bool:
-        if not sha:
-            return False
-        try:
-            run_git(self.root, "cat-file", "-e", f"{sha}^{{commit}}")
-            return True
-        except subprocess.CalledProcessError:
-            return False
 
     def changed_since(self, base_commit: str | None) -> set[str] | None:
         """Files changed between *base_commit* and the current working tree.
@@ -243,13 +233,6 @@ class GitStore:
             return True
         snapshot = self.load_files()
         return bool(snapshot and snapshot.get("all"))
-
-    def local_parse_store(self) -> LocalParseStore | None:
-        """The repository-wide parse store (under the git directory), or None
-        when the layout is not one the in-process layer models."""
-        if self._repo is None:
-            return None
-        return LocalParseStore.at(self._repo.commondir)
 
     def tracked_files(self, limit: int) -> list[str] | None:
         """Every tracked file, or ``None`` if there are more than *limit* (or
@@ -523,11 +506,3 @@ class GitStore:
             run_git(self.root, "update-ref", "-d", ref)
         except subprocess.CalledProcessError:
             pass
-
-    def list_shards(self) -> list[str]:
-        """All shard keys recorded in this repository."""
-        try:
-            out = run_git(self.root, "for-each-ref", "--format=%(refname)", "refs/less/")
-        except subprocess.CalledProcessError:
-            return []
-        return [line.rsplit("/", 1)[-1] for line in out.splitlines() if line]

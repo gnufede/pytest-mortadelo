@@ -41,13 +41,6 @@ class TestHeadAndCommits:
         sha = commit(repo)
         assert GitStore(repo, "x").head() == sha
 
-    def test_commit_exists(self, repo):
-        sha = commit(repo)
-        store = GitStore(repo, "x")
-        assert store.commit_exists(sha)
-        assert not store.commit_exists("0" * 40)
-        assert not store.commit_exists(None)
-
 
 class TestChangedSince:
     def test_tracked_and_untracked_changes(self, repo):
@@ -205,14 +198,6 @@ class TestShardPersistence:
         assert store.delete()
         assert store.load() == (None, None)
         assert not store.delete()
-
-    def test_list_shards(self, repo):
-        commit(repo)
-        for shard in ("aa", "bb"):
-            GitStore(repo, shard).save(
-                {"version": 1, "tests": {}, "failed": []}, {"version": 1}
-            )
-        assert GitStore(repo, "aa").list_shards() == ["aa", "bb"]
 
     def test_ref_is_not_a_branch_or_head(self, repo):
         commit(repo)

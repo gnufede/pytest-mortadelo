@@ -49,17 +49,6 @@ def _env_enabled() -> bool:
     return os.environ.get("PYTEST_LESS", "").strip().lower() in _ENV_TRUTHY
 
 
-def _parse_cache_enabled() -> bool:
-    """Whether the shard's parse cache may be read and written.
-
-    ``PYTEST_LESS_PARSE_CACHE=0`` disables it, for cold-run measurements
-    and for debugging a suspected cache bug.  While disabled the stored
-    ``parse.json`` blob is carried over untouched (it is not even read).
-    """
-    value = os.environ.get("PYTEST_LESS_PARSE_CACHE", "").strip().lower()
-    return value not in ("0", "false", "no")
-
-
 def _sync_remote(config: pytest.Config) -> tuple[str, str] | None:
     """The (remote, mode) to sync shards with, if any.
 
@@ -332,16 +321,11 @@ def pytest_load_initial_conftests(early_config, parser, args):
                 # Parse cache (shard blob, content-hash keyed): loaded now,
                 # before the tool is armed, so the git call is not observed
                 # and import-time parses already hit it.
-                parse_cache = None
-                if _parse_cache_enabled():
-                    early_store = _shared_store(
-                        early_config, root, early_config.invocation_params.args
-                    )
-                    parse_cache = ParseCache(
-                        early_store.load_parse,
-                        local=early_store.local_parse_store(),
-                    )
-                    parse_cache.preload()
+                early_store = _shared_store(
+                    early_config, root, early_config.invocation_params.args
+                )
+                parse_cache = ParseCache(early_store.load_parse)
+                parse_cache.preload()
                 monitor = FileMonitor(
                     root,
                     data_files=data_files,
@@ -440,13 +424,8 @@ class LessState:
                 # and --less from ini addopts): root conftest imports
                 # already happened unwatched, so add the conftest files
                 # themselves as import-time deps.
-                parse_cache = None
-                if _parse_cache_enabled():
-                    parse_cache = ParseCache(
-                        self.store.load_parse,
-                        local=self.store.local_parse_store(),
-                    )
-                    parse_cache.preload()
+                parse_cache = ParseCache(self.store.load_parse)
+                parse_cache.preload()
                 self.monitor = FileMonitor(
                     self.root,
                     data_files=_data_files_enabled(config),
@@ -950,14 +929,10 @@ class LessState:
         parse = None
         if monitor.parse_cache is not None:
             parse = monitor.parse_cache.dump({f for f in dep_files if f.endswith(".py")})
-            monitor.parse_cache.flush_local()
             hits, parsed = monitor.parse_stats
             if config.getoption("verbose", 0) > 0 and hits + parsed:
-                shared = monitor.parse_cache.local_hits
                 self.notes.append(
-                    f"less: parse cache: {hits} hit(s)"
-                    + (f" ({shared} from the repository cache)" if shared else "")
-                    + f", {parsed} file(s) parsed"
+                    f"less: parse cache: {hits} hit(s), {parsed} file(s) parsed"
                 )
         # Fingerprints of what the shard now describes: the next run's change
         # detection compares against them instead of asking git.

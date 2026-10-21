@@ -50,23 +50,15 @@ class TestLoadShard:
         assert shard.import_deps == {("tests/conftest.py", MODULE_BLOCK, "h0")}
         assert shard.failed == {"b"}
 
-    def test_v1_files_migrate_to_wildcards(self):
-        # v1 shards (plain file lists) keep working with the old semantics:
-        # any change to the file re-runs.
-        shard = load_shard(
-            {"version": 1, "tests": {"a": ["x.py"]}, "failed": []},
-            {"base_commit": "c0ffee"},
-        )
-        assert shard.tests == {"a": {("x.py", WILDCARD, WILDCARD)}}
-        assert shard.import_deps == set()
-
     def test_bad_version(self):
-        assert load_shard({"version": 3, "tests": {}}, {"base_commit": None}) is None
+        # including the file-level layout of the very first releases
+        for version in (1, 3):
+            assert load_shard({"version": version, "tests": {}}, {"base_commit": None}) is None
 
     def test_corrupt(self):
         assert load_shard({"version": 2, "blocks": [], "tests": {}}, {}) is not None
         assert load_shard({"version": 2, "blocks": [], "tests": {"a": [7]}}, {}) is None
-        assert load_shard({"version": 1}, {}) is None  # missing "tests"
+        assert load_shard({"version": 2}, {}) is None  # missing "blocks" and "tests"
         assert load_shard(None, None) is None
 
     def test_missing_base_commit_ok(self):

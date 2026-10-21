@@ -3,8 +3,8 @@
 A dependency is a ``Block`` triple ``(file, block id, hash)``.  A changed
 file does not automatically affect a test: the file is re-parsed and only
 stale blocks (missing, or with a different content hash) re-run their
-dependents.  A ``WILDCARD`` block id (dynamic code, redefined names, v1
-shards, unparseable files, recorded data files) means "any change
+dependents.  A ``WILDCARD`` block id (dynamic code, redefined names,
+unparseable files, recorded data files) means "any change
 to this file re-runs".
 
 Tests are selected when they have no recorded data, failed in the recorded
@@ -83,27 +83,12 @@ class Selection:
 
 
 def load_shard(data, meta) -> Shard | None:
-    """Parse a shard, or return None if the data is unusable (fresh/corrupt).
-
-    Version 1 shards (file-level dependencies) are migrated to wildcard
-    blocks: ``file`` becomes ``(file, "*", "*")`` -- exactly the old
-    any-change-to-the-file behavior.
-    """
+    """Parse a shard, or return None if the data is unusable (fresh/corrupt)."""
     if not isinstance(data, dict) or not isinstance(meta, dict):
         return None
     try:
         version = data.get("version")
-        if version == 1:
-            raw_tests = data["tests"]
-            if not isinstance(raw_tests, dict):
-                return None
-            tests = {
-                nid: {(f, WILDCARD, WILDCARD) for f in files if isinstance(f, str)}
-                for nid, files in raw_tests.items()
-                if isinstance(nid, str) and isinstance(files, list)
-            }
-            import_deps: set[Block] = set()
-        elif version == DATA_VERSION:
+        if version == DATA_VERSION:
             table = [tuple(b) for b in data["blocks"]]
             raw_tests = data["tests"]
             if not isinstance(raw_tests, dict):
