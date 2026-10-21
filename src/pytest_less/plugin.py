@@ -558,16 +558,16 @@ class LessState:
         self.new_maps = self._new_maps(changed)
         # Widening facts shared with select_tests (same builder, same
         # predicate -- a test can never run under one and be skipped under
-        # the other).  If a shared import-time dependency went stale, or a
-        # dynamic-marker file widens to *all* tests, nothing is skippable.
+        # the other).  If a shared import-time dependency went stale, nothing
+        # is skippable.
         ctx = self.ctx = build_context(
             self.shard, changed, self.new_maps, pristine=self.pristine
         )
-        if ctx.import_stale or ctx.dynamic_global:
+        if ctx.import_stale:
             return
         # Which files still have at least one test that will run?  A test
         # runs if it previously failed or the shared affected-test predicate
-        # says so (stale block, dynamic widening, subprocess rule).
+        # says so (stale block, runtime-dynamic or subprocess rule).
         file_tests: dict[str, list[str]] = {}
         for nodeid in self.shard.tests:
             file_tests.setdefault(nodeid.split("::")[0], []).append(nodeid)

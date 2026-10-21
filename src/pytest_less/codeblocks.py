@@ -327,4 +327,4 @@ def compile_blocks(source: bytes, *, filename: str = "<src>") -> FileBlocks | No
         blocks[block_id] = content
         spans.append((start, block_id))
     blocks[MODULE_BLOCK] = module_digest
-    return FileBlocks(blocks, spans, None, source)
+    return FileBlocks(blocks, spans)

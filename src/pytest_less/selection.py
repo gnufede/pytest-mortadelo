@@ -12,10 +12,6 @@ run, depend on a stale block, or (via the shared ``import_deps``) when any
 import-time dependency of every test went stale.  Widening rules sit on top
 of that:
 
-* **dynamic markers** -- a changed file that both *contains* reflective
-  constructs (computed ``getattr``, ``__getattr__``, ``eval``/``exec``, ...)
-  *and* has a stale block is widened back to file level: the recorded run
-  may not hold every edge reflective dispatch creates (Ley 1 net).
 * **subprocess spawns** -- coverage cannot follow a child process, so a
   test that spawned one is *never given dependencies* and always re-runs
   (``always`` lists them).  ``spawn_unknown`` (old shards, or a spawn
@@ -191,8 +187,8 @@ def stale_dep(dep: Block, changed: set[str], maps: dict[str, FileBlocks | None])
 class _Context:
     """Per-run selection facts computed once from the whole shard.
 
-    Holds the global conditions (import-time staleness, dynamic-marker
-    widenings, subprocess-trigger availability) and memoizes ``stale_dep``
+    Holds the global conditions (import-time staleness, subprocess-trigger
+    availability) and memoizes ``stale_dep``
     per block triple: every consumer (collection planning, selection) asks
     the same questions.
     """
@@ -200,14 +196,11 @@ class _Context:
     changed: set[str]
     maps: dict[str, FileBlocks | None]
     import_stale: bool
-    dynamic_files: set[str]  # marker-bearing files with a stale block
-    dynamic_global: bool  # ... of which one is in the shared import bucket
     spawn_active: bool  # some changed .py is stale or was never recorded
     unrecorded_py: bool = False  # some changed .py was never recorded
     # Nothing changed since the recording, at the same commit, with everything
     # a child process could read watched: tests that always re-run do not.
     pristine: bool = False
-    import_files: set[str] = field(default_factory=set)
     _memo: dict[Block, bool] = field(default_factory=dict)
 
     def stale(self, dep: Block) -> bool:
@@ -233,7 +226,6 @@ def build_context(
 ) -> _Context:
     """Compute the per-run widening facts (one pass over the shard)."""
     import_stale = False
-    import_files: set[str] = set()
     recorded: set[str] = set()
     stale_files: set[str] = set()
 
@@ -245,7 +237,6 @@ def build_context(
                 stale_files.add(rel)
 
     for b in shard.import_deps:
-        import_files.add(b[0])
         if not import_stale and stale_dep(b, changed, maps):
             import_stale = True
         note(b)
@@ -253,16 +244,6 @@ def build_context(
         for b in deps:
             note(b)
 
-    # Dynamic-marker widening: reflective construct + a real (stale) change
-    # in the same file.  Format-only changes produce no stale block and do
-    # not widen.  A marker file
-    # everyone imported widens to *all* tests (file-level semantics: any
-    # test could reach code through an edge the recording never saw).
-    dynamic_files = {
-        rel
-        for rel in stale_files
-        if (fb := maps.get(rel)) is not None and fb.markers
-    }
     changed_py = {f for f in changed if _is_candidate_py(f)}
     spawn_active = bool(changed_py) and bool(
         (changed_py & stale_files) | (changed_py - recorded)
@@ -273,10 +254,7 @@ def build_context(
         changed=changed,
         maps=maps,
         import_stale=import_stale,
-        dynamic_files=dynamic_files,
-        dynamic_global=bool(dynamic_files & import_files),
         spawn_active=spawn_active,
-        import_files=import_files,
     )
 
 
@@ -294,8 +272,6 @@ def affected_reason(
         return "import"
     if any(ctx.stale(b) for b in deps):
         return "stale"
-    if ctx.dynamic_global or any(b[0] in ctx.dynamic_files for b in deps):
-        return "dynamic"
     if ctx.spawn_active and shard.spawn_unknown:
         return "spawn"
     if ctx.unrecorded_py and (shard.dynamic is None or nodeid in shard.dynamic):
@@ -337,7 +313,7 @@ def select_tests(
         ctx = build_context(shard, changed, maps, pristine=pristine)
     selected: list[str] = []
     deselected: list[str] = []
-    n_affected = n_failed = n_new = n_dynamic = n_spawn = 0
+    n_affected = n_failed = n_new = n_spawn = 0
     n_always = n_runtime = 0
     always = shard.always
     for nodeid in collected:
@@ -357,9 +333,7 @@ def select_tests(
                 deselected.append(nodeid)
                 continue
             selected.append(nodeid)
-            if why == "dynamic":
-                n_dynamic += 1
-            elif why == "spawn":
+            if why == "spawn":
                 n_spawn += 1
             elif why == "runtime":
                 n_runtime += 1
@@ -372,11 +346,6 @@ def select_tests(
     )
     if ctx.import_stale:
         reason += "; import-time dependencies changed"
-    if n_dynamic:
-        reason += (
-            f"; {n_dynamic} widened by dynamic markers in "
-            f"{sorted(ctx.dynamic_files)}"
-        )
     if n_always:
         reason += f"; {n_always} always re-run (spawn subprocesses)"
     elif ctx.pristine and always & set(collected):

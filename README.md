@@ -142,8 +142,22 @@ executed of it is already a dependency, and what it did not execute cannot
 change its result. String-compiled code (`eval`/`exec`) is deliberately **not**
 a signal: the generated code comes from generators that are themselves
 recorded, and flagging it selected 69% of sqlalchemy's ORM tests on every
-edit. The static markers (below) still cover the constructs with no runtime
-signal (`getattr`/`setattr` with computed names, `__getattr__`).
+edit.
+
+A computed `getattr(self, "handle_" + name, default)` needs no rule of its own.
+It can only resolve to something in a namespace some code built — a class body,
+a module body, or a registry filled by executed functions — and each of those
+is a block a test already depends on (class and module skeletons run at import,
+so they are dependencies of every test). The one way such a lookup can start
+resolving to something new, *adding* a definition, therefore always changes a
+block the test depends on and selects it; `tests/test_reflection.py` pins this
+for methods, module functions, subclass overrides and registries. A static
+"computed `getattr` in this file" scan used to widen every change in such a file
+to every test that touched it; on sqlalchemy that made one-function edits run
+the whole suite (`Query.filter`: 2,480 of 2,480 tests, against 338 without) while
+guarding nothing those rules miss. What stays uncovered is dispatch that depends
+on state the plugin does not track (the environment, time, randomness,
+installed packages), the same as for any test impact analysis.
 
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
@@ -225,10 +239,6 @@ What the hash does and does not see, each point pinned by `tests/test_codeblocks
   interpreter newer than 3.15. Any change to such a file re-runs the tests
   that executed it (the `*` wildcard block); nothing is ever skipped because the
   hasher was unsure.
-- **Marker detection is lazy**: the dynamic-construct scan needs an AST, but
-  selection only asks about files that *changed*, so recording never builds one.
-  If the scan cannot run it reports "dynamic" (widen), never "none".
-
 Validation (not just unit tests, and done against the AST hasher this replaced):
 on 1,498 real sqlalchemy file edits (179,000
 blocks) the two hashers agreed on 99.5% of blocks. Where the AST says "changed"
@@ -585,12 +595,6 @@ from the shard's recorded fingerprints, plus new project `.py` files (see
 - one of the **shared import-time** dependencies went stale (that is the
   whole-suite fan-out for conftest/import-time edits — block-granular:
   only blocks that actually executed at import time count),
-- a changed file **containing a dynamic marker** (computed `getattr`,
-  `eval`/`exec`, `__getattr__` definitions, ...) also has a stale block:
-  the file is widened to file level and every test that touched it re-runs
-  (reported as `N widened by dynamic markers`) — reflective edges are the
-  one place a recording can disagree with the next run, so this widens on
-  purpose. The staleness gate keeps edits that change no block (comments, formatting) from widening, and
 - the test is a **spawner** (`always`) and the state is not pristine: it runs
   (`N always re-run`); under `spawn_unknown`, every test runs when a changed `.py` file is stale
   or was never recorded (`N selected by the subprocess rule`),
@@ -620,12 +624,6 @@ silently.
   and child reads of data files are not tracked (data-file tracking covers
   the pytest process only). Monitoring inside the child would be the
   precise version; it is not built.
-- The dynamic-marker widening only considers changed files with a *stale
-  recorded block*; it cannot widen edits for which no recording exists at
-  all (nothing stale → nothing widened — the causal-closure argument).
-- Reflection with no runtime signal (`getattr`/`setattr` with a computed
-  name, `__getattr__`) is only covered by the static markers: a stale block in
-  a marker-bearing file widens to the whole file.
 - Thread attribution: code executed by threads spawned by a test is
   attributed to the test running at that moment; tests are assumed to run
   sequentially.

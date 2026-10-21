@@ -14,7 +14,7 @@ import pytest
 from test_plugin import commit, git, run_less
 
 from pytest_less import codeblocks
-from pytest_less.blocks import MODULE_BLOCK, BlockCache, FileBlocks, ParseCache
+from pytest_less.blocks import MODULE_BLOCK, BlockCache, ParseCache
 from pytest_less.codeblocks import TAG, Unsupported, compile_blocks
 
 pytestmark = pytest.mark.skipif(
@@ -367,21 +367,6 @@ class TestResolve:
         assert fb.resolve("never_defined", 1)[0] == MODULE_BLOCK
 
 
-class TestMarkersAreLazy:
-    SRC = b"def f(o, name):\n    return getattr(o, name)\n"
-
-    def test_not_computed_until_asked(self):
-        fb = compile_blocks(self.SRC)
-        assert fb.known_markers() is None
-        assert fb.markers  # computed now: the computed-attribute call
-        assert fb.known_markers() == fb.markers
-
-    def test_without_source_the_answer_is_dynamic_never_empty(self):
-        fb = compile_blocks(self.SRC)
-        restored = FileBlocks(fb.blocks, fb.spans, None)  # no bytes handed over
-        assert restored.markers  # nothing to scan: widen, do not switch off
-
-
 class TestUnsupportedFiles:
     """What the hasher does not model becomes a file-level dependency."""
 
@@ -436,18 +421,16 @@ class TestUnsupportedFiles:
 
 
 class TestCache:
-    def test_round_trip_does_not_force_the_marker_scan(self, tmp_path):
+    def test_a_cache_round_trip_is_exact(self, tmp_path):
         (tmp_path / "m.py").write_text("def f(o, n):\n    return getattr(o, n)\n")
         cache = ParseCache(None)
         fb = BlockCache(tmp_path, parse_cache=cache).file_blocks("m.py")
-        assert fb.known_markers() is None
         stored = cache.dump({"m.py"})
-        assert stored["files"]["m.py"]["m"] is None
+        assert set(stored["files"]["m.py"]) == {"h", "b", "s"}  # hash, blocks, spans
         again = BlockCache(
             tmp_path, parse_cache=ParseCache(lambda: stored)
         ).file_blocks("m.py")
         assert again.blocks == fb.blocks and again.spans == fb.spans
-        assert again.markers  # lazy, from the bytes handed over on the hit
 
     def test_a_cached_table_resolves_like_a_fresh_one(self, tmp_path):
         (tmp_path / "m.py").write_text(KLASS)

@@ -42,7 +42,7 @@ def fresh(source):
 
 
 def fields(fb):
-    return (fb.blocks, fb.spans, fb.markers)
+    return (fb.blocks, fb.spans)
 
 
 def make(tmp_path, source=SRC, *, stored=None):
@@ -62,7 +62,6 @@ class TestRoundTrip:
         again = second.file_blocks("m.py")
         assert (second.hits, second.misses) == (1, 0)
         assert fields(again) == fields(fb)
-        assert again.markers  # getattr(self, name)
 
     def test_cached_table_equals_a_fresh_parse(self, tmp_path):
         first, cache = make(tmp_path)

@@ -20,17 +20,10 @@ file-level fallback for code we cannot map to a block: files the hasher does
 not model -- PEP 695 generics, ``type`` statements, an interpreter other than
 newer than 3.15 -- unparseable files, and non-Python data files recorded by
 wrapping ``open``).
-
-A *dynamic marker* is a reflective construct (computed ``getattr``,
-``__getattr__`` definitions, ``eval``) in a file: selection widens a semantic
-change in such a file back to file level.  Finding them needs an AST, so they
-are computed lazily -- selection only asks about files that *changed*, and
-recording never builds one.
 """
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -50,53 +43,6 @@ Block = tuple[str, str, str]
 DYNAMIC_DEP: Block = ("<dynamic>", "runtime", "*")
 
 
-# Dynamic-access markers (the "dynscan" safety net): call sites and method
-# definitions whose *targets cannot be resolved statically.  A file
-# containing one of these is potentially wired by reflective edges the
-# recorded run may not have seen (unstable dispatch, exec'd code), so
-# selection widens a semantic change in such a file back to file level
-# (see selection.dynamic_widenings).  Format: ``name@Lline``.
-_DYNAMIC_CALLS = frozenset({"eval", "exec", "__import__", "import_module"})
-_DYNAMIC_ATTR_CALLS = frozenset({"getattr", "setattr", "delattr"})
-_DYNAMIC_METHODS = frozenset({"__getattr__", "__getattribute__"})
-
-
-def find_dynamic_markers(tree: ast.AST) -> tuple[str, ...]:
-    """Reflective/dynamic constructs in *tree*, as ``name@Lline`` strings.
-
-    Deliberately ignored: *statically resolvable* access --
-    ``getattr(x, "lit")`` names its attribute, so it cannot hide an unseen
-    edge; a computed second argument (anything but a string constant) is
-    flagged.  ``__getattr__`` / ``__getattribute__`` definitions are flagged
-    wholesale: every attribute read on the object may dispatch to code no
-    recording saw execute.
-    """
-    markers: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            name = (
-                func.id
-                if isinstance(func, ast.Name)
-                else func.attr
-                if isinstance(func, ast.Attribute)
-                else None
-            )
-            if name in _DYNAMIC_CALLS:
-                markers.add(f"{name}@L{node.lineno}")
-            elif name in _DYNAMIC_ATTR_CALLS:
-                # Second arg a plain string literal: statically resolvable.
-                if len(node.args) >= 2:
-                    arg = node.args[1]
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        continue
-                markers.add(f"{name}@L{node.lineno}")
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name in _DYNAMIC_METHODS:
-                markers.add(f"{node.name}@L{node.lineno}")
-    return tuple(sorted(markers))
-
-
 class FileBlocks:
     """Block table of one Python file.
 
@@ -111,54 +57,19 @@ class FileBlocks:
     file wildcard, and a class declared ``global`` inside a function is found
     under its real ``co_qualname``.
 
-    ``markers`` (the file's dynamic constructs, see
-    :func:`find_dynamic_markers`) is computed on first use from the bytes handed
-    over by :meth:`attach_source`.
     """
 
-    __slots__ = ("_by_name", "_markers", "_source", "blocks", "spans")
+    __slots__ = ("_by_name", "blocks", "spans")
 
-    def __init__(
-        self,
-        blocks: dict[str, str],
-        spans: list[tuple[int, str]],
-        markers: tuple[str, ...] | None = None,
-        source: bytes | None = None,
-    ) -> None:
+    def __init__(self, blocks: dict[str, str], spans: list[tuple[int, str]]) -> None:
         self.blocks = blocks
         self.spans = spans
-        self._markers = markers  # None: not computed yet
-        self._source = source
         # qualname -> [(first line, block id)]: redefinitions (``@overload``,
         # property setters) share a qualname and are told apart by line.
         by_name: dict[str, list[tuple[int, str]]] = {}
         for start, block_id in spans:
             by_name.setdefault(block_id.split("~")[0], []).append((start, block_id))
         self._by_name = by_name
-
-    def attach_source(self, data: bytes) -> None:
-        self._source = data
-
-    def known_markers(self) -> tuple[str, ...] | None:
-        """The markers if already computed, else None (nothing is forced)."""
-        return self._markers
-
-    @property
-    def markers(self) -> tuple[str, ...]:
-        got = self._markers
-        if got is None:
-            # If the scan cannot run, say "dynamic": an empty tuple would
-            # switch the widening safety net off, the unsafe direction.
-            try:
-                got = (
-                    find_dynamic_markers(ast.parse(self._source))
-                    if self._source is not None
-                    else ("unscanned@L0",)
-                )
-            except (SyntaxError, ValueError, RecursionError):
-                got = ("unscanned@L0",)
-            self._markers = got
-        return got
 
     def resolve(self, qualname: str, firstlineno: int) -> tuple[str, str] | None:
         """Map a code object to ``(block id, hash)``."""
@@ -186,7 +97,7 @@ class FileBlocks:
 # Bump when anything that feeds a block hash or the stored table changes (the
 # algorithm in codeblocks, the entry layout): a stored parse result from another
 # version must not be trusted.
-PARSE_CACHE_VERSION = 3
+PARSE_CACHE_VERSION = 4
 
 
 def _content_hash(data: bytes) -> str:
@@ -194,20 +105,12 @@ def _content_hash(data: bytes) -> str:
 
 
 def _file_to_json(fb: FileBlocks) -> dict:
-    markers = fb.known_markers()  # None: not computed yet (and not needed)
-    return {
-        "b": fb.blocks,
-        "s": [list(span) for span in fb.spans],
-        "m": None if markers is None else list(markers),
-    }
+    return {"b": fb.blocks, "s": [list(span) for span in fb.spans]}
 
 
 def _file_from_json(d: dict) -> FileBlocks:
-    markers = d["m"]
     return FileBlocks(
-        dict(d["b"]),
-        [(int(start), block_id) for start, block_id in d["s"]],
-        None if markers is None else tuple(markers),
+        dict(d["b"]), [(int(start), block_id) for start, block_id in d["s"]]
     )
 
 
@@ -293,7 +196,7 @@ class LocalParseStore:
 class ParseCache:
     """Parse results keyed by file *content hash*.
 
-    Analyzing a file (parse + block hashes + marker scan) costs ~10ms; reading
+    Analyzing a file (compile + block hashes) costs ~10ms; reading
     it and hashing the bytes costs ~0.1ms.  ``git diff`` already tells us which
     files changed for *staleness*, but resolving an executed code object to a
     block needs the block table of every file whose code runs -- changed or
@@ -445,7 +348,6 @@ class BlockCache:
             digest = _content_hash(data)
             fb = self.parse_cache.lookup(rel, digest)
             if fb is not None:
-                fb.attach_source(data)
                 self.hits += 1
                 self._cache[rel] = fb
                 return fb
