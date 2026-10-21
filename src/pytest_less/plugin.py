@@ -713,27 +713,7 @@ class LessState:
             self.notes.append("less: nothing ran; stored shard left unchanged")
             return
         if self.fast and self.monitor is None:
-            # Pure fast path (the monitor was never armed) but something
-            # ran or failed.  No dependency can have changed -- that is why
-            # we took the fast path -- so only the failure list can differ;
-            # deps of anything that ran without a monitor stay as recorded
-            # (or, for unrecorded tests, absent: they simply re-run next
-            # time, the conservative "new test" behavior).
-            data = self.store.load_data() or {
-                "version": DATA_VERSION, "blocks": [], "tests": {}, "import_deps": [],
-            }
-            data["failed"] = sorted(self.failed)
-            meta = dict(self._meta or {})
-            meta.update(
-                failed=sorted(self.failed),
-                base_commit=self.store.head(),
-                created=datetime.now(UTC).isoformat(),
-            )
-            self.store.save(data, meta)
-            self.notes.append(
-                "less: monitor was not armed (fast path); failure list "
-                "updated, dependencies left as recorded"
-            )
+            self._store_failures_only()
             return
         monitor = self.monitor
         if monitor is not None:
@@ -763,9 +743,48 @@ class LessState:
         if monitor is None:
             return
 
-        # Partition collect-phase blocks: those executed in test-module
-        # files belong to that module's tests only; everything else is a
-        # shared import-time dependency.
+        old_shard = self.shard
+        import_blocks, module_collect = self._shared_blocks(monitor, old_shard)
+        tests = self._merge_tests(monitor, module_collect, old_shard, interrupted)
+        dynamic_now = self._take_dynamic_marks(monitor, tests, import_blocks)
+        always, spawn_unknown, dynamic = self._marks(
+            monitor, tests, old_shard, dynamic_now
+        )
+        data, meta, dep_files = _shard_documents(
+            self.store, tests, import_blocks, self.failed, always, spawn_unknown, dynamic
+        )
+        self._save(config, monitor, data, meta, dep_files, bool(always))
+
+    def _store_failures_only(self) -> None:
+        """Pure fast path (the monitor was never armed) but something ran or
+        failed.  No dependency can have changed -- that is why we took the fast
+        path -- so only the failure list can differ; deps of anything that ran
+        without a monitor stay as recorded (or, for unrecorded tests, absent:
+        they simply re-run next time, the conservative "new test" behavior)."""
+        data = self.store.load_data() or {
+            "version": DATA_VERSION, "blocks": [], "tests": {}, "import_deps": [],
+        }
+        data["failed"] = sorted(self.failed)
+        meta = dict(self._meta or {})
+        meta.update(
+            failed=sorted(self.failed),
+            base_commit=self.store.head(),
+            created=datetime.now(UTC).isoformat(),
+        )
+        self.store.save(data, meta)
+        self.notes.append(
+            "less: monitor was not armed (fast path); failure list "
+            "updated, dependencies left as recorded"
+        )
+
+    def _shared_blocks(
+        self, monitor: FileMonitor, old_shard: Shard | None
+    ) -> tuple[set[Block], dict[str, set[Block]]]:
+        """``(import-time blocks, collect-time blocks per test module)``.
+
+        Blocks that executed while collecting a test module belong to that
+        module's tests only; everything else that ran before the tests is a
+        shared import-time dependency."""
         module_collect: dict[str, set[Block]] = {}
         import_blocks: set[Block] = set(monitor.import_deps)
         for block in monitor.collect_deps:
@@ -779,13 +798,21 @@ class LessState:
         # empty conftest files.)
         for rel in self.conftest_deps:
             import_blocks.add(monitor.module_dep(rel))
-
-        old_shard = self.shard
-        old_tests = old_shard.tests if old_shard is not None else {}
         # Keep previously recorded import-time deps (conservative: a module
         # that stopped being imported still re-runs its dependents).
-        import_blocks |= old_shard.import_deps if old_shard is not None else set()
+        if old_shard is not None:
+            import_blocks |= old_shard.import_deps
+        return import_blocks, module_collect
 
+    def _merge_tests(
+        self,
+        monitor: FileMonitor,
+        module_collect: dict[str, set[Block]],
+        old_shard: Shard | None,
+        interrupted: bool,
+    ) -> dict[str, set[Block]]:
+        """Each test's dependencies: what it ran now, else what was recorded."""
+        old_tests = old_shard.tests if old_shard is not None else {}
         tests: dict[str, set[Block]] = {}
         for nodeid, module_rel in self.item_map.items():
             own = monitor.test_deps.get(nodeid)
@@ -819,18 +846,17 @@ class LessState:
         if interrupted or stopped_early:
             # A test that was collected but did not finish has an unknown
             # result: it must re-run.  (Also when the run simply stopped --
-            # ``-x`` / ``--maxfail``: the file fingerprints below are
-            # refreshed, so a selected-but-unrun test that kept its old
-            # hashes would otherwise look fresh forever.)  With valid old deps it would otherwise
-            # be deselected forever ("no stale block"), and without any
-            # recorded history it would be omitted entirely -- letting its
-            # file be collection-skipped, silently never running again.
-            # Keeping it in the shard (old deps if any, else none) and on the
+            # ``-x`` / ``--maxfail``: the file fingerprints are refreshed, so
+            # a selected-but-unrun test that kept its old hashes would
+            # otherwise look fresh forever.)  With valid old deps it would be
+            # deselected forever ("no stale block"), and without any recorded
+            # history it would be omitted entirely -- letting its file be
+            # collection-skipped, silently never running again.  Keeping it
+            # in the shard (old deps if any, else none) and on the
             # failed/must-rerun list closes both holes.
-            if self.selection is not None:
-                deselected = set(self.selection.deselected)
-            else:
-                deselected = set()
+            deselected = (
+                set(self.selection.deselected) if self.selection is not None else set()
+            )
             for nodeid in self.item_map:
                 if nodeid in self.finished or nodeid in deselected:
                     continue
@@ -843,20 +869,34 @@ class LessState:
         for nodeid in monitor.spawn_tests:
             if nodeid in self.item_map:
                 tests[nodeid] = set()
-        # Reflective entry points leave a pseudo-dependency: turn it into the
-        # test's "dynamic" mark and keep it out of the shard.
-        dynamic_now: set[str] = set()
-        for nodeid, deps in monitor.test_deps.items():
-            if DYNAMIC_DEP in deps:
-                dynamic_now.add(nodeid)
+        return tests
+
+    @staticmethod
+    def _take_dynamic_marks(
+        monitor: FileMonitor, tests: dict[str, set[Block]], import_blocks: set[Block]
+    ) -> set[str]:
+        """Reflective entry points leave a pseudo-dependency: turn it into the
+        test's "dynamic" mark and keep it out of the shard."""
+        dynamic_now = {n for n, deps in monitor.test_deps.items() if DYNAMIC_DEP in deps}
         import_blocks.discard(DYNAMIC_DEP)
         for deps in tests.values():
             deps.discard(DYNAMIC_DEP)
+        return dynamic_now
 
-        # Marks are replaced by this run's observations for tests that
-        # actually ran; tests that did not run inherit their previous belief.
-        # Unknown history (an old shard) stays unknown until every
-        # previously recorded test has been observed once.
+    def _marks(
+        self,
+        monitor: FileMonitor,
+        tests: dict[str, set[Block]],
+        old_shard: Shard | None,
+        dynamic_now: set[str],
+    ) -> tuple[set[str], bool, set[str] | None]:
+        """``(always, spawn_unknown, dynamic)``.
+
+        Marks are replaced by this run's observations for tests that actually
+        ran; tests that did not run inherit their previous belief.  Unknown
+        history (an old shard) stays unknown until every previously recorded
+        test has been observed once."""
+        old_tests = old_shard.tests if old_shard is not None else {}
         alive = set(tests) | set(self.item_map)
         observed = self.finished
         old_always = old_shard.always if old_shard is not None else set()
@@ -871,59 +911,18 @@ class LessState:
             dynamic = None  # still unknown for the tests that did not run
         else:
             dynamic = (dynamic_now | ((old_dynamic or set()) - observed)) & set(tests)
+        return always, spawn_unknown, dynamic
 
-        # The distinct blocks (a few thousand) already contain every file any
-        # test depends on: derive the file sets from them instead of walking
-        # every test's every block (1.6M generator steps on a 2.5k-test suite).
-        distinct: set[Block] = set(import_blocks)
-        for deps in tests.values():
-            distinct.update(deps)
-        dep_files: set[str] = {b[0] for b in distinct}
-
-        # Serialize with a dedup table: shared blocks (import-time and
-        # common helpers) are stored once.
-        # Every distinct block is indexed once; each test's list is then a
-        # C-speed lookup (``map`` over a dict) instead of ~1.6M Python-level
-        # ``index()`` calls on a 2.5k-test suite.  The table is sorted, so a
-        # file's blocks are adjacent and the (sorted) per-test index lists
-        # become runs -- which also compresses better.
-        ordered: list[Block] = sorted(distinct)
-        table: dict[Block, int] = {b: i for i, b in enumerate(ordered)}
-        lookup = table.__getitem__
-
-        data = {
-            "version": DATA_VERSION,
-            "blocks": [list(b) for b in ordered],  # filled below
-            "tests": {nid: sorted(map(lookup, tests[nid])) for nid in sorted(tests)},
-            "import_deps": sorted(map(lookup, import_blocks)),
-            "failed": sorted(self.failed),
-            # Tests that spawned a process: no dependencies, re-run every
-            # time.  ``spawn_unknown``: the culprit of a collect-phase spawn
-            # (or an old shard's history) is unknown -> weak rule for all.
-            "always": sorted(always),
-            "spawn_unknown": spawn_unknown,
-            # Tests that ran string-compiled / reflective code (None =
-            # unknown) -> re-run when a .py file is stale or unrecorded.
-            "dynamic": sorted(dynamic) if dynamic is not None else None,
-        }
-        data["blocks"] = [list(b) for b in ordered]
-        meta = {
-            "version": 1,
-            "shard": self.store.shard,
-            "base_commit": self.store.head(),
-            "created": datetime.now(UTC).isoformat(),
-            # First-level cache for the no-change rerun (see
-            # _try_fast_path): everything needed to decide "can anything
-            # be stale?" without reading data.json.
-            "failed": sorted(self.failed),
-            "nodeids": sorted(tests),
-            "dep_files": sorted(dep_files),
-            # Mirrors of data.json's subprocess / dynamic marks: let the
-            # fast-path probe see when those rules might fire.
-            "always": sorted(always),
-            "spawn_unknown": spawn_unknown,
-            "dynamic": sorted(dynamic) if dynamic is not None else None,
-        }
+    def _save(
+        self,
+        config: pytest.Config,
+        monitor: FileMonitor,
+        data: dict,
+        meta: dict,
+        dep_files: set[str],
+        spawners: bool,
+    ) -> None:
+        """Write the shard (with the parse cache and fingerprints) and sync."""
         # Parse results of the dependency files (content-hash keyed, verified
         # on every use): None carries the stored blob over untouched.
         parse = None
@@ -940,7 +939,7 @@ class LessState:
         # A child process may read any tracked file, so when a test spawns one
         # the snapshot is widened to all of them: that is what makes "nothing
         # changed" provable, and lets the next rerun at this commit skip it.
-        tracked = self.store.tracked_files(TRACKED_LIMIT) if always else None
+        tracked = self.store.tracked_files(TRACKED_LIMIT) if spawners else None
         snapshot = build_snapshot(
             self.root,
             dep_files,
@@ -954,6 +953,68 @@ class LessState:
                 self.notes.append(f"less: {self.store.sync_push(self.sync_remote)}")
             except Exception as e:  # never break the run
                 self.notes.append(f"less: sync push failed ({e!r})")
+
+
+def _shard_documents(
+    store: GitStore,
+    tests: dict[str, set[Block]],
+    import_blocks: set[Block],
+    failed: set[str],
+    always: set[str],
+    spawn_unknown: bool,
+    dynamic: set[str] | None,
+) -> tuple[dict, dict, set[str]]:
+    """``(data.json, meta.json, dependency files)`` for a shard.
+
+    ``data.json`` is stored with a dedup table: shared blocks (import-time and
+    common helpers) once.  Every distinct block is indexed once, so each test's
+    list is a C-speed ``map`` over a dict instead of ~1.6M Python-level
+    ``index()`` calls on a 2.5k-test suite.  The table is sorted, so a file's
+    blocks are adjacent and the (sorted) per-test index lists become runs --
+    which also compresses better.  ``meta.json`` is the first-level cache for
+    the no-change rerun (see ``_try_fast_path``): everything needed to decide
+    "can anything be stale?" without reading ``data.json``.
+    """
+    # The distinct blocks (a few thousand) already contain every file any test
+    # depends on: derive the file sets from them instead of walking every
+    # test's every block.
+    distinct: set[Block] = set(import_blocks)
+    for deps in tests.values():
+        distinct.update(deps)
+    dep_files = {b[0] for b in distinct}
+    ordered: list[Block] = sorted(distinct)
+    lookup = {b: i for i, b in enumerate(ordered)}.__getitem__
+    marks = {
+        # Tests that spawned a process: no dependencies, re-run every time.
+        # ``spawn_unknown``: the culprit of a collect-phase spawn (or an old
+        # shard's history) is unknown -> weak rule for all.
+        "always": sorted(always),
+        "spawn_unknown": spawn_unknown,
+        # Tests that went through a reflective entry point (None = unknown)
+        # -> re-run when a .py file was never recorded.
+        "dynamic": sorted(dynamic) if dynamic is not None else None,
+    }
+    data = {
+        "version": DATA_VERSION,
+        "blocks": [list(b) for b in ordered],
+        "tests": {nid: sorted(map(lookup, tests[nid])) for nid in sorted(tests)},
+        "import_deps": sorted(map(lookup, import_blocks)),
+        "failed": sorted(failed),
+        **marks,
+    }
+    meta = {
+        "version": 1,
+        "shard": store.shard,
+        "base_commit": store.head(),
+        "created": datetime.now(UTC).isoformat(),
+        "failed": sorted(failed),
+        "nodeids": sorted(tests),
+        "dep_files": sorted(dep_files),
+        # Mirrors of data.json's marks: let the fast-path probe see when the
+        # subprocess / dynamic rules might fire.
+        **marks,
+    }
+    return data, meta, dep_files
 
 
 # ---------------------------------------------------------------- hooks
