@@ -97,12 +97,23 @@ def load_shard(data, meta) -> Shard | None:
             for nid, indices in raw_tests.items():
                 if not isinstance(indices, list):
                     return None
-                own = set()
-                for i in indices:
-                    if not isinstance(i, int) or not (0 <= i < len(table)):
+                # ~1.65M index lookups on a 2,480-test shard: min/max
+                # validate the whole list at C speed, map builds the set.
+                # Anything min/max cannot order (a non-int) raises, which the
+                # outer except turns into "unusable" exactly as the per-element
+                # check did; a bool is an int here as it was there.
+                if indices:
+                    low, high = min(indices), max(indices)
+                    if not (
+                        isinstance(low, int)
+                        and 0 <= low
+                        and isinstance(high, int)
+                        and high < len(table)
+                    ):
                         return None
-                    own.add(table[i])
-                tests[nid] = own
+                    tests[nid] = set(map(table.__getitem__, indices))
+                else:
+                    tests[nid] = set()
             import_deps = set()
             for i in data.get("import_deps", []):
                 if not isinstance(i, int) or not (0 <= i < len(table)):
