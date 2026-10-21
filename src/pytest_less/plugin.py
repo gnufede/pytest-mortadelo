@@ -609,8 +609,14 @@ class LessState:
 
     def remember_items(self, items: list[pytest.Item]) -> None:
         assert self.root is not None
+        # Many items share one file (2.5k items over 12 files on the
+        # benchmark suite): resolve each path once.
+        rel_of: dict = {}
         for item in items:
-            rel = to_repo_rel(item.path, self.root)
+            path = item.path
+            if path not in rel_of:
+                rel_of[path] = to_repo_rel(path, self.root)
+            rel = rel_of[path]
             self.item_map[item.nodeid] = rel
             if rel:
                 self.module_files.add(rel)
