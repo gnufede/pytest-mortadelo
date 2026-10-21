@@ -184,9 +184,8 @@ class _Context:
     """Per-run selection facts computed once from the whole shard.
 
     Holds the global conditions (import-time staleness, subprocess-trigger
-    availability) and memoizes ``stale_dep``
-    per block triple: every consumer (collection planning, selection) asks
-    the same questions.
+    availability) and the set of recorded blocks that went stale.  Every
+    consumer (collection planning, selection) asks the same questions.
     """
 
     changed: set[str]
@@ -197,14 +196,10 @@ class _Context:
     # Nothing changed since the recording, at the same commit, with everything
     # a child process could read watched: tests that always re-run do not.
     pristine: bool = False
-    _memo: dict[Block, bool] = field(default_factory=dict)
-
-    def stale(self, dep: Block) -> bool:
-        hit = self._memo.get(dep)
-        if hit is None:
-            hit = stale_dep(dep, self.changed, self.maps)
-            self._memo[dep] = hit
-        return hit
+    # The recorded blocks that went stale -- a tiny set: a test is affected
+    # iff its dependencies intersect it, one C-speed ``isdisjoint`` instead
+    # of scanning its every block.
+    stale_blocks: frozenset[Block] = field(default_factory=frozenset)
 
 
 def _is_candidate_py(rel: str) -> bool:
@@ -220,37 +215,35 @@ def build_context(
     maps: dict[str, FileBlocks | None],
     pristine: bool = False,
 ) -> _Context:
-    """Compute the per-run widening facts (one pass over the shard)."""
-    import_stale = False
-    recorded: set[str] = set()
-    stale_files: set[str] = set()
+    """Compute the per-run widening facts (one pass over the *distinct* blocks).
 
-    def note(block: Block) -> None:
-        rel = block[0]
-        if rel in changed:
-            recorded.add(rel)
-            if stale_dep(block, changed, maps):
-                stale_files.add(rel)
-
-    for b in shard.import_deps:
-        if not import_stale and stale_dep(b, changed, maps):
-            import_stale = True
-        note(b)
+    A shard keeps one dependency set per test, but the blocks repeat: ~1.65M
+    ``(test, block)`` edges on a 2,480-test suite over ~9k distinct blocks.
+    Every widening fact depends only on the distinct blocks, so those are what
+    is iterated here -- and ``affected_reason`` then asks each test one set
+    intersection instead of scanning its every block (3.3M memoized calls, the
+    single largest cost of a run that selects anything).
+    """
+    distinct: set[Block] = set(shard.import_deps)
     for deps in shard.tests.values():
-        for b in deps:
-            note(b)
+        distinct.update(deps)  # C-speed set union per test
 
+    recorded = {b[0] for b in distinct if b[0] in changed}
+    stale = frozenset(
+        b for b in distinct if b[0] in changed and stale_dep(b, changed, maps)
+    )
     changed_py = {f for f in changed if _is_candidate_py(f)}
     spawn_active = bool(changed_py) and bool(
-        (changed_py & stale_files) | (changed_py - recorded)
+        (changed_py & {b[0] for b in stale}) | (changed_py - recorded)
     )
     return _Context(
         pristine=pristine,
         unrecorded_py=bool(changed_py - recorded),
         changed=changed,
         maps=maps,
-        import_stale=import_stale,
+        import_stale=not stale.isdisjoint(shard.import_deps),
         spawn_active=spawn_active,
+        stale_blocks=stale,
     )
 
 
@@ -266,7 +259,7 @@ def affected_reason(
         return "always"
     if ctx.import_stale:
         return "import"
-    if any(ctx.stale(b) for b in deps):
+    if not deps.isdisjoint(ctx.stale_blocks):
         return "stale"
     if ctx.spawn_active and shard.spawn_unknown:
         return "spawn"
