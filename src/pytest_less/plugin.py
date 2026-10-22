@@ -358,9 +358,12 @@ class LessState:
         self.module_files: set[str] = set()
         self.conftest_deps: set[str] = set()
         # Blocks of >function-scoped fixtures each test consumes (static
-        # closure, see _fixture_deps) and a memo for their resolution.
-        self.fixture_deps: dict[str, set[Block]] = {}
-        self._fixture_dep_cache: dict[tuple[str, str, int], Block] = {}
+        # closure, see _fixture_deps).  Items share closures (every test of a
+        # class requests the same fixtures), so resolution is memoized per
+        # fixture *name* and per closure *tuple*.
+        self.fixture_deps: dict[str, frozenset[Block]] = {}
+        self._fixture_names: dict[str, frozenset[Block]] = {}
+        self._fixture_closures: dict[tuple[str, ...], frozenset[Block]] = {}
         self.failed: set[str] = set()
         self.finished: set[str] = set()
         # Collection plan (computed at the start of the collection phase).
@@ -629,7 +632,7 @@ class LessState:
                 if deps:
                     self.fixture_deps[item.nodeid] = deps
 
-    def _fixture_deps(self, item: pytest.Item) -> set[Block]:
+    def _fixture_deps(self, item: pytest.Item) -> frozenset[Block]:
         """Blocks of the >function-scoped fixtures this test consumes.
 
         Their setup code runs once, in the FIRST requesting test's window;
@@ -644,30 +647,48 @@ class LessState:
         PY_START already records it.  Every definition of a name is taken
         (shadowing included), the safe direction.  A lookup that fails leaves
         the dependency out, which is exactly the behavior before this rule.
+
+        ``remember_items`` processes every item in one pass, after collection
+        has registered all fixtures, so the manager's table is final: results
+        are memoized per name, and per closure tuple -- items of one class
+        request the same fixtures, and on the benchmark suite 2,480 items
+        collapse to a few hundred closures.
         """
         try:
             arg2 = item.session._fixturemanager._arg2fixturedefs
         except AttributeError:  # pragma: no cover - pytest internals moved
-            return set()
+            return frozenset()
+        key = tuple(getattr(item, "fixturenames", ()))
+        hit = self._fixture_closures.get(key)
+        if hit is None:
+            deps: set[Block] = set()
+            for name in key:
+                ndeps = self._fixture_names.get(name)
+                if ndeps is None:
+                    ndeps = self._fixture_name_deps(arg2, name)
+                    self._fixture_names[name] = ndeps
+                deps |= ndeps
+            hit = frozenset(deps)
+            self._fixture_closures[key] = hit
+        return hit
+
+    def _fixture_name_deps(self, arg2, name: str) -> frozenset[Block]:
+        """The >function-scoped, repo-resident blocks defined under *name*."""
         deps: set[Block] = set()
-        for name in getattr(item, "fixturenames", ()):
-            for fdef in arg2.get(name) or ():
-                try:
-                    if getattr(fdef, "scope", "function") == "function":
-                        continue
-                    code = getattr(fdef.func, "__code__", None)
-                    if code is None:
-                        continue
-                    rel = self.monitor.repo_rel(code.co_filename)
-                    if rel is None:
-                        continue  # outside the repository
-                    key = (rel, code.co_qualname, code.co_firstlineno)
-                    if key not in self._fixture_dep_cache:
-                        self._fixture_dep_cache[key] = self._fixture_dep(rel, code)
-                    deps.add(self._fixture_dep_cache[key])
-                except Exception:  # noqa: S112 - a lookup must never break the run
+        for fdef in arg2.get(name) or ():
+            try:
+                if getattr(fdef, "scope", "function") == "function":
                     continue
-        return deps
+                code = getattr(fdef.func, "__code__", None)
+                if code is None:
+                    continue
+                rel = self.monitor.repo_rel(code.co_filename)
+                if rel is None:
+                    continue  # outside the repository
+                deps.add(self._fixture_dep(rel, code))
+            except Exception:  # noqa: S112 - a lookup must never break the run
+                continue
+        return frozenset(deps)
 
     def _fixture_dep(self, rel: str, code) -> Block:
         """The block a fixture's body lives in.
