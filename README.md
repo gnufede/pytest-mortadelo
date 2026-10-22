@@ -40,6 +40,44 @@ Options:
 If nothing changed and nothing failed, **zero tests run and pytest exits with
 code 5** ("no tests collected"), just like a `pytest -k nomatch` run.
 
+### When a test depends on something selection cannot see
+
+Two escape hatches, both scoped to the *reason* rather than to a whole
+commit or branch (a cache invalidation can never tell you why):
+
+**`less_watch`** — inputs no Python executes. A `ctypes.CDLL` artifact is
+the canonical case: dlopen is not an import, no event fires, nothing is
+recorded. Naming it makes it a file-level dependency of every test:
+
+```ini
+[pytest]
+less_watch =
+    build/native/*.so      # a '/' anchors the pattern at the repository root
+    *.env                  # without one, the file name at any depth
+    **/config/*.yml         # '**' matches zero or more directories
+```
+
+Any change to a matched file re-runs everything — reported as
+"import-time dependencies changed" — and the no-change fast path stays
+honest while they are untouched. A pattern must match files that exist at
+record time; a brand-new matching file in an unwatched directory is picked
+up by the next record.
+
+**`@pytest.mark.less_always`** — a single test whose outcome depends on
+state no rule can see (the environment, the clock, a memoized value).
+Declared where the person who knows the test lives:
+
+```python
+@pytest.mark.less_always
+def test_dispatch_on_env():
+    assert Handler().run() == "fast"     # chosen by DISPATCH, an env var
+```
+
+It is selected whenever anything changed, exactly like a test that spawns
+a subprocess — but it still records dependencies (the graph keeps
+learning) and is skipped when provably nothing changed at all. Removing
+the marker takes effect the next time the test runs.
+
 ## How it works
 
 ### 1. Dependency collection (`sys.monitoring`, PY_START / PY_RESUME)
