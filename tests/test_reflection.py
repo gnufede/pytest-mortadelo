@@ -670,3 +670,137 @@ class TestLessAlwaysMarker:
         run_less(marked_project, "-q").assert_outcomes(passed=1)  # the file changed
         data = shard_data(marked_project.path)
         assert data["always"] == []
+
+
+class TestDynamicLibraryLoads:
+    """``ctypes.CDLL`` and ``importlib.import_module`` wraps.
+
+    dlopen is not an import: no ``IMPORT_NAME`` bytecode, no Python code
+    objects, so the artifact is invisible to both the event model and the
+    import scan.  The wrap records the resolved library as a file-level
+    dependency.  ``import_module`` produces no ``IMPORT_NAME`` opcode (it
+    is a plain function call), so the bytecode scan cannot see it either;
+    the wrap records the resolved module's skeleton -- the ``sys.modules``
+    gap, where only the first import runs the module's code."""
+
+    def test_cdll_dep_resolves_paths(self, tmp_path):
+        from pytest_less.monitoring import FileMonitor
+
+        (tmp_path / "lib.so").write_bytes(b"\x00")
+        monitor = FileMonitor(tmp_path, data_files=False)
+        assert monitor._cdll_dep("lib.so") is None  # outside the repo (cwd)
+        # a path inside the repo root
+        monitor.repo_rel(str(tmp_path / "lib.so"))  # warm the cache
+        assert monitor._cdll_dep(str(tmp_path / "lib.so")) == "lib.so"
+        # a bare name resolves to None (not on a loader path into the repo)
+        assert monitor._cdll_dep("libSystem") is None
+
+    def test_track_cdll_records_when_active(self, tmp_path):
+        from pytest_less.blocks import WILDCARD
+        from pytest_less.monitoring import FileMonitor
+
+        (tmp_path / "lib.so").write_bytes(b"\x00")
+        monitor = FileMonitor(tmp_path, data_files=False)
+        monitor._active = True
+        monitor.phase = "test"
+        monitor.current_nodeid = "t"
+        monitor._track_cdll(str(tmp_path / "lib.so"))
+        assert ("t", {("lib.so", WILDCARD, WILDCARD)}) in monitor.test_deps.items()
+        # disabled: records nothing
+        monitor._active = False
+        monitor._track_cdll(str(tmp_path / "lib.so"))
+        assert len(monitor.test_deps) == 1  # unchanged
+
+    def test_import_module_on_a_cached_module_records_the_skeleton(self, pytester):
+        make_project(
+            pytester,
+            {
+                "lib.py": "CONST = 1\n\ndef f():\n    return CONST\n",
+                "tests/conftest.py": "",
+                "tests/test_a.py": "def test_a():\n    import lib\n    assert lib.f() == 1\n",
+                "tests/test_b.py": (
+                    "import importlib\n\n"
+                    "def test_b():\n"
+                    "    lib = importlib.import_module('lib')\n"
+                    "    assert lib.CONST == 1\n"
+                ),
+            },
+        )
+        run_less(pytester, "-q").assert_outcomes(passed=2)
+        # edit the module-level code: test_b holds the skeleton via the wrap
+        (pytester.path / "lib.py").write_text("CONST = 30\n\ndef f():\n    return CONST\n")
+        result = run_less(pytester, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
+
+    def test_the_interceptors_install_and_remove(self):
+        import ctypes
+        import importlib
+        import tempfile
+        from pathlib import Path
+
+        from pytest_less.monitoring import FileMonitor
+
+        orig_init = ctypes.CDLL.__init__
+        orig_im = importlib.import_module
+        root = Path(tempfile.mkdtemp())
+        monitor = FileMonitor(root, data_files=False)
+        monitor.activate()
+        assert ctypes.CDLL.__init__ is not orig_init
+        assert importlib.import_module is not orig_im
+        monitor.deactivate()
+        assert ctypes.CDLL.__init__ is orig_init
+        assert importlib.import_module is orig_im
+
+    def test_a_disabled_monitor_records_nothing(self):
+        import importlib
+        import tempfile
+        from pathlib import Path
+
+        from pytest_less.monitoring import FileMonitor
+
+        root = Path(tempfile.mkdtemp())
+        monitor = FileMonitor(root, data_files=False)
+        monitor._active = False
+        importlib.import_module("json")  # stdlib: would be a no-op anyway
+        assert not monitor.test_deps
+
+    @pytest.mark.skipif(
+        not __import__("shutil").which("cc"), reason="cc not available"
+    )
+    def test_a_ctypes_artifact_rebuild_is_caught_end_to_end(self, pytester):
+        import subprocess as sp
+        import sysconfig
+
+        # ``cc -shared`` produces a loadable file named .so on every
+        # platform we support (macOS included: dlopen accepts it)
+        so = pytester.path / "libplain.so"
+        c = pytester.path / "libplain.c"
+        c.write_text("int answer(void) { return 42; }\n")
+        inc = sysconfig.get_paths()["include"]
+        def build():
+            sp.run(
+                ["cc", "-shared", "-fPIC", "-undefined", "dynamic_lookup",
+                 f"-I{inc}", str(c), "-o", str(so)],
+                check=True,
+            )
+        build()
+        make_project(
+            pytester,
+            {
+                "tests/conftest.py": "",
+                "tests/test_answer.py": (
+                    "import ctypes\n"
+                    "from pathlib import Path\n\n"
+                    "def test_answer():\n"
+                    "    so = Path(__file__).parent / '..' / 'libplain.so'\n"
+                    "    lib = ctypes.CDLL(str(so))\n"
+                    "    assert lib.answer() == 42\n"
+                ),
+            },
+        )
+        run_less(pytester, "-q").assert_outcomes(passed=1)
+        c.write_text("int answer(void) { return 43; }\n")
+        build()
+        result = run_less(pytester, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/1 tests*"])
+        result.assert_outcomes(failed=1)  # 43 != 42

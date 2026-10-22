@@ -687,11 +687,38 @@ class FileMonitor:
     )
 
     def _install_interceptors(self) -> None:
-        """Wrap spawn functions (always) and ``open`` (data files only).
+        """Wrap the runtime entry points whose effects no event can see.
 
-        Wrappers are removed again by :meth:`deactivate`; one that cannot be
-        removed (someone wrapped on top of it) no-ops through the ``_active``
-        check.
+        All wraps share one pattern: a thin ``functools.wraps`` wrapper that
+        calls a tracking method before (or, when the original must run
+        first, after) the original, and the shared ``wrap`` helper that
+        stashes the undo entry.  A wrapper that cannot be installed, or a
+        wrap someone stacked on top of, no-ops through the ``_active``
+        check in the tracking method.  Removed by :meth:`deactivate`.
+
+        What is wrapped and why (the gap each one closes):
+        * *spawn functions* (``subprocess.Popen.__init__``, ``os.system``,
+          ``os.fork``/``exec*``, ``_posixsubprocess.fork_exec``): coverage
+          cannot follow a child process, so a spawning test gets no
+          dependencies and always re-runs (``always``).
+        * ``open`` (data files only): a non-Python in-repo file read by a
+          test is a file-level dependency of that test.
+        * ``ctypes.CDLL.__init__``: dlopen is not an import (no
+          ``IMPORT_NAME`` bytecode, no Python code objects), so the artifact
+          is invisible to both the event model and the import scan.  All
+          public ctypes loaders (``CDLL``, ``PyDLL``, ``WinDLL``, ``OleDLL``,
+          ``cdll.LoadLibrary``) go through ``CDLL.__init__``, and patching
+          the *class method* is immune to ``from ctypes import CDLL``
+          binding-order issues.
+        * ``importlib.import_module``: the reflective-import API produces
+          no ``IMPORT_NAME`` opcode in the caller's bytecode (it is a plain
+          function call), so the bytecode import scan cannot see it.  The
+          ``import`` *statement* is already covered (the scan reads its
+          opcodes; ``PY_START`` fires the module's code objects).
+          ``sys.meta_path`` was considered and rejected: it fires for every
+          import in the process (stdlib, plugins, everything — millions of
+          times on a test suite) against 57 calls for the ``import_module``
+          wrapper on sqlalchemy.
         """
         import functools
 
@@ -706,15 +733,30 @@ class FileMonitor:
                 return
             self._undo.append((owner, name, orig, wrapper))
 
-        def spawn_wrapper(orig):
-            note = self._note_spawn
+        def intercept(track, *, after=False):
+            """A wrapper factory: call ``track(*args)`` and then the
+            original (or the original first and then the track, when the
+            tracking needs the original's result — ``import_module`` must
+            return the module before we can resolve its file)."""
 
-            @functools.wraps(orig)
-            def wrapper(*a, **k):
-                note()
-                return orig(*a, **k)
+            def make(orig):
+                if after:
+                    @functools.wraps(orig)
+                    def wrapper(*a, **k):
+                        result = orig(*a, **k)
+                        track(*a, **k)
+                        return result
+                else:
+                    @functools.wraps(orig)
+                    def wrapper(*a, **k):
+                        track(*a, **k)
+                        return orig(*a, **k)
+                return wrapper
 
-            return wrapper
+            return make
+
+        def note_spawn(*a, **k):
+            self._note_spawn()
 
         for modname, attr in self._SPAWN_TARGETS:
             try:
@@ -727,31 +769,21 @@ class FileMonitor:
                 owner = getattr(module, cls, None)
                 if owner is None:  # pragma: no cover
                     continue
-            wrap(owner, leaf, spawn_wrapper)
+            wrap(owner, leaf, intercept(note_spawn))
 
         if self._data_files:
             import builtins
             import io
 
-            def make_open_wrapper(is_output):
-                def open_wrapper(orig):
-                    track = self._track_open
+            def track_py_open(*a, **k):
+                file = a[0] if a else k.get("file")
+                mode = a[1] if len(a) > 1 else k.get("mode", "r")
+                self._track_open(file, _mode_is_output_only(mode))
 
-                    @functools.wraps(orig)
-                    def wrapper(file, *a, **k):
-                        track(file, is_output(a, k))
-                        return orig(file, *a, **k)
-
-                    return wrapper
-
-                return open_wrapper
-
-            py_open = make_open_wrapper(
-                lambda a, k: _mode_is_output_only(a[0] if a else k.get("mode", "r"))
-            )
-            fd_open = make_open_wrapper(
-                lambda a, k: _flags_are_output_only(a[0] if a else k.get("flags"))
-            )
+            def track_fd_open(*a, **k):
+                file = a[0] if a else k.get("file")
+                flags = a[1] if len(a) > 1 else k.get("flags")
+                self._track_open(file, _flags_are_output_only(flags))
 
             # ``builtins.open`` and ``io.open`` are the same object; wrap
             # both bindings (pathlib and most libraries go through one of
@@ -759,9 +791,31 @@ class FileMonitor:
             # directly by plenty of code (and by libraries that want a raw
             # fd), so it needs its own wrapper: without it those reads are
             # invisible and an edited data file selects nothing.
-            wrap(builtins, "open", py_open)
-            wrap(io, "open", py_open)
-            wrap(os, "open", fd_open)
+            wrap(builtins, "open", intercept(track_py_open))
+            wrap(io, "open", intercept(track_py_open))
+            wrap(os, "open", intercept(track_fd_open))
+
+        # ctypes.CDLL.__init__: the class method, so every subclass
+        # constructor (PyDLL, WinDLL, OleDLL) and every LibraryLoader
+        # (cdll.LoadLibrary) goes through it.
+        import ctypes
+
+        def track_cdll(self_, name, *a, **k):
+            # ``self_`` is the CDLL instance: patching a class method means
+            # the wrapper receives the bound instance first
+            self._track_cdll(name)
+
+        if hasattr(ctypes, "CDLL"):
+            wrap(ctypes.CDLL, "__init__", intercept(track_cdll))
+
+        # importlib.import_module: resolved after the call (the module must
+        # exist before we can ask it where it lives).
+        import importlib
+
+        def track_import_module(name, package=None):
+            self._track_import_module(name, package)
+
+        wrap(importlib, "import_module", intercept(track_import_module, after=True))
 
     def _remove_interceptors(self) -> None:
         while self._undo:
@@ -795,6 +849,69 @@ class FileMonitor:
                 self.spawn_shared = True
         except Exception:  # pragma: no cover - never break the call we wrap
             pass
+
+    def _cdll_dep(self, name: str) -> str | None:
+        """Repo-relative path of a dynamically loaded library, or None.
+
+        dlopen semantics: a name containing a path separator is a path
+        (relative to the process cwd); a bare name is searched by the
+        dynamic loader -- of which only entries on the loader path env
+        vars can land inside the repository.  System libraries are outside
+        the watched universe and are skipped."""
+        try:
+            if "/" in name or os.sep in name:
+                p = Path(name)
+                if not p.is_absolute():
+                    p = Path.cwd() / p
+                return self.repo_rel(os.fspath(p))
+            for var in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
+                for d in os.environ.get(var, "").split(os.pathsep):
+                    if d:
+                        p = Path(d) / name
+                        if p.is_file():
+                            rel = self.repo_rel(os.fspath(p))
+                            if rel is not None:
+                                return rel
+            return None
+        except Exception:
+            return None
+
+    def _track_cdll(self, name) -> None:
+        """A dynamically loaded in-repo library is a file-level dependency
+        of whoever loaded it (the same shape the import scan gives a .so:
+        dlopen is not an import, but the artifact is equally a dependency).
+        A bare name that resolves outside the repository is skipped."""
+        if not self._active or not isinstance(name, str):
+            return
+        try:
+            rel = self._cdll_dep(name)
+            if rel is not None:
+                self._bucket(((rel, WILDCARD, WILDCARD),))
+        except Exception:
+            pass  # tracking must never break the load it observes
+
+    def _track_import_module(self, name, package) -> None:
+        """The module a reflective import resolved to is a dependency of
+        whoever imported it -- its *skeleton* if it is a .py (exactly what
+        the bytecode import scan records for a plain ``import``), a
+        file-level wildcard if it is an extension module.  This is the
+        ``sys.modules`` gap: only the first import runs the module's code,
+        every later one is a silent dict hit."""
+        if not self._active:
+            return
+        try:
+            module = sys.modules.get(
+                importlib.util.resolve_name(name, package) if isinstance(name, str) else name
+            )
+            if module is None:
+                return  # the import failed (the original already raised)
+            f = getattr(module, "__file__", None)
+            if f:
+                rel = self.repo_rel(f)
+                if rel is not None:
+                    self._bucket((self.module_dep(rel),))
+        except Exception:
+            pass  # tracking must never break the import it observes
 
     def _track_open(self, path, output_only: bool = False) -> None:
         """Record a non-Python in-repo file opened while the monitor is active
