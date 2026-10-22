@@ -596,3 +596,77 @@ class TestWatchedFiles:
         (pytester.path / "artifact.bin").write_text("v2\n")
         result = run_less(pytester, "-v")
         result.stdout.fnmatch_lines(["*selected 1/1 tests*"])
+
+
+class TestLessAlwaysMarker:
+    """``@pytest.mark.less_always``: the targeted escape hatch.
+
+    The test says its outcome depends on things no rule can see (the
+    environment, time, a memoized value) -- so it is selected whenever
+    anything changed, exactly like a spawner, but unlike the spawner rule
+    it still records dependencies (the graph keeps learning), it is
+    skipped when provably nothing changed (the pristine rule), and it is
+    counted in the run summary.  Removing the marker takes effect on the
+    next run of the test."""
+    # ^ docstring ends here; the tests follow
+
+    @pytest.fixture
+    def marked_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "lib.py": "def f():\n    return 1\n",
+                "tests/conftest.py": "",
+                "tests/test_plain.py": "def test_plain():\n    import lib\n    assert lib.f() == 1\n",
+                "tests/test_marked.py": (
+                    "import pytest\n\n"
+                    "@pytest.mark.less_always\n"
+                    "def test_marked():\n"
+                    "    import lib\n"
+                    "    assert lib.f() == 1\n"
+                ),
+            },
+        )
+        return pytester
+
+    def test_any_edit_selects_the_marked_test(self, marked_project):
+        run_less(marked_project, "-q").assert_outcomes(passed=2)
+        # a comment appended to lib.py: no block is stale, nothing for
+        # test_plain -- but the marked test re-runs
+        path = marked_project.path / "lib.py"
+        path.write_text(path.read_text() + "\n# a comment\n")
+        result = run_less(marked_project, "-v")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
+        result.stdout.fnmatch_lines(["*1 always re-run*"])
+
+    def test_nothing_changed_skips_even_the_marked_test(self, marked_project):
+        run_less(marked_project, "-q").assert_outcomes(passed=2)
+        result = run_less(marked_project, "-q")
+        assert result.ret == 5
+        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
+
+    def test_the_marked_test_still_records_dependencies(self, marked_project):
+        from test_plugin import shard_data
+
+        run_less(marked_project, "-q").assert_outcomes(passed=2)
+        data = shard_data(marked_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        idx = data["tests"]["tests/test_marked.py::test_marked"]
+        assert "f" in {table[i][1] for i in idx}  # deps recorded normally
+        assert "tests/test_marked.py::test_marked" in data["always"]
+
+    def test_removing_the_marker_takes_effect(self, marked_project):
+        run_less(marked_project, "-q").assert_outcomes(passed=2)
+        path = marked_project.path / "tests" / "test_marked.py"
+        path.write_text(
+            "import pytest\n\n"
+            "def test_marked():\n"
+            "    import lib\n"
+            "    assert lib.f() == 1\n"
+        )
+        from test_plugin import shard_data
+
+        run_less(marked_project, "-q").assert_outcomes(passed=1)  # the file changed
+        data = shard_data(marked_project.path)
+        assert data["always"] == []

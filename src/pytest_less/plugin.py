@@ -381,6 +381,10 @@ class LessState:
         # A claim the stored shard does not know yet (see _try_fast_path):
         # this run records everything so the claims take effect.
         self.new_claims = False
+        # Tests carrying the less_always marker: re-run whenever anything
+        # changed (the targeted escape hatch for tests whose outcomes
+        # depend on state no rule can see).
+        self.marker_always: set[str] = set()
         self.fixture_deps: dict[str, frozenset[Block]] = {}
         self._fixture_names: dict[str, frozenset[Block]] = {}
         self._fixture_closures: dict[tuple[str, ...], frozenset[Block]] = {}
@@ -729,6 +733,8 @@ class LessState:
             self.item_map[item.nodeid] = rel
             if rel:
                 self.module_files.add(rel)
+            if item.get_closest_marker("less_always") is not None:
+                self.marker_always.add(item.nodeid)
             if self.monitor is not None:
                 deps = self._fixture_deps(item)
                 if deps:
@@ -1102,7 +1108,16 @@ class LessState:
         alive = set(tests) | set(self.item_map)
         observed = self.finished
         old_always = old_shard.always if old_shard is not None else set()
-        always = (set(monitor.spawn_tests) | (old_always - observed)) & alive
+        # spawn_tests: coverage cannot follow a child process.  marker_always:
+        # the test itself declares that its outcome depends on things no rule
+        # can see (environment, time, a memoized value).  Both are replaced by
+        # this run's observations for tests that ran; tests that did not run
+        # inherit their previous belief.
+        always = (
+            set(monitor.spawn_tests)
+            | self.marker_always
+            | (old_always - observed)
+        ) & alive
         unobserved_old = (set(old_tests) & alive) - observed
         spawn_unknown = monitor.spawn_shared or (
             old_shard is not None and old_shard.spawn_unknown and bool(unobserved_old)
@@ -1223,6 +1238,12 @@ def _shard_documents(
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        "less_always: re-run this test whenever anything changed (it is "
+        "skipped only when provably nothing changed at all) -- for tests "
+        "whose outcome depends on state no selection rule can see",
+    )
     option = config.option
     enabled = bool(getattr(option, "less", False)) or _env_enabled()
     early_monitor = getattr(config, "_less_early_monitor", None)
