@@ -218,7 +218,12 @@ whose producer already ran; it never executes anything to resolve a name.
 
 - *Dispatch that depends on state we do not track* — the environment, time,
   randomness, installed packages, external services. The fundamental limit of
-  test impact analysis without hermetic environments.
+  test impact analysis without hermetic environments. (Code sample below.)
+- *Memoized function calls* (`functools.lru_cache`, `functools.cache`,
+  hand-rolled caches and `if _CACHED is None` patterns): only the first
+  caller records the edge — a later caller with the same arguments executes
+  nothing, so no event fires, and no static knowledge exists that could
+  record it. (Code sample below.)
 - *C extensions in the repository*: `.c`/`.so` changes never select anything
   (nothing to hash); shared by every Python TIA.
 - *CPython's own `.pyc` same-size same-second race*: CPython may execute
@@ -239,3 +244,95 @@ whose producer already ran; it never executes anything to resolve a name.
 - *Interpreters newer than 3.15*: every file is a file-level dependency
   (any change re-runs its tests) until the hasher is validated for that
   version — never a guess.
+
+### Not handled, sample 1: a memoized function (`lru_cache`)
+
+The third sibling of the first-consumer-wins family — the one with no static
+rule to cover it. Later `import`s are invisible → the import bytecode scan
+covers them (minimal repro 2). A shared fixture's setup runs once → the
+fixture closure covers its consumers (minimal repro 1). A memoized function
+called by a second test with the same arguments executes *nothing* in that
+test's window — and Python has no static knowledge of which test calls
+which function (unlike fixture requests, which pytest knows, and `import`
+bytecode, which the scan sees). Line-coverage tools miss these calls too:
+no line of the function runs.
+
+```python
+# lib.py
+import functools
+
+@functools.lru_cache
+def compute(x):
+    return x * 10
+```
+
+```python
+# test_a.py
+def test_a():
+    import lib
+    assert lib.compute(1) == 10   # first call: executes compute -> recorded
+```
+
+```python
+# test_b.py
+def test_b():
+    import lib
+    assert lib.compute(1) == 10   # cache hit: nothing executes -> NOT recorded
+```
+
+Recorded: `test_a` holds `lib:compute` (the first call's `PY_START`);
+`test_b` holds only `lib:<module>` (the import scan). Edit the body
+(`x * 10` → `x * 100`):
+
+- `--less` rerun: `selected 1/2 tests` — `test_b` is **silently skipped**;
+- ground truth (no `--less`): `2 failed`.
+
+A cache *miss* with different arguments executes and is recorded; only hits
+are invisible. A `cache_clear()` between tests restores recording.
+
+### Not handled, sample 2: computed `getattr` on untracked state
+
+The repo-resident variant of computed dispatch is covered: adding a
+`handle_x` method changes the class body, a block every importer holds, so
+a test that could reach it re-runs (that is what made removing the static
+`getattr` markers safe — see minimal repro 1). The uncovered variant is
+when the *choice itself* depends on state selection never sees:
+
+```python
+# lib.py
+import os
+
+class Handler:
+    def fast(self):
+        return "fast"
+
+    def slow(self):
+        return "slow"
+
+    def run(self):
+        # the target is chosen by an environment variable: not a file,
+        # not a fixture, nothing the recording ever sees
+        return getattr(self, os.environ.get("DISPATCH", "fast"))()
+```
+
+```python
+# test_dispatch.py
+def test_dispatch():
+    import lib
+    assert lib.Handler().run() in ("fast", "slow")
+```
+
+Recorded with `DISPATCH` unset, the test holds exactly `run`, `fast`, the
+`Handler` class block and `lib:<module>` — no `slow`. Edit `slow`'s body
+(`"slow"` → `"crawling"`):
+
+- `--less` rerun, same state: `selected 0/1 tests` — **correct**: nothing
+  the test executed changed (this precision is deliberate; a handler the
+  test never ran does not re-run it), and the test still passes;
+- `DISPATCH=slow python -m pytest` (no `--less`): `1 failed` — the outcome
+  changed on a path no recorded dependency covers.
+
+Every rule the plugin has is about code and files; this dispatch is decided
+by process state. Widening every computed `getattr` to file level — the
+removed static markers — selected 2,480 of 2,480 sqlalchemy tests on
+one-function edits while guarding nothing the block rules miss.
