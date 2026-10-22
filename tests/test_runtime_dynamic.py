@@ -150,7 +150,7 @@ class TestReflectiveEntryPoints:
         return FileMonitor(tmp_path)._analyze(code)
 
     def test_import_module_leaves_the_pseudo_dependency(self, tmp_path):
-        assert self.analyze(tmp_path, importlib.import_module.__code__) == {
+        assert self.analyze(tmp_path, importlib.import_module.__wrapped__.__code__) == {
             DYNAMIC_DEP
         }
 
