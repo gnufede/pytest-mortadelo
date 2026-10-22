@@ -231,3 +231,82 @@ class TestAResumedGeneratorIsADependency:
         for nid, idx in data["tests"].items():
             names = {table[i][1] for i in idx}
             assert "numbers" in names, (nid, names)
+
+
+class TestModuleLevelCodeIsTracked:
+    """PY_START (+ PY_RESUME) sees code outside functions too.
+
+    A module body, a class body and the functions *called by* module-level
+    code are all code objects that start (or resume) in some window, so the
+    test that triggers them holds the dependency:
+
+    * a lazy ``import lib`` inside a test runs ``lib``'s ``<module>`` there;
+    * the import-time ``X = compute(10)`` attributes ``compute`` to the
+      importing test, and ``class C:`` attributes the class-body block;
+    * a class body defined *inside* a test is a block of its own
+      (``test_x.<locals>.D``), so editing it selects that test alone;
+    * editing a module-level or class-level statement stales the module
+      skeleton, which every importer holds.
+    """
+
+    @pytest.fixture
+    def lib_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "lib.py": (
+                    "def compute(n):\n    return n * 2\n\n"
+                    "X = compute(10)\n\n"
+                    "class C:\n    Y = compute(5)\n\n    def m(self):\n        return self.Y\n"
+                ),
+                "tests/conftest.py": "",
+                "tests/test_lazy.py": "def test_lazy():\n    import lib\n    assert lib.X == 20\n",
+                "tests/test_method.py": "def test_method():\n    import lib\n    assert lib.C().m() == 10\n",
+                "tests/test_dyn.py": (
+                    "def test_dyn():\n    class D:\n        Z = 7\n    assert D.Z == 7\n"
+                ),
+            },
+        )
+        return pytester
+
+    def test_the_importing_test_holds_the_module_compute_and_class_blocks(
+        self, lib_project
+    ):
+        from test_plugin import shard_data
+
+        run_less(lib_project, "-q").assert_outcomes(passed=3)
+        data = shard_data(lib_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        deps = {table[i][1] for i in data["tests"]["tests/test_lazy.py::test_lazy"]}
+        assert {"<module>", "compute", "C"} <= deps, deps
+
+    def test_a_module_level_statement_edit_selects_the_importers(self, lib_project):
+        run_less(lib_project, "-q").assert_outcomes(passed=3)
+        (lib_project.path / "lib.py").write_text(
+            (lib_project.path / "lib.py").read_text().replace("X = compute(10)", "X = compute(1000)")
+        )
+        result = run_less(lib_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/3 tests*"])  # both lib importers
+
+    def test_a_class_level_statement_edit_selects_the_importers(self, lib_project):
+        run_less(lib_project, "-q").assert_outcomes(passed=3)
+        (lib_project.path / "lib.py").write_text(
+            (lib_project.path / "lib.py").read_text().replace("Y = compute(5)", "Y = compute(500)")
+        )
+        result = run_less(lib_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
+
+    def test_a_method_body_edit_selects_only_the_caller(self, lib_project):
+        run_less(lib_project, "-q").assert_outcomes(passed=3)
+        (lib_project.path / "lib.py").write_text(
+            (lib_project.path / "lib.py").read_text().replace("return self.Y", "return self.Y * 1")
+        )
+        result = run_less(lib_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
+
+    def test_a_class_body_defined_inside_a_test_is_its_own_block(self, lib_project):
+        run_less(lib_project, "-q").assert_outcomes(passed=3)
+        path = lib_project.path / "tests" / "test_dyn.py"
+        path.write_text(path.read_text().replace("Z = 7", 'Z = int("7")'))
+        result = run_less(lib_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])  # test_dyn alone
