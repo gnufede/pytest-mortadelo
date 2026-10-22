@@ -502,3 +502,97 @@ class TestActiveConfigFile:
         table = [tuple(b) for b in data["blocks"]]
         deps = {table[i] for i in data["import_deps"]}
         assert ("pytest.ini", WILDCARD, WILDCARD) in deps
+
+
+class TestWatchedFiles:
+    """``less_watch``: the refined tracked-files escape hatch.
+
+    Matched files become file-level dependencies of every test -- a
+    dependency, not a cache invalidation: fingerprints watch them,
+    staleness reports them, and the no-change fast path stays honest while
+    they are untouched.  Patterns with a ``/`` anchor at the repository
+    root; without one they match the file name at any depth."""
+
+    @pytest.fixture
+    def watch_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "pytest.ini": "[pytest]\nless_watch =\n    *.env\n    **/config/*.yml\n",
+                ".env": "KEY=1\n",
+                "config/app.yml": "v: 1\n",
+                "lib.py": "def f():\n    return 1\n\ndef g():\n    return 2\n",
+                "tests/conftest.py": "",
+                "tests/test_a.py": "def test_a():\n    import lib\n    assert lib.f() == 1\n",
+                "tests/test_b.py": "def test_b():\n    import lib\n    assert lib.g() == 2\n",
+            },
+        )
+        return pytester
+
+    def test_the_matched_files_are_shared_import_deps(self, watch_project):
+        from test_plugin import shard_data
+
+        run_less(watch_project, "-q").assert_outcomes(passed=2)
+        data = shard_data(watch_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        deps = {table[i] for i in data["import_deps"]}
+        assert (".env", WILDCARD, WILDCARD) in deps
+        assert ("config/app.yml", WILDCARD, WILDCARD) in deps
+
+    def test_an_edit_to_a_watched_file_re_runs_everything(self, watch_project):
+        run_less(watch_project, "-q").assert_outcomes(passed=2)
+        (watch_project.path / ".env").write_text("KEY=2\n")
+        result = run_less(watch_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
+
+    def test_an_anchored_pattern_watches_nested_directories(self, watch_project):
+        run_less(watch_project, "-q").assert_outcomes(passed=2)
+        (watch_project.path / "config" / "app.yml").write_text("v: 2\n")
+        result = run_less(watch_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
+
+    def test_watch_does_not_widen_ordinary_edits(self, watch_project):
+        run_less(watch_project, "-q").assert_outcomes(passed=2)
+        path = watch_project.path / "lib.py"
+        path.write_text(path.read_text().replace("return 2", "return 2 + 1"))
+        result = run_less(watch_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
+
+    def test_an_unmatched_pattern_is_harmless(self, pytester):
+        make_project(
+            pytester,
+            {
+                "pytest.ini": "[pytest]\nless_watch = *.nomatch\n",
+                "lib.py": "def f():\n    return 1\n",
+                "tests/conftest.py": "",
+                "tests/test_a.py": "def test_a():\n    import lib\n    assert lib.f() == 1\n",
+            },
+        )
+        result = run_less(pytester, "-q")
+        result.assert_outcomes(passed=1)
+
+    def test_adopting_a_pattern_after_a_record_re_records_everything(self, pytester):
+        # a shard recorded BEFORE the pattern: the watched file is nobody's
+        # dependency in it, and the no-change fast path would deselect
+        # everything forever, so the claim could never take effect.  The
+        # run after adopting must record everything once.
+        make_project(
+            pytester,
+            {
+                "artifact.bin": "v1\n",
+                "lib.py": "def f():\n    return 1\n",
+                "tests/conftest.py": "",
+                "tests/test_a.py": "def test_a():\n    import lib\n    assert lib.f() == 1\n",
+            },
+        )
+        run_less(pytester, "-q").assert_outcomes(passed=1)
+        (pytester.path / "pytest.ini").write_text("[pytest]\nless_watch = artifact.bin\n")
+        result = run_less(pytester, "-v")
+        result.stdout.fnmatch_lines(
+            ["*selected 1/1 tests: new shared dependencies*"]
+        )
+        result.assert_outcomes(passed=1)
+        # the claim is now an ordinary dependency of every test
+        (pytester.path / "artifact.bin").write_text("v2\n")
+        result = run_less(pytester, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/1 tests*"])

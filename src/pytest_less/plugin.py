@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from datetime import UTC, datetime
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -226,6 +227,18 @@ def _selectors_active(config: pytest.Config) -> bool:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addini(
+        "less_watch",
+        help="space/newline-separated glob patterns: matched files become "
+        "file-level dependencies of EVERY test, so any change to them "
+        "re-runs everything (the refined 'tracked files' escape hatch: a "
+        "dependency, not a cache invalidation). A pattern containing '/' "
+        "is matched against the path from the repository root; without one "
+        "it matches the file name at any depth ('*.env' matches '.env' "
+        "anywhere). Venvs, caches and hidden directories are never crawled.",
+        type="args",
+        default=(),
+    )
     group = parser.getgroup("less", "test impact analysis by file monitoring")
     group.addoption(
         "--less",
@@ -362,8 +375,12 @@ class LessState:
         # class requests the same fixtures), so resolution is memoized per
         # fixture *name* and per closure *tuple*.
         # Files that are a dependency of every test at *file* level: any
-        # change re-runs everything (the active configuration file).
+        # change re-runs everything (the active configuration file, the
+        # ``less_watch`` matches).
         self.wildcard_deps: set[str] = set()
+        # A claim the stored shard does not know yet (see _try_fast_path):
+        # this run records everything so the claims take effect.
+        self.new_claims = False
         self.fixture_deps: dict[str, frozenset[Block]] = {}
         self._fixture_names: dict[str, frozenset[Block]] = {}
         self._fixture_closures: dict[tuple[str, ...], frozenset[Block]] = {}
@@ -402,6 +419,7 @@ class LessState:
             return
 
         self._collect_conftest_deps(config)
+        self._collect_watch_deps(config)
         self.store = _shared_store(config, self.root, config.invocation_params.args)
         sync = _sync_remote(config)
         if sync is not None:
@@ -474,6 +492,13 @@ class LessState:
         self._meta = meta
         if meta is None or config.option.less_force:
             return False
+        # A file-level dependency of every test claimed now that the stored
+        # shard does not know -- a less_watch pattern adopted, the ini file
+        # appearing, a shard from before the claims existed -- is a
+        # configuration change.  The fast path would deselect everything
+        # and never re-record, so the claim would never take effect.
+        if self.wildcard_deps - set(meta.get("dep_files") or ()):
+            return False
         if _selectors_active(config):
             self.selectors_active = True
             return False
@@ -535,6 +560,55 @@ class LessState:
             if rel:
                 self.wildcard_deps.add(rel)
 
+    def _collect_watch_deps(self, config: pytest.Config) -> None:
+        """Files matching the ``less_watch`` patterns become file-level
+        dependencies of every test.
+
+        The refined version of the "tracked files" escape hatch other TIA
+        tools offer: not a cache invalidation but a *dependency*, so it
+        composes -- fingerprints watch the files, staleness reports them as
+        "import-time dependencies changed", and the no-change fast path
+        stays honest while they are untouched.  It reaches what neither the
+        events nor the import scan can see: inputs a test consumes without
+        executing any Python for them (a ``ctypes.CDLL`` artifact, a config
+        a child process reads).
+
+        Semantics: a pattern containing ``/`` is matched (fnmatch, so
+        ``*`` may cross directory separators -- over-matching, the safe
+        direction) against the path from the repository root; without one
+        it matches the file name at any depth, like ``.gitignore`` basics.
+        Hidden directories, venvs, caches and site-packages are never
+        crawled, whatever the pattern.  A file must exist at record time
+        to be watched; a brand-new matching file in an unwatched directory
+        is picked up by the next record.
+        """
+        patterns = config.getini("less_watch")
+        if not patterns:
+            return
+        excluded = {"__pycache__", ".git"} | _EXCLUDED_SEGMENTS
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [
+                d for d in dirnames if d not in excluded and not d.startswith(".")
+            ]
+            for name in filenames:
+                for pat in patterns:
+                    full = os.path.join(dirpath, name)
+                    rel = to_repo_rel(full, self.root)
+                    if rel is None:
+                        continue
+                    if "/" in pat:
+                        # fnmatch has no glob ``**``: it also matches zero
+                        # leading directories, so ``**/a/*.yml`` must also be
+                        # tried as ``a/*.yml`` (``*`` may cross ``/`` in
+                        # fnmatch, which over-matches -- the safe direction).
+                        variants = {pat, pat[3:]} if pat.startswith("**/") else {pat}
+                        if any(fnmatch(rel, q) for q in variants):
+                            self.wildcard_deps.add(rel)
+                            break
+                    elif fnmatch(name, pat):
+                        self.wildcard_deps.add(rel)
+                        break
+
     # -- collection / selection ------------------------------------------
 
     def plan(self, config: pytest.Config) -> None:
@@ -558,6 +632,14 @@ class LessState:
             self.notes.append(f"less: could not compute changes ({e!r}); running everything")
             return
         self.changed = changed
+        if self.wildcard_deps - set((self._meta or {}).get("dep_files") or ()):
+            # Same condition as _try_fast_path, from the selection side: the
+            # watched file is nobody's dependency in the old shard, so
+            # normal selection would never notice it.  This run records
+            # everything; the claims are ordinary dependencies from the next
+            # record on.
+            self.new_claims = True
+            return
         if changed is None:
             return
         self.pristine = self.store.is_pristine(self.shard.base_commit, changed)
@@ -749,6 +831,13 @@ class LessState:
         elif config.option.less_force:
             self.selection = Selection(
                 collected, [], set(), "--less-force: running everything"
+            )
+            return
+        elif self.new_claims:
+            self.selection = Selection(
+                collected, [], set(self.changed or ()),
+                "new shared dependencies (less_watch / the config file): "
+                "recording everything",
             )
             return
         elif self.selectors_active:
