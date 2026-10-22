@@ -458,3 +458,47 @@ class TestFixtureClosureConsumers:
         assert ("conftest.py", "value") in pairs  # runtime already recorded it
         assert ("conftest.py", WILDCARD) not in pairs  # and the closure added nothing wider
         assert all(f != "conftest.py" or q == "value" for f, q in pairs)
+
+
+class TestActiveConfigFile:
+    """pytest parses pytest.ini / pyproject.toml / tox.ini / setup.cfg before
+    the earliest hook a plugin can use, so no event ever saw the read: the
+    file never became a dependency, and a config change selected nothing
+    (observed: it even went through the no-change fast path).  The active
+    ini is now claimed as a shared file-level dependency -- pytest itself
+    says which file it parsed (``config.inifile``), so there is no list to
+    maintain and no glob to guess."""
+
+    @pytest.fixture
+    def ini_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "pytest.ini": "[pytest]\n",
+                "tests/conftest.py": "",
+                "tests/test_warn.py": (
+                    "def test_warn():\n"
+                    "    import warnings\n"
+                    '    warnings.warn("boom")\n'
+                ),
+            },
+        )
+        return pytester
+
+    def test_a_config_edit_selects_everything(self, ini_project):
+        run_less(ini_project, "-q").assert_outcomes(passed=1)
+        (ini_project.path / "pytest.ini").write_text(
+            "[pytest]\nfilterwarnings = error\n"
+        )
+        result = run_less(ini_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/1 tests*"])
+        result.assert_outcomes(failed=1)  # the warning is now an error
+
+    def test_the_ini_is_a_shared_import_dependency(self, ini_project):
+        from test_plugin import shard_data
+
+        run_less(ini_project, "-q").assert_outcomes(passed=1)
+        data = shard_data(ini_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        deps = {table[i] for i in data["import_deps"]}
+        assert ("pytest.ini", WILDCARD, WILDCARD) in deps

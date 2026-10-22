@@ -361,6 +361,9 @@ class LessState:
         # closure, see _fixture_deps).  Items share closures (every test of a
         # class requests the same fixtures), so resolution is memoized per
         # fixture *name* and per closure *tuple*.
+        # Files that are a dependency of every test at *file* level: any
+        # change re-runs everything (the active configuration file).
+        self.wildcard_deps: set[str] = set()
         self.fixture_deps: dict[str, frozenset[Block]] = {}
         self._fixture_names: dict[str, frozenset[Block]] = {}
         self._fixture_closures: dict[tuple[str, ...], frozenset[Block]] = {}
@@ -514,6 +517,23 @@ class LessState:
                 rel = to_repo_rel(filename, self.root)
                 if rel:
                     self.conftest_deps.add(rel)
+        # The active configuration file (config.inifile: pytest.ini,
+        # pyproject.toml, tox.ini, setup.cfg) is parsed by pytest before the
+        # earliest hook a plugin can use, so no event ever sees the read --
+        # a config change used to select nothing.  Claiming it here needs no
+        # configured list: pytest itself says which file affected this run,
+        # and any change to it re-running everything is exactly what a
+        # config change means.  A file-level dependency, deliberately NOT a
+        # block hash: ini files often happen to parse as Python
+        # ("[pytest]" reads as a one-element list), and Python-visible
+        # equivalence is not ini equivalence -- configparser keeps a
+        # trailing "# note" *inside* a value while Python strips it as a
+        # comment, so two different configs could hash identically.
+        inifile = getattr(config, "inifile", None)
+        if inifile is not None:
+            rel = to_repo_rel(os.fspath(inifile), self.root)
+            if rel:
+                self.wildcard_deps.add(rel)
 
     # -- collection / selection ------------------------------------------
 
@@ -887,6 +907,8 @@ class LessState:
         # empty conftest files.)
         for rel in self.conftest_deps:
             import_blocks.add(monitor.module_dep(rel))
+        for rel in self.wildcard_deps:
+            import_blocks.add((rel, WILDCARD, WILDCARD))
         # Keep previously recorded import-time deps (conservative: a module
         # that stopped being imported still re-runs its dependents).
         if old_shard is not None:

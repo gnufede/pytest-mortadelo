@@ -178,10 +178,11 @@ guarding nothing those rules miss. What stays uncovered is dispatch that depends
 on state the plugin does not track (the environment, time, randomness,
 installed packages), the same as for any test impact analysis — memoized
 calls (`lru_cache`, `cached_property` on shared instances): only the first
-caller records the edge; configuration files, which pytest parses before
-the monitor arms; order-dependent tests; and directory listings (only
-`open` is wrapped). `docs/correctness.md` has verified code samples of
-all of them.
+caller records the edge; order-dependent tests; and directory listings
+(only `open` is wrapped). `docs/correctness.md` has verified code samples
+of all of them. The active configuration file (`pytest.ini` /
+`pyproject.toml` / ...) is claimed as a shared dependency: a config change
+selects everything.
 
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).

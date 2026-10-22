@@ -233,10 +233,9 @@ whose producer already ran; it never executes anything to resolve a name.
   a later caller with the same arguments executes nothing, so no event
   fires, and no static knowledge exists that could record it. (Samples 1
   and 3 below.)
-- *Configuration files* (`pytest.ini`, `pyproject.toml`, `tox.ini`,
-  `setup.cfg`): parsed by pytest before the earliest hook a plugin can use,
-  so they never become dependencies and a config change selects nothing.
-  (Sample 4 below — unlike the others, cheaply fixable.)
+- *Configuration files*: fixed — the active one (`config.inifile`) is now
+  claimed as a shared file-level dependency at collection (sample 4 below
+  tells the story, including the fix).
 - *Order-dependent tests*: a test whose outcome depends on another having
   run first (module globals, `setattr` of data, files one test writes and
   another reads). TIA assumes test independence; this is that assumption.
@@ -397,25 +396,31 @@ Recorded: `test_a` holds `conftest:shared` (the closure) **and**
 `conftest:shared`. Edit the body (`10` → `100`): `selected 1/2 tests`,
 `test_b` silently skipped; ground truth `2 failed`.
 
-### Not handled, sample 4: configuration files are read before arming
+### Sample 4: configuration files — a gap, now fixed mechanically
 
 pytest parses `pytest.ini` / `pyproject.toml` / `tox.ini` / `setup.cfg`
-before the earliest hook a plugin can use, so no event ever sees the read
-and the files never become dependencies. Editing them changes every test's
-environment and selects nothing:
+before the earliest hook a plugin can use, so no event ever saw the read
+and the files never became dependencies. With `test_warn.py` emitting a
+warning, changing `pytest.ini` to `filterwarnings = error` produced:
 
-```ini
-# pytest.ini, changed from an empty [pytest] section
-[pytest]
-filterwarnings = error
-```
+- `--less`: `selected 0/1 tests: no recorded dependency changed; fast
+  path` — the run never even opened the shard;
+- ground truth: `1 failed`.
 
-with `test_warn.py` emitting a warning: after the edit, `--less` reports
-`selected 0/1 tests: no recorded dependency changed; fast path` — the run
-never even opens the shard — while the ground truth is `1 failed`.
-Unlike the other samples this one is fixable: the config files could be
-claimed as file-level import dependencies at arming. They are small, few,
-and affect everything, so any change selecting everything would be correct.
+**Fixed:** the *active* ini file — the one pytest itself reports
+(`config.inifile`) — is claimed as a shared file-level dependency, so a
+config change selects everything, which is what a config change means.
+Two deliberate details: no configured list of globs (pytest says which
+file it parsed, so nothing to maintain or forget); and a *file-level*
+dependency, not a content hash — ini files often happen to parse as
+Python (`[pytest]` reads as a one-element list), but Python-visible
+equivalence is not ini equivalence (configparser keeps a trailing
+`# note` *inside* a value while Python strips it as a comment), so two
+different configs could have hashed identically.
+
+This is the shape we prefer over the "tracked files" escape hatch other
+TIA tools offer: a rule derived from what the system already knows, exact
+by construction, zero configuration.
 
 ### Not handled, sample 5: order-dependent tests
 
