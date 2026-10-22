@@ -1,7 +1,9 @@
 """File dependency collection via ``sys.monitoring`` (Python 3.12+).
 
-Instead of coverage.py-style per-line coverage, the monitor registers a single
-*PY_START* event: every time a code block starts executing it records
+Instead of coverage.py-style per-line coverage, the monitor registers the
+*PY_START* and *PY_RESUME* events: every time a code block starts executing --
+or resumes after a suspension (a generator or coroutine primed elsewhere runs
+its code in whoever's window resumes it) -- it records
 
 * the file the block lives in (file-level coverage -- we deliberately do not
   track lines), and
@@ -569,9 +571,22 @@ class FileMonitor:
         # imports) that the freshly armed tool would otherwise observe.
         self._install_interceptors()
         try:
-            _sys_monitoring.set_events(self._tool_id, monitoring_events.PY_START)
+            # PY_START covers a code object's first execution in a window;
+            # PY_RESUME covers the resumption of a suspended one (generators,
+            # coroutines).  A generator primed by one test and resumed by
+            # another executes its code in the later test's window: without
+            # PY_RESUME that test holds no dependency on the block (seen on
+            # sqlalchemy's class-scoped yield fixtures: 186 tests).  Both
+            # events honor DISABLE per code object until restart_events(),
+            # so the hot path and its once-per-window cost are identical.
+            _sys_monitoring.set_events(
+                self._tool_id, monitoring_events.PY_START | monitoring_events.PY_RESUME
+            )
             _sys_monitoring.register_callback(
                 self._tool_id, monitoring_events.PY_START, self._on_py_start
+            )
+            _sys_monitoring.register_callback(
+                self._tool_id, monitoring_events.PY_RESUME, self._on_py_start
             )
         except ValueError:
             self._remove_interceptors()
@@ -587,6 +602,9 @@ class FileMonitor:
         try:
             _sys_monitoring.register_callback(
                 self._tool_id, monitoring_events.PY_START, None
+            )
+            _sys_monitoring.register_callback(
+                self._tool_id, monitoring_events.PY_RESUME, None
             )
             _sys_monitoring.set_events(self._tool_id, monitoring_events.NO_EVENTS)
         except ValueError:  # pragma: no cover - tool already gone
@@ -803,7 +821,8 @@ class FileMonitor:
     # -- event handling --------------------------------------------------
 
     def _on_py_start(self, code, instruction_offset) -> None:
-        """Hot path: called for every code block start in the process.
+        """Hot path: called for every code block start *or resumption* in the
+        process (PY_START and PY_RESUME share this callback).
 
         Flattened to a dict lookup plus an identity comparison for the
         overwhelmingly common case (a code object already analyzed, still

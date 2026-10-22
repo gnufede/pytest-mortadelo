@@ -183,3 +183,51 @@ class TestPrecision:
         result.stdout.fnmatch_lines(["*selected 1/2 tests*"])
         assert "test_b.py::test_b PASSED" in result.stdout.str()
         assert "test_a.py" not in result.stdout.str().split("selected")[-1]
+
+
+class TestAResumedGeneratorIsADependency:
+    """PY_RESUME: a generator primed by one test runs its code in the test
+    that *resumes* it, so that test depends on the generator's block too.
+
+    Before PY_RESUME was tracked, the resuming test held no dependency: a
+    shared generator edited between runs silently skipped the test (the
+    synthetic case in docs/performance-notes.md; on sqlalchemy, 186 tests
+    consume class-scoped yield fixtures this way)."""
+
+    @pytest.fixture
+    def shared_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "helper.py": (
+                    "def numbers():\n    n = 0\n    while True:\n        n += 1\n        yield n\n\n"
+                    "G = numbers()\n"
+                ),
+                "tests/conftest.py": "",
+                # primes the generator (its PY_START); records the block
+                "tests/test_prime.py": "def test_prime():\n    import helper\n    assert next(helper.G) == 1\n",
+                # only ever resumes it: previously held no 'numbers' dependency
+                "tests/test_resume.py": "def test_resume():\n    import helper\n    assert next(helper.G) == 2\n",
+            },
+        )
+        return pytester
+
+    def test_the_resuming_test_reruns_when_the_generator_changes(self, shared_project):
+        run_less(shared_project, "-q").assert_outcomes(passed=2)
+        (shared_project.path / "helper.py").write_text(
+            "def numbers():\n    n = 0\n    while True:\n        n += 30\n        yield n\n\n"
+            "G = numbers()\n"
+        )
+        result = run_less(shared_project, "-v")
+        # both tests run: the priming one AND the resuming one
+        result.stdout.fnmatch_lines(["*selected 2/2 tests*"])
+
+    def test_the_recorded_shard_names_the_generator_block_for_both(self, shared_project):
+        from test_plugin import shard_data
+
+        run_less(shared_project, "-q").assert_outcomes(passed=2)
+        data = shard_data(shared_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        for nid, idx in data["tests"].items():
+            names = {table[i][1] for i in idx}
+            assert "numbers" in names, (nid, names)

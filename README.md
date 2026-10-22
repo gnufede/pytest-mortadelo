@@ -6,7 +6,7 @@ Minimal **test impact analysis (TIA)** for pytest.
 |---|---|
 | dependency storage | JSON shards stored in git refs |
 | dependency resolution | **code blocks** (qualified name + hash of the compiled bytecode) and module skeletons for imports |
-| dependency collection | a custom `sys.monitoring` tool using **PY_START** events (no per-line tracking) |
+| dependency collection | a custom `sys.monitoring` tool using **PY_START / PY_RESUME** events (no per-line tracking) |
 | dynamic imports | conservative bytecode scan for import opcodes inside every executed code block |
 | import-time dependencies | everything imported before tests start is a dependency of *every* test |
 | change detection | **file fingerprints** recorded with the shard (size, mtime, content hash) — no git in the common case; `git diff` is the fallback |
@@ -40,13 +40,18 @@ code 5** ("no tests collected"), just like a `pytest -k nomatch` run.
 
 ## How it works
 
-### 1. Dependency collection (`sys.monitoring`, PY_START)
+### 1. Dependency collection (`sys.monitoring`, PY_START / PY_RESUME)
 
-The plugin registers a monitoring tool (PEP 669) with a single global event:
-`PY_START`. Tool ids are allocated dynamically (preferring the unnamed ids 4
+The plugin registers a monitoring tool (PEP 669) with two global events:
+`PY_START` (a code block starts executing) and `PY_RESUME` (a suspended one
+resumes). Tool ids are allocated dynamically (preferring the unnamed ids 4
 and 3, then any free id), so several monitors can coexist in one process --
-e.g. the plugin running its own test suite. Every time a code block starts executing it records the repo
-file it lives in — file-level coverage, no lines. On top of that, for every
+e.g. the plugin running its own test suite. Every time a code block starts --
+or, after a suspension, resumes: a generator or coroutine primed by one test
+runs its code in whichever test's window resumes it, and that test depends on
+the block (on sqlalchemy, 186 tests consume class-scoped yield fixtures this
+way) -- it records the repo file it lives in — file-level coverage, no
+lines. On top of that, for every
 code block that starts, the plugin scans its bytecode for `IMPORT_NAME` /
 `IMPORT_FROM` opcodes and resolves the referenced modules to file paths. This
 is the conservative treatment of dynamic imports: an `import` inside a branch
@@ -637,7 +642,7 @@ so it needs network-free local git only.
 ```
 src/pytest_less/
 ├── plugin.py      # pytest hooks, lifecycle, options
-├── monitoring.py  # sys.monitoring tool: PY_START + import bytecode scan
+├── monitoring.py  # sys.monitoring tool: PY_START/PY_RESUME + import bytecode scan
 ├── gitstore.py    # JSON shards behind refs/less/<shard>
 ├── selection.py   # shard parsing + test selection
 └── util.py        # path normalization, command shard key
