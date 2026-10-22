@@ -785,7 +785,7 @@ class TestDynamicLibraryLoads:
 
         def build():
             sp.run(
-                [*flags, f"-I{inc}", str(c), "-o", str(so)],
+                ["cc", *flags, f"-I{inc}", str(c), "-o", str(so)],
                 check=True,
             )
         build()
