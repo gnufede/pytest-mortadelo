@@ -38,7 +38,7 @@ below is pinned by tests in this repository.
    window, so later consumers are recorded statically, from
    `item.fixturenames`.
 
-## The minimal repro: a shared fixture's consumers
+## Minimal repro 1: a shared fixture's consumers
 
 The hole rule 8 closes, small enough to show live in a talk (~30 seconds):
 
@@ -91,6 +91,62 @@ fixture (`setup_class_methods`); a one-line edit to its body selected
 2,055 all consume its value. The recorded cost is 4,859 extra
 `(test, block)` edges on that suite (+0.3 % of the dependency graph), and
 the six standard reference edits select exactly the same tests as before.
+
+## Minimal repro 2: `import` after the first test
+
+The hole rule 4 closes: only the **first** import of a module runs its code —
+every later one is a silent `sys.modules` dict hit, so no event can record
+the dependency. Same shape as repro 1, small enough for a talk (~30 s):
+
+```bash
+mkdir less-import-demo && cd less-import-demo && git init -q
+cat > lib.py <<'EOF'
+CONST = 1
+
+def f():
+    return CONST
+EOF
+cat > test_a.py <<'EOF'
+def test_a():
+    import lib            # the FIRST import: module code runs in this window
+    assert lib.f() == 1
+EOF
+cat > test_b.py <<'EOF'
+def test_b():
+    import lib            # sys.modules hit: no event fires in this window
+    assert lib.f() == 1
+EOF
+git add -A && git commit -qm init
+python -m pytest -q --less                 # record: 2 passed
+python - <<'EOF'
+s = open("lib.py").read()
+open("lib.py", "w").write(s.replace("CONST = 1", "CONST = 30"))
+EOF
+python -m pytest -q --less
+python -m pytest -q                        # ground truth, no selection
+```
+
+What each run shows:
+
+| run | without the import scan | with it |
+|---|---|---|
+| `--less` after the edit | `selected 1/2 tests ... 1 affected` — `test_b` is **silently skipped** (its file is never even collected) | `selected 2/2 tests ... 2 affected` |
+| outcome of that run | `1 failed` — a missed failure | `2 failed` |
+| ground truth (no `--less`) | `2 failed` | `2 failed` |
+
+Why: the edit changes module-level code, so only the module *skeleton*
+stales — `f`'s bytecode is identical. `test_a` holds the skeleton because
+the module genuinely executed in its window (`PY_START`). `test_b` gets a
+`sys.modules` hit and only ever calls `f`, so runtime events give it the
+`f` block and nothing else; the scan of its executed block's bytecode sees
+the `IMPORT_NAME` and records `lib`'s skeleton for it.
+
+The asymmetry is the talk-friendly part: disable the scan and `test_a`
+stays correct — the event fired in its window. The scan exists for
+everyone *after* the first importer, whom no event can ever see, because
+`sys.modules` caching is fundamental to how Python imports work. Like the
+fixture closure (repro 1), this is static knowledge recorded for consumers
+whose producer already ran; it never executes anything to resolve a name.
 
 ## Checked and covered — corner cases and why they hold
 
