@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-from .blocks import DYNAMIC_DEP, Block, ParseCache
+from .blocks import DYNAMIC_DEP, WILDCARD, Block, ParseCache
 from .fingerprint import TRACKED_LIMIT, build_snapshot
 from .gitstore import GitStore
 from .monitoring import FileMonitor
@@ -357,6 +357,10 @@ class LessState:
         self.item_map: dict[str, str | None] = {}  # nodeid -> module rel path
         self.module_files: set[str] = set()
         self.conftest_deps: set[str] = set()
+        # Blocks of >function-scoped fixtures each test consumes (static
+        # closure, see _fixture_deps) and a memo for their resolution.
+        self.fixture_deps: dict[str, set[Block]] = {}
+        self._fixture_dep_cache: dict[tuple[str, str, int], Block] = {}
         self.failed: set[str] = set()
         self.finished: set[str] = set()
         # Collection plan (computed at the start of the collection phase).
@@ -620,6 +624,64 @@ class LessState:
             self.item_map[item.nodeid] = rel
             if rel:
                 self.module_files.add(rel)
+            if self.monitor is not None:
+                deps = self._fixture_deps(item)
+                if deps:
+                    self.fixture_deps[item.nodeid] = deps
+
+    def _fixture_deps(self, item: pytest.Item) -> set[Block]:
+        """Blocks of the >function-scoped fixtures this test consumes.
+
+        Their setup code runs once, in the FIRST requesting test's window;
+        later consumers receive the cached value without executing it, so
+        runtime events cannot see their dependency (the hole is pinned in
+        tests/test_reflection.py: a class-scoped fixture edit used to select
+        one test of three while all three failed).  pytest knows the closure
+        statically -- ``item.fixturenames`` resolved through the fixture
+        manager -- so it is recorded here, the same over-approximation the
+        import scan makes for ``import`` bytecode.  Function-scoped fixtures
+        are skipped: their code runs in every consumer's own window, where
+        PY_START already records it.  Every definition of a name is taken
+        (shadowing included), the safe direction.  A lookup that fails leaves
+        the dependency out, which is exactly the behavior before this rule.
+        """
+        try:
+            arg2 = item.session._fixturemanager._arg2fixturedefs
+        except AttributeError:  # pragma: no cover - pytest internals moved
+            return set()
+        deps: set[Block] = set()
+        for name in getattr(item, "fixturenames", ()):
+            for fdef in arg2.get(name) or ():
+                try:
+                    if getattr(fdef, "scope", "function") == "function":
+                        continue
+                    code = getattr(fdef.func, "__code__", None)
+                    if code is None:
+                        continue
+                    rel = self.monitor.repo_rel(code.co_filename)
+                    if rel is None:
+                        continue  # outside the repository
+                    key = (rel, code.co_qualname, code.co_firstlineno)
+                    if key not in self._fixture_dep_cache:
+                        self._fixture_dep_cache[key] = self._fixture_dep(rel, code)
+                    deps.add(self._fixture_dep_cache[key])
+                except Exception:  # noqa: S112 - a lookup must never break the run
+                    continue
+        return deps
+
+    def _fixture_dep(self, rel: str, code) -> Block:
+        """The block a fixture's body lives in.
+
+        A wildcard when the block table cannot name the code object (a
+        dynamically built fixture): any change to that file then re-runs the
+        consumers, never less."""
+        fb = self.monitor.file_blocks(rel)
+        if fb is None:
+            return (rel, WILDCARD, WILDCARD)  # unparseable: any change re-runs
+        block_id, content = fb.resolve(code.co_qualname, code.co_firstlineno)
+        if block_id.split("~")[0] != code.co_qualname:
+            return (rel, WILDCARD, WILDCARD)
+        return (rel, block_id, content)
 
     def select(self, config: pytest.Config, items: list[pytest.Item]) -> None:
         """Select tests among the *collected* items (files whose tests are
@@ -824,6 +886,8 @@ class LessState:
             own = monitor.test_deps.get(nodeid)
             if own is not None and nodeid in self.finished:
                 extra = module_collect.get(module_rel, set()) if module_rel else set()
+                if nodeid in self.fixture_deps:
+                    extra = extra | self.fixture_deps[nodeid]
                 # (no copy when there is nothing to add: the monitor is done)
                 tests[nodeid] = own | extra if extra else own
             elif nodeid in old_tests:

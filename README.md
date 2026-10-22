@@ -66,6 +66,16 @@ sounds: only the **first** test to import a module runs its module code and
 records it through that module's own `PY_START`; every later test gets a
 `sys.modules` hit, so for them this scan is the only record of the edge.
 
+**Fixture closure (static, like the import scan):** a fixture with scope
+wider than `function` runs its setup once, in the first requesting test's
+window — later consumers receive the cached value without executing any of
+its code, so events alone cannot see their dependency. pytest knows the
+closure at collection time (`item.fixturenames`), and the block of every
+>function-scoped fixture a test requests is recorded as that test's
+dependency. On sqlalchemy, a one-line edit to the autouse class-scoped
+`setup_class_methods` testing fixture selected 425 of 2,480 tests before
+this rule and all 2,480 with it: the other 2,055 all consume its value.
+
 Events are bucketed by phase:
 
 - **import phase** (everything before collection: pytest plugins, conftest

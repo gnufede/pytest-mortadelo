@@ -19,6 +19,8 @@ against 338 without the scan) while guarding nothing the rules below miss.
 import pytest
 from test_plugin import commit, git, run_less
 
+from pytest_less.blocks import WILDCARD
+
 
 def make_project(pytester, files: dict[str, str]):
     for rel, text in {"tests/conftest.py": "", ".gitignore": ".pytest_cache/\n__pycache__/\n", **files}.items():
@@ -366,3 +368,93 @@ class TestPluginsLoadedBeforeArming:
         table = [tuple(b) for b in data["blocks"]]
         deps = {(table[i][0], table[i][1]) for i in data["import_deps"]}
         assert ("plug_gap.py", "<module>") in deps
+
+
+class TestFixtureClosureConsumers:
+    """A >function-scoped fixture's setup runs once, in the FIRST requesting
+    test's window; middle consumers receive the cached value without
+    executing it.  Runtime events cannot see their dependency, so the
+    closure pytest knows statically (``item.fixturenames``) is recorded for
+    every requesting test -- the same over-approximation the import scan
+    makes for ``import`` bytecode."""
+
+    @pytest.fixture
+    def fixture_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "conftest.py": (
+                    "import pytest\n\n"
+                    '@pytest.fixture(scope="class")\n'
+                    "def config():\n"
+                    '    return {"v": 1}\n\n\n'
+                    "def unused_helper():\n    return 2\n"
+                ),
+                "tests/conftest.py": "",
+                "tests/test_suite.py": (
+                    "class TestA:\n"
+                    '    def test_first(self, config):\n        assert config["v"] == 1\n\n'
+                    '    def test_middle(self, config):\n        assert config["v"] == 1\n\n'
+                    '    def test_last(self, config):\n        assert config["v"] == 1\n'
+                ),
+            },
+        )
+        return pytester
+
+    def test_a_fixture_body_edit_selects_every_consumer(self, fixture_project):
+        run_less(fixture_project, "-q").assert_outcomes(passed=3)
+        path = fixture_project.path / "conftest.py"
+        path.write_text(path.read_text().replace('return {"v": 1}', 'return {"v": 30}'))
+        result = run_less(fixture_project, "-v")
+        # before the closure rule this selected only test_first (1/3) while
+        # all three tests failed
+        result.stdout.fnmatch_lines(["*selected 3/3 tests*"])
+        result.assert_outcomes(failed=3)
+
+    def test_every_consumer_holds_the_fixture_block(self, fixture_project):
+        from test_plugin import shard_data
+
+        run_less(fixture_project, "-q").assert_outcomes(passed=3)
+        data = shard_data(fixture_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        for nid, idx in data["tests"].items():
+            names = {table[i][1] for i in idx}
+            assert "config" in names, (nid, names)
+
+    def test_a_function_body_edit_of_an_uncalled_helper_selects_nothing(
+        self, fixture_project
+    ):
+        # precision control: the closure adds the *consumed* fixture block,
+        # not the whole file
+        run_less(fixture_project, "-q").assert_outcomes(passed=3)
+        path = fixture_project.path / "conftest.py"
+        path.write_text(path.read_text().replace("return 2", "return 3"))
+        result = run_less(fixture_project, "-q")
+        assert result.ret == 5  # nothing selected: no test depends on it
+        result.stdout.fnmatch_lines(["*selected 0/3 tests*"])
+
+    def test_a_function_scoped_fixture_needs_no_closure_entry(self, pytester):
+        # its code runs in every consumer's own window, where PY_START
+        # already records it -- the closure only widens for scope != function
+        make_project(
+            pytester,
+            {
+                "conftest.py": (
+                    "import pytest\n\n"
+                    "@pytest.fixture\n"
+                    "def value():\n    return 1\n"
+                ),
+                "tests/conftest.py": "",
+                "tests/test_use.py": "def test_use(value):\n    assert value == 1\n",
+            },
+        )
+        from test_plugin import shard_data
+
+        run_less(pytester, "-q").assert_outcomes(passed=1)
+        data = shard_data(pytester.path)
+        table = [tuple(b) for b in data["blocks"]]
+        idx = data["tests"]["tests/test_use.py::test_use"]
+        pairs = {(table[i][0], table[i][1]) for i in idx}
+        assert ("conftest.py", "value") in pairs  # runtime already recorded it
+        assert ("conftest.py", WILDCARD) not in pairs  # and the closure added nothing wider
+        assert all(f != "conftest.py" or q == "value" for f, q in pairs)
