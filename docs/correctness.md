@@ -243,8 +243,14 @@ whose producer already ran; it never executes anything to resolve a name.
 - *Directory contents*: only `open` is wrapped — `os.listdir`, `glob`,
   `rglob`, `os.walk` record no dependency on what they looked at.
   (Sample 6 below.)
-- *C extensions in the repository*: `.c`/`.so` changes never select anything
-  (nothing to hash); shared by every Python TIA.
+- *C extension sources* (`.c`): nothing executes them, so they are not
+  dependencies — but the built artifact is. An in-repo `.so` imported by name
+  resolves through `find_spec` in the import scan and becomes a file-level
+  dependency of every importer, so a rebuild re-runs its tests (verified end
+  to end with a compiled extension). Editing the source without rebuilding
+  selects nothing — correctly: the behavior, the artifact, has not changed.
+  Builds landing outside the repository (site-packages) belong to the
+  installed-packages family below.
 - *CPython's own `.pyc` same-size same-second race*: CPython may execute
   stale bytecode while source-hash selection says "unchanged" — an
   environment-level hazard (it corrupted an early version of the fixture
