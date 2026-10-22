@@ -222,6 +222,76 @@ whose producer already ran; it never executes anything to resolve a name.
 - *A runtime `request.getfixturevalue` on an uncached wide fixture*
   executes it in the requesting test's window, where events record it.
 
+## Two kinds of gaps — and why only one is closable
+
+Every blind spot in this document falls into one of two families, and the
+distinction is the most useful thing to carry out of it:
+
+### Mechanical gaps — a thing is loaded but no signal sees it
+
+A **specific file, module, or library** is consumed, but the existing
+signals (PY_START, PY_RESUME, the import scan, `open`) don't fire for it.
+The gap is in the *observation*, not in the model. One call maps to one
+dependency, so wrapping the entry point closes it:
+
+| gap | why the signal missed it | closed by |
+|---|---|---|
+| a `.so` loaded by `import fast` | the import scan resolves via `find_spec` → the artifact's path | already covered (the scan asks the import system itself) |
+| a `.so` loaded by `ctypes.CDLL("./lib.so")` | dlopen is not an import: no `IMPORT_NAME` bytecode, no Python code objects | the `CDLL.__init__` wrap — one call, one file-level dep |
+| a module imported by `import_module("lib")` (cached) | a plain function call, no `IMPORT_NAME` opcode; `sys.modules` hit, no code runs | the `import_module` wrap — one call, one module skeleton |
+| a data file read by `open("config.yml")` | the `open` builtin sees it, but the event model tracks only code objects | the `open` wrap (data files) |
+| the active `pytest.ini` | parsed before the earliest hook, so no event ever sees the read | claimed at collection (pytest itself says which file it parsed) |
+| a shared fixture's *value* | the setup ran once, in the first consumer's window | the static closure (`item.fixturenames`) |
+
+In every case the fix is the same shape: find where the system already
+knows (or can cheaply learn) the mapping from *what happened* to *which
+file or block*, and record it as an ordinary dependency. No
+configuration, no widening — just a new edge in the same graph.
+
+### State gaps — the *choice* depends on something that is not a thing
+
+A test's outcome depends on **which of several possible code paths it
+took**, and the condition that selected the path is not a file, a module,
+or a code object — it is run-time state the repository cannot represent:
+
+```python
+def run(self):
+    # the target is chosen by an environment variable: not a file,
+    # not a fixture, nothing the recording ever sees
+    return getattr(self, os.environ.get("DISPATCH", "fast"))()
+```
+
+No wrapper can close this, because the gap is not in the *observation* —
+it is in the *counterfactual*. The recording correctly saw that
+`handle_fast` executed. It cannot know that `handle_slow` would have
+executed under a different env var, because the env var is not a
+dependency that can be recorded. The possibilities:
+
+- **Record what actually runs** — already done (PY_START on the target).
+  Sound for the recorded state; silent about the others.
+- **Record all possible targets** — what the removed static `getattr`
+  markers did: 2,480 of 2,480 sqlalchemy tests on a one-function edit,
+  while guarding nothing the block rules miss. The nuclear option, and
+  it makes the tool useless.
+- **Record the dispatch logic** — already done (the code that computes
+  the name is a block; editing it stales it).
+- **Record a new target** — already done (adding a definition changes the
+  class body, which every importer holds).
+
+The residual is exactly one case: **the state that chose the path is
+outside the repository** — an env var, the clock, randomness, an
+installed package version, a network response. That is the fundamental
+limit of any test impact analysis, not a wrapping problem. The targeted
+escape hatch for a test you *know* depends on such state is
+`@pytest.mark.less_always` (re-run whenever anything changed), written by
+the person who knows the test.
+
+This is the taxonomy for evaluating any proposed TIA feature: *does it
+map a call to a thing?* If yes, wrap the entry point and record the
+dependency. If the "thing" it maps to is *state* rather than code or a
+file, no wrapper can help — and the honest answer is a marker, a
+configured dependency, or a full run.
+
 ## Known residuals (documented, accepted)
 
 - *Dispatch that depends on state we do not track* — the environment, time,
