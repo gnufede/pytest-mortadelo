@@ -804,3 +804,172 @@ class TestDynamicLibraryLoads:
         result = run_less(pytester, "-v")
         result.stdout.fnmatch_lines(["*selected 1/1 tests*"])
         result.assert_outcomes(failed=1)  # 43 != 42
+
+
+class TestMemoizationWraps:
+    """``functools.lru_cache`` / ``cache`` / ``cached_property``, scoped.
+
+    A memoized function consumes the original's result without executing
+    it on a cache hit, so ``PY_START`` never fires for later callers.
+    The wrap patches the *decorator* at monitor activation; only repo
+    functions get the tracking wrapper (checked at decoration time via
+    ``co_filename``), stdlib and third-party cached functions keep the
+    untouched C wrapper.  The dependency (the original function's block)
+    is pre-computed at decoration time and added to the caller's bucket
+    at every call, hit or miss."""
+
+    @pytest.fixture
+    def memo_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "lib.py": (
+                    "import functools\n\n"
+                    "@functools.lru_cache(maxsize=None)\n"
+                    "def compute(x):\n"
+                    "    return x * 10\n\n"
+                    "@functools.cache\n"
+                    "def other(x):\n"
+                    "    return x + 1\n"
+                ),
+                "tests/conftest.py": "",
+                # test_a makes the first call (cache miss: PY_START fires
+                # AND the tracking wrapper records); test_b gets the cache
+                # hit (only the tracking wrapper records)
+                "tests/test_a.py": (
+                    "def test_a():\n"
+                    "    import lib\n"
+                    "    assert lib.compute(1) == 10\n"
+                ),
+                "tests/test_b.py": (
+                    "def test_b():\n"
+                    "    import lib\n"
+                    "    assert lib.compute(1) == 10\n"  # cache hit
+                    "    assert lib.other(1) == 2\n"      # first call
+                ),
+                "tests/test_c.py": "def test_c():\n    assert 1 + 1 == 2\n",
+            },
+        )
+        return pytester
+
+    def test_every_caller_holds_the_function_block(self, memo_project):
+        from test_plugin import shard_data
+
+        run_less(memo_project, "-q").assert_outcomes(passed=3)
+        data = shard_data(memo_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        for nid in ("tests/test_a.py::test_a", "tests/test_b.py::test_b"):
+            deps = {table[i][1] for i in data["tests"][nid]}
+            assert "compute" in deps, (nid, deps)
+
+    def test_an_edit_selects_every_caller(self, memo_project):
+        run_less(memo_project, "-q").assert_outcomes(passed=3)
+        path = memo_project.path / "lib.py"
+        path.write_text(path.read_text().replace("x * 10", "x * 100"))
+        result = run_less(memo_project, "-v")
+        # both the cache-miss caller and the cache-hit caller are selected
+        result.stdout.fnmatch_lines(["*selected 2/3 tests*"])
+
+    def test_the_wrapper_is_removed_on_deactivate(self):
+        import functools
+        import tempfile
+        from pathlib import Path
+
+        from pytest_less.monitoring import FileMonitor
+
+        orig_lru = functools.lru_cache
+        orig_cache = functools.cache
+        orig_cp = functools.cached_property
+        root = Path(tempfile.mkdtemp())
+        monitor = FileMonitor(root, data_files=False)
+        monitor.activate()
+        assert functools.lru_cache is not orig_lru
+        assert functools.cache is not orig_cache
+        assert functools.cached_property is not orig_cp
+        monitor.deactivate()
+        assert functools.lru_cache is orig_lru
+        assert functools.cache is orig_cache
+        assert functools.cached_property is orig_cp
+
+    def test_stdlib_cached_functions_are_untouched(self):
+        """The scoping check: a stdlib function keeps the C wrapper."""
+        import functools
+        import tempfile
+        from pathlib import Path
+
+        from pytest_less.monitoring import FileMonitor
+
+        root = Path(tempfile.mkdtemp())
+        (root / "conftest.py").touch()
+        monitor = FileMonitor(root, data_files=False)
+        monitor.activate()
+        try:
+            # decorate a non-repo function: must get the real C wrapper
+            @functools.cache
+            def stdlib_fn(x):
+                return x
+
+            assert type(stdlib_fn).__name__ == "_lru_cache_wrapper"  # the C type
+            assert not hasattr(stdlib_fn, "cache_info") or callable(stdlib_fn.cache_info)
+            # the monitor was active but no dep was recorded (not repo code)
+            assert not monitor.test_deps
+        finally:
+            monitor.deactivate()
+
+    def test_a_repo_function_gets_the_tracking_wrapper(self):
+        import functools
+        import tempfile
+        from pathlib import Path
+
+        from pytest_less.monitoring import FileMonitor
+
+        root = Path(tempfile.mkdtemp())
+        (root / "lib.py").write_text("X = 1\n")
+        monitor = FileMonitor(root, data_files=False)
+        monitor.activate()
+        try:
+            # a function in the root (which IS the repo)
+            # compile in the repo so _is_repo_code sees it as repo
+            code = compile(
+                "@functools.lru_cache\ndef f(x):\n    return x\n",
+                str(root / "lib2.py"), "exec",
+            )
+            ns = {"__name__": "m", "functools": functools}
+            exec(code, ns)  # noqa: S102 - test helper
+            f = ns["f"]
+            # the tracking wrapper has __wrapped__ pointing to the original
+            assert f.__wrapped__.__name__ == "f"
+            assert hasattr(f, "cache_info")
+        finally:
+            monitor.deactivate()
+
+    def test_cached_property_on_a_shared_instance(self, pytester):
+        """The third first-consumer-wins member, now closed: every consumer
+        of a cached_property holds the original function's block."""
+        make_project(
+            pytester,
+            {
+                "lib.py": (
+                    "import functools\n\n"
+                    "class Shared:\n"
+                    "    @functools.cached_property\n"
+                    "    def config(self):\n"
+                    "        return 10\n"
+                ),
+                "conftest.py": (
+                    "import pytest\n"
+                    "import lib\n\n"
+                    '@pytest.fixture(scope="session")\n'
+                    "def shared():\n"
+                    "    return lib.Shared()\n"
+                ),
+                "tests/conftest.py": "",
+                "tests/test_a.py": "def test_a(shared):\n    assert shared.config == 10\n",
+                "tests/test_b.py": "def test_b(shared):\n    assert shared.config == 10\n",
+            },
+        )
+        run_less(pytester, "-q").assert_outcomes(passed=2)
+        path = pytester.path / "lib.py"
+        path.write_text(path.read_text().replace("return 10", "return 100"))
+        result = run_less(pytester, "-v")
+        result.stdout.fnmatch_lines(["*selected 2/2 tests*"])

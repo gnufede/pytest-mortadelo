@@ -65,6 +65,14 @@ times per suite; profiling numbers from the sqlalchemy benchmark):
 from __future__ import annotations
 
 import dis
+
+# The untouched functools originals, saved at import time (before any
+# monitor patches them).  Wraps always delegate to THESE, not to whatever
+# is currently on the functools module -- two coexisting monitors each
+# install their own wrapper, and each must call the real original, never
+# the other monitor's wrapper (which for cached_property is a function,
+# not a class -- subclassing it would crash).
+import functools as _ft_mod
 import importlib.util
 import opcode
 import os
@@ -74,6 +82,9 @@ from pathlib import Path
 from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache, ParseCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
+_ORIG_LRU = _ft_mod.lru_cache
+_ORIG_CACHE = getattr(_ft_mod, "cache", None)
+_ORIG_CACHED_PROPERTY = getattr(_ft_mod, "cached_property", None)
 try:
     from sys import monitoring as _sys_monitoring
 except ImportError:  # pragma: no cover - Python < 3.12
@@ -816,6 +827,153 @@ class FileMonitor:
             self._track_import_module(name, package)
 
         wrap(importlib, "import_module", intercept(track_import_module, after=True))
+
+        # functools.lru_cache / cache / cached_property: a memoized function
+        # consumes the original's result without executing it, so PY_START
+        # never fires on later calls.  Scoped to REPO functions: the wrap
+        # checks co_filename at decoration time, and only repo functions
+        # get the Python tracking wrapper -- stdlib and third-party cached
+        # functions keep the untouched C wrapper (zero overhead on their
+        # hot paths).  The dependency is pre-computed at decoration time
+        # (resolve the code object to a block once) and added to the
+        # current bucket at every call, hit or miss, so every consumer
+        # gets the edge.
+        def make_scoped_lru(orig_lru):
+            """A drop-in for functools.lru_cache that tracks repo functions."""
+
+            def scoped_lru(*args, **kwargs):
+                # bare form: @lru_cache (the function is the first arg)
+                if args and callable(args[0]) and not isinstance(args[0], int):
+                    return _apply(orig_lru, args[0], (), kwargs)
+                # parameterized: @lru_cache(maxsize=N) returns a decorator
+
+                def dec(fn):
+                    return _apply(orig_lru, fn, args, kwargs)
+
+                return dec
+
+            scoped_lru.__wrapped__ = orig_lru
+            return scoped_lru
+
+        def _apply(orig_lru, func, dargs, dkwargs):
+            dep = self._resolve_code_dep(func.__code__) if self._is_repo_code(func) else None
+            if dargs or dkwargs:
+                cached = orig_lru(*dargs, **dkwargs)(func)  # @lru_cache(maxsize=N)
+            else:
+                cached = orig_lru(func)  # bare @lru_cache or @cache
+            if dep is None:
+                return cached
+
+            def tracked(*a, **k):
+                result = cached(*a, **k)
+                if self._active:
+                    self._bucket((dep,))
+                return result
+
+            tracked.__wrapped__ = func
+            tracked.cache_info = cached.cache_info
+            tracked.cache_clear = cached.cache_clear
+            for attr in ("__name__", "__qualname__", "__doc__", "__module__"):
+                try:
+                    setattr(tracked, attr, getattr(func, attr))
+                except (AttributeError, TypeError):
+                    pass
+            tracked.__dict__.update(getattr(func, "__dict__", {}))
+            return tracked
+
+        wrap(_ft_mod, "lru_cache", lambda orig: make_scoped_lru(_ORIG_LRU))
+        if _ORIG_CACHE is not None:
+            wrap(_ft_mod, "cache", lambda orig: make_scoped_lru(_ORIG_CACHE))
+
+        # functools.cached_property: a descriptor, not a function wrapper.
+        # __get__ is called on EVERY attribute access (hit or miss: it
+        # checks the instance __dict__ first), so the tracking fires for
+        # every consumer, not just the first one that computed the value.
+        def make_scoped_cproperty(orig_cp):
+            """A drop-in for functools.cached_property, tracking repo functions.
+
+            ``__get__`` fires on EVERY attribute access (hit or miss: it
+            checks the instance ``__dict__`` first), so the tracking
+            fires for every consumer, not just the one that computed the
+            value.  The monitor and dep are captured in the closure and
+            stored on the descriptor instance.
+            """
+            monitor = self
+
+            class TrackedCP(orig_cp):
+                """A data-descriptor version of cached_property.
+
+                The original is a *non-data* descriptor: after the first
+                access the value is in ``instance.__dict__`` and the
+                descriptor is bypassed entirely, so ``__get__`` fires
+                only on the miss.  Adding ``__set__`` makes this a data
+                descriptor — Python's attribute protocol then calls
+                ``__get__`` on *every* access, hit or miss, which is
+                what lets the tracking fire for every consumer.
+
+                The semantic difference: the attribute is now truly
+                read-only through the descriptor (setting raises
+                AttributeError instead of shadowing the descriptor via
+                ``__dict__``).
+                """
+
+                def __set__(self, instance, value):
+                    # read-only; exists only to force data-descriptor
+                    # lookup (and thus __get__ on every access)
+                    raise AttributeError(
+                        f"property '{self.attrname}' of '{type(instance).__name__}'"
+                        " object has no setter"
+                    )
+
+                def __get__(self, instance, owner):
+                    if instance is None:
+                        return self
+                    dep = getattr(self, "_less_dep", None)
+                    if dep is not None and monitor._active:
+                        monitor._bucket((dep,))
+                    return super().__get__(instance, owner)
+
+            def scoped_cp(func):
+                if not monitor._is_repo_code(func):
+                    return orig_cp(func)
+                dep = monitor._resolve_code_dep(func.__code__)
+                t = TrackedCP(func)
+                t._less_dep = dep
+                return t
+
+            return scoped_cp
+
+        if _ORIG_CACHED_PROPERTY is not None:
+            wrap(_ft_mod, "cached_property",
+                 lambda orig: make_scoped_cproperty(_ORIG_CACHED_PROPERTY))
+
+    def _is_repo_code(self, func) -> bool:
+        """Whether *func*'s code object lives in the repository."""
+        try:
+            return self.repo_rel(func.__code__.co_filename) is not None
+        except Exception:
+            return False
+
+    def _resolve_code_dep(self, code) -> Block | None:
+        """Pre-compute the dependency triple for a code object's block.
+
+        Called once at decoration time; the result is captured in the
+        tracking wrapper's closure and added to the bucket at every call,
+        hit or miss.  A file-level wildcard if the block table cannot
+        resolve the code object."""
+        try:
+            rel = self.repo_rel(code.co_filename)
+            if rel is None:
+                return None
+            fb = self._blocks.file_blocks(rel)
+            if fb is None:
+                return (rel, WILDCARD, WILDCARD)
+            block_id, content = fb.resolve(
+                getattr(code, "co_qualname", code.co_name), code.co_firstlineno
+            )
+            return (rel, block_id, content)
+        except Exception:
+            return None
 
     def _remove_interceptors(self) -> None:
         while self._undo:
