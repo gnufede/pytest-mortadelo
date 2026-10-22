@@ -166,6 +166,14 @@ whose producer already ran; it never executes anything to resolve a name.
   file, and the callee's own block to whichever test calls it.
 - *`exec(compile(src, "repo/path.py", "exec"))`* resolves through
   `co_filename` like any other code object of that file.
+- *`eval`/`exec` of a string produced in the repo*: the string is a constant
+  of the enclosing block — editing it stales that block — and every call the
+  compiled code makes fires `PY_START` in the caller's window (verified:
+  `exec("import lib\nassert lib.g() == 5")` records `lib:g`; editing the
+  string or `lib.g` each selects the test). A string from an untracked source
+  (env var, network) is the state-dispatch residual. Flagging `eval`/`exec`
+  as static markers — tried once — selected 69 % of sqlalchemy's ORM tests on
+  every edit while guarding nothing the events miss.
 - *Code a co-resident tool re-arms*: a foreign `restart_events()` (another
   monitor in the process) is answered by re-silencing, one event per window.
 - *Threads* are attributed to the test running at the moment their code
@@ -220,10 +228,22 @@ whose producer already ran; it never executes anything to resolve a name.
   randomness, installed packages, external services. The fundamental limit of
   test impact analysis without hermetic environments. (Code sample below.)
 - *Memoized function calls* (`functools.lru_cache`, `functools.cache`,
-  hand-rolled caches and `if _CACHED is None` patterns): only the first
-  caller records the edge — a later caller with the same arguments executes
-  nothing, so no event fires, and no static knowledge exists that could
-  record it. (Code sample below.)
+  `functools.cached_property` on shared instances, hand-rolled caches and
+  `if _CACHED is None` patterns): only the first caller records the edge —
+  a later caller with the same arguments executes nothing, so no event
+  fires, and no static knowledge exists that could record it. (Samples 1
+  and 3 below.)
+- *Configuration files* (`pytest.ini`, `pyproject.toml`, `tox.ini`,
+  `setup.cfg`): parsed by pytest before the earliest hook a plugin can use,
+  so they never become dependencies and a config change selects nothing.
+  (Sample 4 below — unlike the others, cheaply fixable.)
+- *Order-dependent tests*: a test whose outcome depends on another having
+  run first (module globals, `setattr` of data, files one test writes and
+  another reads). TIA assumes test independence; this is that assumption.
+  (Sample 5 below.)
+- *Directory contents*: only `open` is wrapped — `os.listdir`, `glob`,
+  `rglob`, `os.walk` record no dependency on what they looked at.
+  (Sample 6 below.)
 - *C extensions in the repository*: `.c`/`.so` changes never select anything
   (nothing to hash); shared by every Python TIA.
 - *CPython's own `.pyc` same-size same-second race*: CPython may execute
@@ -336,3 +356,104 @@ Every rule the plugin has is about code and files; this dispatch is decided
 by process state. Widening every computed `getattr` to file level — the
 removed static markers — selected 2,480 of 2,480 sqlalchemy tests on
 one-function edits while guarding nothing the block rules miss.
+
+### Not handled, sample 3: `cached_property` on a shared instance
+
+The fourth member of the first-consumer-wins family. A session fixture hands
+every test the same object; the first access runs the property body in
+*that* test's window, later accesses read the instance `__dict__`. The
+fixture closure (minimal repro 1) records the *fixture's* block for every
+consumer — but the property body is a different producer, and only its
+first consumer holds it:
+
+```python
+# lib.py
+import functools
+
+class Shared:
+    @functools.cached_property
+    def config(self):
+        return 10
+```
+
+```python
+# conftest.py
+import pytest
+import lib
+
+@pytest.fixture(scope="session")
+def shared():
+    return lib.Shared()
+```
+
+```python
+# test_a.py and test_b.py
+def test_a(shared):
+    assert shared.config == 10
+```
+
+Recorded: `test_a` holds `conftest:shared` (the closure) **and**
+`lib:Shared.config` (the first access); `test_b` holds only
+`conftest:shared`. Edit the body (`10` → `100`): `selected 1/2 tests`,
+`test_b` silently skipped; ground truth `2 failed`.
+
+### Not handled, sample 4: configuration files are read before arming
+
+pytest parses `pytest.ini` / `pyproject.toml` / `tox.ini` / `setup.cfg`
+before the earliest hook a plugin can use, so no event ever sees the read
+and the files never become dependencies. Editing them changes every test's
+environment and selects nothing:
+
+```ini
+# pytest.ini, changed from an empty [pytest] section
+[pytest]
+filterwarnings = error
+```
+
+with `test_warn.py` emitting a warning: after the edit, `--less` reports
+`selected 0/1 tests: no recorded dependency changed; fast path` — the run
+never even opens the shard — while the ground truth is `1 failed`.
+Unlike the other samples this one is fixable: the config files could be
+claimed as file-level import dependencies at arming. They are small, few,
+and affect everything, so any change selecting everything would be correct.
+
+### Not handled, sample 5: order-dependent tests
+
+`setattr` of *data* — module globals, attributes — is cross-test state
+leakage: the second test executes nothing of the first, so no dependency
+between them can exist. `setattr` of *functions* is the covered case above
+(definer attribution); data is the independence assumption itself:
+
+```python
+# test_1_set.py
+def test_1_set():
+    import lib
+    lib.STATE = 22       # was 1
+
+# test_2_get.py
+def test_2_get():
+    import lib
+    assert lib.get() == 1
+```
+
+After the edit: `selected 1/2 tests` — only the setter; ground truth
+`test_2_get` fails. The same shape exists through files one test writes
+and another reads (write-only opens are deliberately not dependencies:
+outputs are not inputs).
+
+### Not handled, sample 6: directory listings
+
+Only `open` is wrapped. A test whose outcome depends on a directory's
+*contents* holds no dependency on anything it looked at:
+
+```python
+# test_1_write.py writes out/a.txt and out/b.txt (write-only: not deps)
+# test_2_list.py
+def test_2_list():
+    import os
+    assert len(os.listdir("out")) == 2
+```
+
+Editing `test_1_write` to write a third file: `selected 1/2 tests` —
+`test_2_list` never touched anything selection can see; ground truth
+`1 failed, 1 passed`.

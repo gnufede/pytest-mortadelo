@@ -176,10 +176,12 @@ to every test that touched it; on sqlalchemy that made one-function edits run
 the whole suite (`Query.filter`: 2,480 of 2,480 tests, against 338 without) while
 guarding nothing those rules miss. What stays uncovered is dispatch that depends
 on state the plugin does not track (the environment, time, randomness,
-installed packages), the same as for any test impact analysis — and
-memoized calls (`functools.lru_cache`, hand-rolled caches): only the first
-caller records the edge, a later one with the same arguments executes
-nothing. `docs/correctness.md` has verified code samples of both.
+installed packages), the same as for any test impact analysis — memoized
+calls (`lru_cache`, `cached_property` on shared instances): only the first
+caller records the edge; configuration files, which pytest parses before
+the monitor arms; order-dependent tests; and directory listings (only
+`open` is wrapped). `docs/correctness.md` has verified code samples of
+all of them.
 
 Child reads of *data* files are not tracked (data-file tracking covers
 the pytest process only).
