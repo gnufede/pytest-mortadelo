@@ -31,6 +31,8 @@ Options:
 | `--less` | enable recording + selection |
 | `--less-force` | run all tests, but still record dependencies |
 | `--less-clean` | discard the stored data for this command before running |
+| `less_watch` (ini) | glob patterns: matched files become file-level dependencies of *every* test — any change to them re-runs everything. Patterns with a `/` anchor at the repository root; without one they match the file name at any depth. Reaches inputs no Python executes (a `ctypes` artifact, a config a child reads) |
+| `@pytest.mark.less_always` | re-run this test whenever anything changed (skipped only when provably nothing changed at all) — for tests whose outcome depends on state no selection rule can see; records dependencies like any other test |
 | `--less-no-data-files` | disable data-file tracking (on by default); ini: `less_data_files = false` |
 | `PYTEST_LESS=1` | same as `--less` (env form; also enables before conftest loading) |
 | `-p no:less` | disable the plugin entirely |

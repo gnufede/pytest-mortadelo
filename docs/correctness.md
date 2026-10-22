@@ -426,7 +426,13 @@ different configs could have hashed identically.
 
 This is the shape we prefer over the "tracked files" escape hatch other
 TIA tools offer: a rule derived from what the system already knows, exact
-by construction, zero configuration.
+by construction, zero configuration.  For inputs no rule can see --
+``ctypes.CDLL`` artifacts are the canonical case (dlopen, not import; the
+demo above shows a rebuild being missed) -- ``less_watch`` is the same
+mechanism with user-supplied patterns, still a *dependency* rather than a
+cache invalidation; and ``@pytest.mark.less_always`` is the test-scoped
+version for a single test whose outcome depends on untracked state.  See
+the README for both.
 
 ### Not handled, sample 5: order-dependent tests
 
