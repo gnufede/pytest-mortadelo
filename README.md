@@ -69,7 +69,12 @@ records it through that module's own `PY_START`; every later test gets a
 Events are bucketed by phase:
 
 - **import phase** (everything before collection: pytest plugins, conftest
-  imports) → dependencies of **every** test. Changing a conftest re-runs the
+  imports) → dependencies of **every** test. Modules imported *before* the
+  monitor arms — pytest loads its plugins (entry points, `-p`) before the
+  earliest hook a plugin can use — have no events left to see, so at arming
+  every already-imported repo module's skeleton is added to this bucket
+  instead (functions called later are still block-precise). Changing a
+  conftest re-runs the
   world.
 - **collect phase** (test module imports) → shared by all tests, except the
   test modules themselves, which are attributed only to their own tests, so

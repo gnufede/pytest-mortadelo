@@ -310,3 +310,59 @@ class TestModuleLevelCodeIsTracked:
         path.write_text(path.read_text().replace("Z = 7", 'Z = int("7")'))
         result = run_less(lib_project, "-v")
         result.stdout.fnmatch_lines(["*selected 1/3 tests*"])  # test_dyn alone
+
+
+class TestPluginsLoadedBeforeArming:
+    """pytest imports its plugins -- entry points, ``-p``, ``PYTEST_PLUGINS``
+    -- before the earliest hook a plugin can use, so the module-level code of
+    a repo-resident plugin has already run when the monitor arms: no event
+    can see the past.  At arming, already-imported repo modules get their
+    skeletons added as shared import-time dependencies (the same treatment
+    conftests imported before a *late* activation get); functions called in
+    a window still fire PY_START and stay block-precise."""
+
+    @pytest.fixture
+    def plugin_project(self, pytester):
+        make_project(
+            pytester,
+            {
+                "pytest.ini": "[pytest]\naddopts = -p plug_gap\n",
+                "plug_gap.py": (
+                    "CONST = 1\n\nimport pytest as _pytest\n\n"
+                    "@_pytest.fixture\ndef val():\n    return CONST\n"
+                ),
+                "tests/conftest.py": "",
+                # uses the fixture; never imports plug_gap by name
+                "tests/test_use.py": "def test_use(val):\n    assert val == 1\n",
+                # imports it by name (the bytecode import scan also covers this shape)
+                "tests/test_imports.py": "def test_imports():\n    import plug_gap\n    assert plug_gap.CONST == 1\n",
+                "tests/test_other.py": "def test_other():\n    assert 1 + 1 == 2\n",
+            },
+        )
+        return pytester
+
+    def test_a_module_level_edit_selects_the_fixture_user_too(self, plugin_project):
+        run_less(plugin_project, "-q").assert_outcomes(passed=3)
+        path = plugin_project.path / "plug_gap.py"
+        path.write_text(path.read_text().replace("CONST = 1", "CONST = 30"))
+        result = run_less(plugin_project, "-v")
+        # the import scan already covered test_imports; without the sweep
+        # test_use (which depends on CONST only through the fixture) was
+        # silently deselected while its outcome changed
+        result.stdout.fnmatch_lines(["*selected 3/3 tests*"])
+
+    def test_a_function_body_edit_stays_block_precise(self, plugin_project):
+        run_less(plugin_project, "-q").assert_outcomes(passed=3)
+        path = plugin_project.path / "plug_gap.py"
+        path.write_text(path.read_text().replace("return CONST", "return CONST + 0"))
+        result = run_less(plugin_project, "-v")
+        result.stdout.fnmatch_lines(["*selected 1/3 tests*"])
+
+    def test_the_skeleton_is_a_shared_import_dep(self, plugin_project):
+        from test_plugin import shard_data
+
+        run_less(plugin_project, "-q").assert_outcomes(passed=3)
+        data = shard_data(plugin_project.path)
+        table = [tuple(b) for b in data["blocks"]]
+        deps = {(table[i][0], table[i][1]) for i in data["import_deps"]}
+        assert ("plug_gap.py", "<module>") in deps

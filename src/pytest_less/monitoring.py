@@ -570,6 +570,9 @@ class FileMonitor:
         # Interceptors first: installing them runs Python code (functools,
         # imports) that the freshly armed tool would otherwise observe.
         self._install_interceptors()
+        # Repo modules already imported (pytest's own plugin loading, before
+        # the earliest hook) ran before any event could see them.
+        self._note_pre_armed_modules()
         try:
             # PY_START covers a code object's first execution in a window;
             # PY_RESUME covers the resumption of a suspended one (generators,
@@ -594,6 +597,30 @@ class FileMonitor:
             return False
         self._active = True
         return True
+
+    def _note_pre_armed_modules(self) -> None:
+        """Skeletons of repo modules that were imported before arming.
+
+        pytest imports its plugins -- entry points, ``-p``, ``PYTEST_PLUGINS``
+        -- before the earliest hook a plugin can use, so the module-level code
+        of a repo-resident plugin has already run when the monitor arms: no
+        event can see the past.  What ran is import phase, so these skeletons
+        become shared import-time dependencies of every test, the same
+        treatment conftests imported before a *late* activation get.  Their
+        functions still fire PY_START when called in a window and stay
+        block-precise; only the already-executed module level is covered
+        here.  Called before the tool is armed so neither the past nor the
+        sweep itself is recorded.
+        """
+        seen: set[str] = set()
+        for module in list(sys.modules.values()):
+            file = getattr(module, "__file__", None)
+            if not file or not file.endswith(".py"):
+                continue  # builtins, frozen, namespace packages, .pyc-only
+            rel = self.repo_rel(file)
+            if rel is not None and rel not in seen:
+                seen.add(rel)
+                self.import_deps.add(self.module_dep(rel))
 
     def deactivate(self) -> None:
         if not self._active:
