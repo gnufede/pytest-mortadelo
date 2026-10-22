@@ -16,6 +16,8 @@ a one-function edit into a full run (``Query.filter``: 2,480 of 2,480 tests,
 against 338 without the scan) while guarding nothing the rules below miss.
 """
 
+import sys
+
 import pytest
 from test_plugin import commit, git, run_less
 
@@ -777,10 +779,13 @@ class TestDynamicLibraryLoads:
         c = pytester.path / "libplain.c"
         c.write_text("int answer(void) { return 42; }\n")
         inc = sysconfig.get_paths()["include"]
+        flags = ["-shared", "-fPIC"]
+        if sys.platform == "darwin":
+            flags += ["-undefined", "dynamic_lookup"]
+
         def build():
             sp.run(
-                ["cc", "-shared", "-fPIC", "-undefined", "dynamic_lookup",
-                 f"-I{inc}", str(c), "-o", str(so)],
+                [*flags, f"-I{inc}", str(c), "-o", str(so)],
                 check=True,
             )
         build()
