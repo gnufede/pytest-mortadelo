@@ -424,8 +424,8 @@ class TestFastPath:
         meta["nodeids"] = [n for n in meta["nodeids"]
                            if n != "tests/test_a.py::test_a"]
         meta["dep_files"] = [f for f in meta["dep_files"] if f != "tests/test_a.py"]
-        from pytest_less.gitstore import GitStore
-        GitStore(project.path, meta["shard"]).save(data, meta)
+        from pytest_less.store import Store
+        Store(project.path, meta["shard"]).save(data, meta)
 
         # Flip the outcome via the untracked marker (non-.py, not a dep:
         # still pure -- no dep changed, no new .py file).
