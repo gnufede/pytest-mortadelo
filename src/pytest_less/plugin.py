@@ -43,15 +43,6 @@ def _selectors_active(config: pytest.Config) -> bool:
     return any("::" in arg for arg in getattr(config, "args", []))
 
 
-def _data_files_enabled(config) -> bool:
-    if getattr(config.option, "less_no_data_files", False):
-        return False
-    try:
-        if config.getini("less_data_files") is False:
-            return False
-    except Exception:  # pragma: no cover - ini not registered (embedders)
-        pass
-    return True
 
 
 # ---------------------------------------------------------------- options
@@ -77,19 +68,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         action="store_true",
         default=False,
         help="Discard the stored data before running.",
-    )
-    group.addoption(
-        "--less-no-data-files",
-        action="store_true",
-        default=False,
-        help="Disable data-file tracking (on by default); ini: "
-        "`less_data_files = false`.",
-    )
-    parser.addini(
-        "less_data_files",
-        help="set to false to disable data-file tracking (on by default)",
-        type="bool",
-        default=True,
     )
 
 
@@ -151,11 +129,7 @@ def pytest_load_initial_conftests(early_config, parser, args):
     ):
         root = _shared_git_root(early_config, Path.cwd())
         if root is not None:
-                data_files = (
-                    "--less-no-data-files" not in args
-                    and _data_files_enabled(early_config)
-                )
-                monitor = FileMonitor(root, data_files=data_files)
+                monitor = FileMonitor(root)
                 if monitor.activate():
                     early_config._less_early_monitor = monitor
     return (yield)
@@ -234,7 +208,7 @@ class LessState:
         """Arm the monitor now (recovery path when the early probe skipped)."""
         self.monitor = early_monitor
         if self.monitor is None or not self.monitor.active:
-            self.monitor = FileMonitor(self.root, data_files=_data_files_enabled(config))
+            self.monitor = FileMonitor(self.root)
             self.monitor.activate()
 
     def _drop_early_monitor(self, monitor):
@@ -489,7 +463,7 @@ class LessState:
 
     def _save(self, config, monitor, data, meta, dep_files, spawners):
         """Write the JSON files (with fingerprints) to .pytest_less/."""
-        digests = monitor.parse_cache.used if monitor.parse_cache is not None else {}
+        digests = {}
         tracked = self.store.tracked_files(30000) if spawners else None
         snapshot = build_snapshot(
             self.root, dep_files, digests,

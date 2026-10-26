@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 from collections.abc import Sequence
@@ -194,18 +193,3 @@ def _filter_args(args: Sequence[str]) -> list[str]:
     return out
 
 
-def command_key(args: Sequence[str], root: Path) -> str:
-    """Shard key for a pytest invocation: normalized args, order/dup-insensitive.
-
-    The same *set* of normalized arguments always produces the same shard,
-    regardless of argument order or repetitions.  Excluded from the key: the
-    plugin's own flags, volatile pytest arguments (``--basetemp``), and
-    presentation-only flags (``-q``/``-v``/``--tb``/``-x``/... -- see
-    ``_filter_args``); everything else, notably selection-affecting arguments
-    (``-k``, ``-m``, ``--deselect``, positional paths) and unknown arguments,
-    stays in the key.
-    """
-    filtered = _filter_args(args)
-    normalized = sorted({normalize_arg(a, root) for a in filtered})
-    blob = "\x00".join(normalized)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]

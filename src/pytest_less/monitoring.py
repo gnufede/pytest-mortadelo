@@ -79,12 +79,11 @@ import os
 import sys
 from pathlib import Path
 
-from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache, ParseCache
+from .blocks import DYNAMIC_DEP, WILDCARD, Block, BlockCache
 from .util import _EXCLUDED_SEGMENTS, to_repo_rel
 
 _ORIG_LRU = _ft_mod.lru_cache
 _ORIG_CACHE = getattr(_ft_mod, "cache", None)
-_ORIG_CACHED_PROPERTY = getattr(_ft_mod, "cached_property", None)
 try:
     from sys import monitoring as _sys_monitoring
 except ImportError:  # pragma: no cover - Python < 3.12
@@ -115,7 +114,6 @@ _REFLECTIVE_ENTRY_POINTS = {
 
 _PREFERRED_TOOL_IDS = (4, 3)
 _ALL_TOOL_IDS = tuple(range(6))
-
 
 def _candidate_tool_ids():
     yield from _PREFERRED_TOOL_IDS
@@ -166,7 +164,6 @@ _REARM = _sys_monitoring is not None and hasattr(_sys_monitoring, "restart_event
 _DISABLE = _sys_monitoring.DISABLE if _sys_monitoring is not None else None
 _DISABLE_ATTRIBUTED = _DISABLE if _REARM else None
 
-
 def _use_tool(tool_id: int, name: str) -> None:
     # Python 3.13 renamed sys.monitoring.use_tool -> use_tool_id.
     fn = getattr(_sys_monitoring, "use_tool_id", None) or getattr(
@@ -174,13 +171,11 @@ def _use_tool(tool_id: int, name: str) -> None:
     )
     fn(tool_id, name)
 
-
 def _free_tool(tool_id: int) -> None:
     fn = getattr(_sys_monitoring, "free_tool_id", None) or getattr(
         _sys_monitoring, "free_tool", None
     )
     fn(tool_id)
-
 
 def _operand_name(code, instruction) -> str | None:
     """The module / attribute name an IMPORT_NAME / IMPORT_FROM refers to.
@@ -192,7 +187,6 @@ def _operand_name(code, instruction) -> str | None:
     """
     value = instruction.argval
     return value if isinstance(value, str) else None
-
 
 def _imports_via_dis(code) -> list[tuple[str, str | None, int]]:
     """``[(op, name, level)]`` for every IMPORT_NAME / IMPORT_FROM, via ``dis``.
@@ -209,7 +203,6 @@ def _imports_via_dis(code) -> list[tuple[str, str | None, int]]:
         elif ins.opname == "IMPORT_FROM":
             out.append(("IMPORT_FROM", _operand_name(code, ins), 0))
     return out
-
 
 def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
     """The same list, found by scanning the raw bytecode for the two opcodes.
@@ -263,7 +256,6 @@ def _imports_via_bytes(code) -> list[tuple[str, str | None, int]] | None:
         out.append(("IMPORT_NAME", name, level))
     return out
 
-
 def _level_before(co: bytes, start: int, consts: tuple) -> int | None:
     """The relative-import level pushed before the IMPORT_NAME at byte *start*,
     or None if the two units before it are not a plain int load.  Mirrors
@@ -285,7 +277,6 @@ def _level_before(co: bytes, start: int, consts: tuple) -> int | None:
         # 3.15's LOAD_COMMON_CONSTANT, ...): the level is one load further
         # back.  Past that, defer to dis.
     return None
-
 
 def _static_level(instrs, index: int) -> int:
     """Best-effort static read of the relative-import *level* stack operand.
@@ -314,7 +305,6 @@ def _static_level(instrs, index: int) -> int:
         if seen == 2:
             break
     return 0
-
 
 def _build_module_index(root: Path, exclude_roots: tuple[Path, ...]) -> dict[str, str]:
     """Map importable dotted names to repo-relative files, conservatively.
@@ -375,43 +365,13 @@ def _build_module_index(root: Path, exclude_roots: tuple[Path, ...]) -> dict[str
             index.setdefault(name, rel)
     return index
 
-
-def _mode_is_output_only(mode) -> bool:
-    """Whether an ``open()`` mode never reads the file's existing content.
-
-    ``w``/``x`` discard or refuse existing content (``w+`` too: what it reads
-    back is what it wrote); ``a`` without ``+`` can only append.  ``r``,
-    ``r+`` and ``a+`` can read pre-existing content: inputs.
-    """
-    if not isinstance(mode, str):
-        return False
-    return "w" in mode or "x" in mode or ("a" in mode and "+" not in mode)
-
-
-def _flags_are_output_only(flags) -> bool:
-    """The ``os.open`` flavour of :func:`_mode_is_output_only`."""
-    if not isinstance(flags, int):
-        return False
-    if flags & getattr(os, "O_ACCMODE", 3) == os.O_WRONLY:
-        return True
-    if flags & getattr(os, "O_TRUNC", 0):
-        return True  # truncated: existing content is discarded
-    created = getattr(os, "O_CREAT", 0) & flags and getattr(os, "O_EXCL", 0) & flags
-    return bool(created)  # exclusive create: the file is new by definition
-
-
 class FileMonitor:
     """Collects repo-relative file dependencies, bucketed by execution phase."""
 
     def __init__(
         self, root: Path, exclude_roots: tuple[Path, ...] = (),
-        *, data_files: bool = False,
-        parse_cache: ParseCache | None = None,
     ):
         self.root = Path(root).resolve()
-        # Whether non-Python files opened by tests are recorded as
-        # file-level dependencies (wrapped ``open``; on by default).
-        self._data_files = data_files
         # (owner, name, original, wrapper) of every installed interceptor.
         self._undo: list[tuple] = []
         # In-repo files this run only *wrote*: outputs, never inputs (see
@@ -448,7 +408,7 @@ class FileMonitor:
         self.spawn_tests: set[str] = set()
         self.spawn_shared = False
         # Block analysis (one compile per file, lazily).
-        self._blocks = BlockCache(self.root, parse_cache=parse_cache)
+        self._blocks = BlockCache(self.root)
         # Internals.
         self._active = False
         self._tool_id: int | None = None
@@ -782,42 +742,9 @@ class FileMonitor:
                     continue
             wrap(owner, leaf, intercept(note_spawn))
 
-        if self._data_files:
-            import builtins
-            import io
-
-            def track_py_open(*a, **k):
-                file = a[0] if a else k.get("file")
-                mode = a[1] if len(a) > 1 else k.get("mode", "r")
-                self._track_open(file, _mode_is_output_only(mode))
-
-            def track_fd_open(*a, **k):
-                file = a[0] if a else k.get("file")
-                flags = a[1] if len(a) > 1 else k.get("flags")
-                self._track_open(file, _flags_are_output_only(flags))
-
-            # ``builtins.open`` and ``io.open`` are the same object; wrap
-            # both bindings (pathlib and most libraries go through one of
-            # them at call time).  ``os.open`` is a separate entry point used
-            # directly by plenty of code (and by libraries that want a raw
-            # fd), so it needs its own wrapper: without it those reads are
-            # invisible and an edited data file selects nothing.
-            wrap(builtins, "open", intercept(track_py_open))
-            wrap(io, "open", intercept(track_py_open))
-            wrap(os, "open", intercept(track_fd_open))
-
         # ctypes.CDLL.__init__: the class method, so every subclass
         # constructor (PyDLL, WinDLL, OleDLL) and every LibraryLoader
         # (cdll.LoadLibrary) goes through it.
-        import ctypes
-
-        def track_cdll(self_, name, *a, **k):
-            # ``self_`` is the CDLL instance: patching a class method means
-            # the wrapper receives the bound instance first
-            self._track_cdll(name)
-
-        if hasattr(ctypes, "CDLL"):
-            wrap(ctypes.CDLL, "__init__", intercept(track_cdll))
 
         # importlib.import_module: resolved after the call (the module must
         # exist before we can ask it where it lives).
@@ -889,63 +816,6 @@ class FileMonitor:
         # __get__ is called on EVERY attribute access (hit or miss: it
         # checks the instance __dict__ first), so the tracking fires for
         # every consumer, not just the first one that computed the value.
-        def make_scoped_cproperty(orig_cp):
-            """A drop-in for functools.cached_property, tracking repo functions.
-
-            ``__get__`` fires on EVERY attribute access (hit or miss: it
-            checks the instance ``__dict__`` first), so the tracking
-            fires for every consumer, not just the one that computed the
-            value.  The monitor and dep are captured in the closure and
-            stored on the descriptor instance.
-            """
-            monitor = self
-
-            class TrackedCP(orig_cp):
-                """A data-descriptor version of cached_property.
-
-                The original is a *non-data* descriptor: after the first
-                access the value is in ``instance.__dict__`` and the
-                descriptor is bypassed entirely, so ``__get__`` fires
-                only on the miss.  Adding ``__set__`` makes this a data
-                descriptor — Python's attribute protocol then calls
-                ``__get__`` on *every* access, hit or miss, which is
-                what lets the tracking fire for every consumer.
-
-                The semantic difference: the attribute is now truly
-                read-only through the descriptor (setting raises
-                AttributeError instead of shadowing the descriptor via
-                ``__dict__``).
-                """
-
-                def __set__(self, instance, value):
-                    # read-only; exists only to force data-descriptor
-                    # lookup (and thus __get__ on every access)
-                    raise AttributeError(
-                        f"property '{self.attrname}' of '{type(instance).__name__}'"
-                        " object has no setter"
-                    )
-
-                def __get__(self, instance, owner):
-                    if instance is None:
-                        return self
-                    dep = getattr(self, "_less_dep", None)
-                    if dep is not None and monitor._active:
-                        monitor._bucket((dep,))
-                    return super().__get__(instance, owner)
-
-            def scoped_cp(func):
-                if not monitor._is_repo_code(func):
-                    return orig_cp(func)
-                dep = monitor._resolve_code_dep(func.__code__)
-                t = TrackedCP(func)
-                t._less_dep = dep
-                return t
-
-            return scoped_cp
-
-        if _ORIG_CACHED_PROPERTY is not None:
-            wrap(_ft_mod, "cached_property",
-                 lambda orig: make_scoped_cproperty(_ORIG_CACHED_PROPERTY))
 
     def _is_repo_code(self, func) -> bool:
         """Whether *func*'s code object lives in the repository."""
@@ -1008,46 +878,6 @@ class FileMonitor:
         except Exception:  # pragma: no cover - never break the call we wrap
             pass
 
-    def _cdll_dep(self, name: str) -> str | None:
-        """Repo-relative path of a dynamically loaded library, or None.
-
-        dlopen semantics: a name containing a path separator is a path
-        (relative to the process cwd); a bare name is searched by the
-        dynamic loader -- of which only entries on the loader path env
-        vars can land inside the repository.  System libraries are outside
-        the watched universe and are skipped."""
-        try:
-            if "/" in name or os.sep in name:
-                p = Path(name)
-                if not p.is_absolute():
-                    p = Path.cwd() / p
-                return self.repo_rel(os.fspath(p))
-            for var in ("DYLD_LIBRARY_PATH", "LD_LIBRARY_PATH"):
-                for d in os.environ.get(var, "").split(os.pathsep):
-                    if d:
-                        p = Path(d) / name
-                        if p.is_file():
-                            rel = self.repo_rel(os.fspath(p))
-                            if rel is not None:
-                                return rel
-            return None
-        except Exception:
-            return None
-
-    def _track_cdll(self, name) -> None:
-        """A dynamically loaded in-repo library is a file-level dependency
-        of whoever loaded it (the same shape the import scan gives a .so:
-        dlopen is not an import, but the artifact is equally a dependency).
-        A bare name that resolves outside the repository is skipped."""
-        if not self._active or not isinstance(name, str):
-            return
-        try:
-            rel = self._cdll_dep(name)
-            if rel is not None:
-                self._bucket(((rel, WILDCARD, WILDCARD),))
-        except Exception:
-            pass  # tracking must never break the load it observes
-
     def _track_import_module(self, name, package) -> None:
         """The module a reflective import resolved to is a dependency of
         whoever imported it -- its *skeleton* if it is a .py (exactly what
@@ -1070,55 +900,6 @@ class FileMonitor:
                     self._bucket((self.module_dep(rel),))
         except Exception:
             pass  # tracking must never break the import it observes
-
-    def _track_open(self, path, output_only: bool = False) -> None:
-        """Record a non-Python in-repo file opened while the monitor is active
-        as a file-level wildcard dependency -- a data file has no code
-        structure, so ``(rel, "*", "*")`` means "any content change re-runs
-        the tests (or, outside a test, everything) that opened it".  git only
-        reports content changes, so mtime-only churn never reaches selection.
-        The suffix reject-first filter runs before any path resolution.
-
-        Outputs are not inputs.  A file the run only *writes* (*output_only*)
-        is remembered instead of recorded, and reading it back later in the
-        same run is not a dependency either: it is produced by the run, and
-        recording it would make the test depend on a file it creates itself
-        -- untracked, hence "changed" forever, hence re-run on every run.
-        """
-        if not self._active:
-            return
-        try:
-            if isinstance(path, str):
-                fname = path
-            elif isinstance(path, (bytes, os.PathLike)):
-                fname = os.fspath(path)
-                if not isinstance(fname, str):
-                    fname = os.fsdecode(fname)
-            else:
-                return  # int fd or exotic object: no path to record
-            # Python source/bytecode is tracked at block precision by
-            # PY_START; a file-level wildcard dep on it would throw that
-            # precision away.
-            if fname.endswith((".py", ".pyc", ".pyo")):
-                return
-            rel = self.repo_rel(fname)  # memoized; None outside the repo
-            if rel is None:
-                return
-            if rel == ".git" or rel.startswith(self._AUDIT_SKIP_PREFIXES):
-                return
-            if self._exclude_roots and self._is_excluded(fname):
-                return
-            if output_only:
-                self._written.add(rel)
-                return
-            if rel in self._written:
-                return
-            # GIL note: set.add is atomic; bucket attribution under
-            # concurrent threads follows the current test (documented
-            # over/under-attribution caveat, same as the code tracker).
-            self._bucket(((rel, WILDCARD, WILDCARD),))
-        except Exception:
-            pass  # tracking must never break the open() it observes
 
     # -- event handling --------------------------------------------------
 
@@ -1345,9 +1126,6 @@ class FileMonitor:
         """Import-time dependency on a module (its skeleton)."""
         return self._blocks.module_dep(rel)
 
-    @property
-    def parse_cache(self) -> ParseCache | None:
-        return self._blocks.parse_cache
 
     @property
     def parse_stats(self) -> tuple[int, int]:
