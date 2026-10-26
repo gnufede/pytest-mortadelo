@@ -340,7 +340,7 @@ def repo(tmp_path):
 
 
 def git_changed(root, base):
-    return Store(root, "k").changed_since(base)
+    return Store(root).changed_since(base)
 
 
 OPS = ["edit_py", "edit_data", "touch", "delete", "new_py", "new_py_in_new_dir",
@@ -353,7 +353,7 @@ def test_agrees_with_git_diff_and_ls_files(repo, seed):
     deps = ["pkg/a.py", "pkg/sub/c.py", "tests/test_t.py", "data/x.txt"]
     base = git(repo, "rev-parse", "HEAD").stdout.strip()
     snapshot = build_snapshot(repo, deps)
-    store = Store(repo, "k")
+    store = Store(repo)
     existing = ["pkg/a.py", "pkg/b.py", "pkg/sub/c.py", "tests/test_t.py", "setup.py", "data/x.txt"]
     for counter in range(1, rng.randint(1, 7) + 1):
         op = rng.choice(OPS)
@@ -396,22 +396,17 @@ def test_agrees_with_git_diff_and_ls_files(repo, seed):
 # End to end.
 
 
-def shard_key(project):
-    ref = git(project.path, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()[0]
-    return ref.rsplit("/", 1)[-1]
-
-
 class TestEndToEnd:
     def test_the_shard_carries_its_fingerprints(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
-        snapshot = Store(project.path, shard_key(project)).load_files()
+        snapshot = Store(project.path).load_files()
         assert snapshot is not None and snapshot["v"] == 1
         assert {"tests/lib.py", "tests/test_a.py", "tests/conftest.py"} <= set(snapshot["files"])
         assert "tests" in snapshot["dirs"] and "" in snapshot["dirs"]
 
     def test_amended_history_does_not_invalidate_the_shard(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
-        base = Store(project.path, shard_key(project)).load_meta()["base_commit"]
+        base = Store(project.path).load_meta()["base_commit"]
         git(project.path, "commit", "-q", "--amend", "--allow-empty", "-m", "amended")
         git(project.path, "reflog", "expire", "--expire=now", "--all")
         git(project.path, "gc", "-q", "--prune=now")
@@ -457,16 +452,16 @@ class TestEndToEnd:
 
     def test_a_shard_without_fingerprints_falls_back_to_git_and_gains_them(self, project):
         run_less(project, "-q").assert_outcomes(passed=2)
-        store = Store(project.path, shard_key(project))
-        data, meta, parse = store.load_data(), store.load_meta(), store.load_parse()
+        store = Store(project.path)
+        data, meta = store.load_data(), store.load_meta()
         store.delete()
-        store.save(data, meta, parse=parse)  # an old-style shard: no files.json
-        assert Store(project.path, shard_key(project)).load_files() is None
+        store.save(data, meta)  # old-style: no files.json
+        assert Store(project.path).load_files() is None
         result = run_less(project, "-q")
         assert result.ret == 5  # git diff path still decides correctly
         (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
         run_less(project, "-q").assert_outcomes(passed=1)
-        assert Store(project.path, shard_key(project)).load_files() is not None
+        assert Store(project.path).load_files() is not None
 
     def test_a_run_that_stops_early_does_not_hide_the_tests_it_never_ran(self, pytester):
         tests = pytester.path / "tests"

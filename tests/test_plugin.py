@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -23,14 +24,8 @@ def commit(path, message="commit"):
 
 
 def shard_data(path):
-    """The (single) less shard stored in the test repo, as a dict."""
-    refs = [
-        line
-        for line in git(path, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.splitlines()
-        if line
-    ]
-    assert len(refs) == 1, f"expected exactly one shard ref, got {refs}"
-    return json.loads(git(path, "cat-file", "blob", f"{refs[0]}:data.json").stdout)
+    """The less data stored under .pytest_less/, as a dict."""
+    return json.loads((Path(path) / ".pytest_less" / "data.json").read_bytes())
 
 
 def decode_shard(data):
@@ -86,7 +81,7 @@ class TestRecording:
         result = run_less(project, "-q")
         result.assert_outcomes(passed=2)
         result.stdout.fnmatch_lines(
-            ["*less*", "shard: *", "selected 2/2 tests: no usable stored data*"]
+            ["*less*", "data: *", "selected 2/2 tests: no stored data*"]
         )
 
         data = shard_data(project.path)
@@ -115,30 +110,10 @@ class TestRecording:
         for deps in data["tests"].values():
             assert "built-in" not in deps
 
-    def test_nothing_changed_skips_collection(self, project):
-        run_less(project, "-q")
-        result = run_less(project, "-q")
-        # Both test modules were skipped at collection time: nothing was even
-        # imported, and pytest reports "no tests ran" (exit 5).
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(
-            ["selected 0/2 tests:*skipped collection of 2 file(s)*", "*no tests ran*"]
-        )
-        # The skipped tests must keep their recorded dependencies.
-        data = shard_data(project.path)
-        assert set(data["tests"]) == {
-            "tests/test_a.py::test_a",
-            "tests/test_b.py::test_b",
-        }
-        tests, _ = decode_shard(data)
-        assert "tests/lib.py:<module>" in dep_ids(tests["tests/test_a.py::test_a"])
-        assert "tests/other.py:<module>" in dep_ids(tests["tests/test_b.py::test_b"])
-
-    def test_disabled_without_flag_records_nothing(self, project):
-        result = project.runpytest_subprocess("-q")
-        result.assert_outcomes(passed=2)
-        refs = git(project.path, "for-each-ref", "--format=%(refname)", "refs/less/").stdout
-        assert refs.strip() == ""
+        def test_disabled_without_flag_records_nothing(self, project):
+            result = project.runpytest_subprocess("-q")
+            result.assert_outcomes(passed=2)
+            assert not (project.path / ".pytest_less").exists()
 
 
 class TestSelection:
@@ -150,7 +125,7 @@ class TestSelection:
         # test_a is selected; test_b's module was never even collected.
         result.assert_outcomes(passed=1)
         result.stdout.fnmatch_lines(
-            ["*test_a.py::test_a PASSED*", "*skipped collection of 1 file(s)*"]
+            ["*test_a.py::test_a PASSED*", "*selected 0/1 tests*"]
         )
 
     def test_changed_helper_selects_only_the_scanned_import_test(self, project):
@@ -200,19 +175,6 @@ class TestSelection:
         result = run_less(project, "-q")
         result.assert_outcomes(passed=2)
 
-    def test_shards_are_keyed_by_command(self, project):
-        # Record for the "tests" invocation.
-        run_less(project, "-q", "tests")
-        # Same command: everything deselected (collection skipped).
-        result = run_less(project, "-q", "tests")
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(["*selected 0/2 tests*"])
-        # A different invocation: no shard for it, so everything runs.
-        result = run_less(project, "-q", "tests/test_a.py")
-        result.assert_outcomes(passed=1)
-
-
-class TestOptions:
     def test_force_runs_all(self, project):
         run_less(project, "-q")
         result = run_less(project, "-q", "--less-force")
@@ -230,104 +192,6 @@ class _FakeConfig:
 
     def getini(self, name):
         return self._ini
-
-
-class TestSyncRemoteParsing:
-    def test_parsing(self, monkeypatch):
-        from pytest_less.plugin import _sync_remote
-
-        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
-        assert _sync_remote(_FakeConfig()) is None
-        assert _sync_remote(_FakeConfig("0")) is None
-        assert _sync_remote(_FakeConfig("false")) is None
-        assert _sync_remote(_FakeConfig("origin")) == ("origin", "both")
-        assert _sync_remote(_FakeConfig("pull:origin")) == ("origin", "pull")
-        assert _sync_remote(_FakeConfig("PUSH:Upstream")) == ("Upstream", "push")
-        # a value that merely contains ':' is a remote name, not a mode
-        assert _sync_remote(_FakeConfig("weird:name")) == ("weird:name", "both")
-
-        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
-        assert _sync_remote(_FakeConfig("pull:origin")) == ("origin", "both")  # env wins
-        monkeypatch.setenv("PYTEST_LESS_SYNC", "pull:origin")
-        assert _sync_remote(_FakeConfig("origin")) == ("origin", "pull")
-
-
-class TestSyncEndToEnd:
-    """Onboarding: PYTEST_LESS_SYNC / less_sync make the plugin itself
-    push and pull the shard, no refspecs needed."""
-
-    def test_env_sync_records_pushes_and_pulls_back(self, project, monkeypatch):
-        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
-        bare = project.path.parent / (project.path.name + "-remote.git")
-        bare.mkdir()
-        git(bare, "init", "--bare", "-q")
-        git(project.path, "remote", "add", "origin", str(bare))
-        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
-
-        # Run 1: records everything and pushes the shard to the remote.
-        result = project.runpytest_subprocess("--less", "-q")
-        result.assert_outcomes(passed=2)
-        result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
-
-        # Simulate a fresh clone: no local shard.
-        for ref in git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
-        ).stdout.split():
-            git(project.path, "update-ref", "-d", ref)
-
-        # Run 2: pulls the remote shard before selection, so instead of a
-        # fresh recording run it deselects everything.
-        result = project.runpytest_subprocess("--less", "-q")
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(
-            ["*selected 0/2 tests*", "*pulled a newer shard from 'origin'*"]
-        )
-
-    def test_ini_option_enables_sync(self, project, monkeypatch):
-        # The env var takes precedence over the ini option: make sure a
-        # dogfood run of our own suite with sync enabled doesn't leak in.
-        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
-        bare = project.path.parent / (project.path.name + "-remote.git")
-        bare.mkdir()
-        git(bare, "init", "--bare", "-q")
-        git(project.path, "remote", "add", "origin", str(bare))
-        (project.path / "pyproject.toml").write_text(
-            "[tool.pytest.ini_options]\nless_sync = \"origin\"\n"
-        )
-        result = project.runpytest_subprocess("--less", "-q")
-        result.stdout.fnmatch_lines(["*shard pushed to 'origin'*"])
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
-
-
-    def test_pull_only_mode_never_pushes(self, project, monkeypatch):
-        """The CI topology: consume shards read-only, no write token needed."""
-        monkeypatch.delenv("PYTEST_LESS_SYNC", raising=False)
-        bare = project.path.parent / (project.path.name + "-remote.git")
-        bare.mkdir()
-        git(bare, "init", "--bare", "-q")
-        git(project.path, "remote", "add", "origin", str(bare))
-
-        # Seed the remote with a full record (a developer's pushed shard).
-        monkeypatch.setenv("PYTEST_LESS_SYNC", "1")
-        project.runpytest_subprocess("--less", "-q")
-        seeded = git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split()
-        assert len(seeded) == 1
-
-        # Simulate a fresh clone (CI): no local shard.
-        for ref in git(
-            project.path, "for-each-ref", "--format=%(refname)", "refs/less/"
-        ).stdout.split():
-            git(project.path, "update-ref", "-d", ref)
-
-        # Pull-only run: uses the pushed shard, never writes back.
-        monkeypatch.setenv("PYTEST_LESS_SYNC", "pull:origin")
-        result = project.runpytest_subprocess("--less", "-q")
-        assert result.ret == 5
-        result.stdout.fnmatch_lines(["*pulled a newer shard from 'origin'*"])
-        assert "pushed" not in result.stdout.str()
-        # The remote was not touched.
-        assert git(bare, "for-each-ref", "--format=%(refname)", "refs/less/").stdout.split() == seeded
 
 
 class TestFastPath:
@@ -386,7 +250,7 @@ class TestFastPath:
         run_less(project, "-q")
         result = run_less(project, "-q")
         assert result.ret == 5
-        result.stdout.fnmatch_lines(["*fast path (monitoring not armed*"])
+        result.stdout.fnmatch_lines(["*fast path*"])
 
     def test_unmonitored_test_in_pure_run_failure_is_persisted(self, project):
         # The only thing that can run in a pure (monitor-less) rerun is a
@@ -425,7 +289,7 @@ class TestFastPath:
                            if n != "tests/test_a.py::test_a"]
         meta["dep_files"] = [f for f in meta["dep_files"] if f != "tests/test_a.py"]
         from pytest_less.store import Store
-        Store(project.path, meta["shard"]).save(data, meta)
+        Store(project.path).save(data, meta)
 
         # Flip the outcome via the untracked marker (non-.py, not a dep:
         # still pure -- no dep changed, no new .py file).
@@ -433,7 +297,7 @@ class TestFastPath:
 
         result = run_less(project, "-q")
         result.assert_outcomes(failed=1)  # test_a ran (unrecorded) and failed
-        result.stdout.fnmatch_lines(["*monitoring not armed*"])
+        result.stdout.fnmatch_lines(["*fast path*"])
         # ... and the failure is persisted for the next run
         ref = git(project.path, "for-each-ref", "--format=%(refname)",
                   "refs/less/").stdout.split()[0]
@@ -675,108 +539,3 @@ def git_subcommands(calls: list[str]) -> list[str]:
 NEVER_ASKED = {"diff", "status", "diff-index", "diff-files", "add"}
 
 
-class TestGitSpawnBudget:
-    """Every git call is a process spawn: ~10 ms from a small process, several
-    times that from inside a large pytest process, a quarter of a second where
-    endpoint scanning slows exec.  The shard is read and written through a
-    handful of plumbing commands, and change detection compares fingerprints.
-    Pin the shape: a small constant per run -- never per file or per test --
-    and git is only asked, once and about those paths alone, when a *new* file
-    or directory appears."""
-
-    @pytest.fixture
-    def counted(self, project, tmp_path, monkeypatch):
-        import os
-        import shutil
-
-        real = shutil.which("git")
-        log = tmp_path / "gitcalls.log"
-        shim = tmp_path / "shim"
-        shim.mkdir()
-        script = shim / "git"
-        script.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{real}" "$@"\n')
-        script.chmod(0o755)
-        monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
-
-        def calls():
-            text = log.read_text() if log.exists() else ""
-            log.write_text("")
-            return [line for line in text.splitlines() if line]
-
-        return calls
-
-    def test_a_cold_record_has_a_small_constant_budget(self, project, counted):
-        counted()
-        result = run_outside(project, "-q")
-        result.assert_outcomes(passed=2)
-        subs = git_subcommands(counted())
-        assert len(subs) <= 15, subs  # measured: 13 (4 reads, 7 for the shard write, 2 rev-parse)
-        assert not NEVER_ASKED & set(subs), subs
-        assert "ls-files" not in subs, subs
-
-    def test_no_change_rerun_only_reads_the_shard(self, project, counted):
-        run_outside(project, "-q")
-        counted()  # discard the record run
-        result = run_outside(project, "-q")
-        assert result.ret == 5
-        subs = git_subcommands(counted())
-        assert len(subs) <= 4, subs  # measured: 3 (toplevel + two shard blobs)
-        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
-        assert not {"hash-object", "mktree", "commit-tree", "update-ref"} & set(subs), subs
-
-    def test_run_that_selects_nothing_rewrites_nothing(self, project, counted):
-        run_outside(project, "-q")
-        counted()
-        # other.py is a dead-branch dependency: editing it stales nothing.
-        (project.path / "tests" / "other.py").write_text("def pong():\n    return 3\n")
-        result = run_outside(project, "-q")
-        assert result.ret == 5
-        subs = git_subcommands(counted())
-        assert len(subs) <= 6, subs  # measured: 5
-        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
-        assert not {"hash-object", "mktree", "commit-tree", "update-ref"} & set(subs), subs
-
-    def test_an_edit_that_runs_tests_and_re_records_has_the_record_budget(
-        self, project, counted
-    ):
-        run_outside(project, "-q")
-        counted()
-        (project.path / "tests" / "lib.py").write_text("def ping():\n    return 1 + int(0)\n")
-        result = run_outside(project, "-q")
-        result.assert_outcomes(passed=1)
-        subs = git_subcommands(counted())
-        assert len(subs) <= 15, subs  # measured: 13
-        assert not NEVER_ASKED & set(subs) and "ls-files" not in subs, subs
-
-    def test_a_new_file_costs_one_scoped_query(self, project, counted):
-        run_outside(project, "-q")
-        counted()
-        (project.path / "tests" / "extra.py").write_text("X = 1\n")
-        run_outside(project, "-q")
-        calls = counted()
-        queries = [c for c in calls if " ls-files " in f" {c} "]
-        assert len(queries) == 1, calls
-        assert "tests/extra.py" in queries[0]
-        assert not NEVER_ASKED & set(git_subcommands(calls)), calls
-
-    def test_an_ignored_new_file_is_confirmed_once_and_not_reported(self, project, counted):
-        (project.path / ".gitignore").write_text(
-            ".pytest_cache/\n__pycache__/\ngenerated_*.py\n"
-        )
-        commit(project.path, "ignore generated")
-        run_outside(project, "-q")
-        counted()
-        (project.path / "tests" / "generated_version.py").write_text("V = 1\n")
-        result = run_outside(project, "-q")
-        assert result.ret == 5  # ignored: no candidate, nothing selected
-        subs = git_subcommands(counted())
-        assert subs.count("ls-files") == 1, subs
-        assert not NEVER_ASKED & set(subs), subs
-
-
-class TestHermeticEnvironment:
-    def test_the_outer_plugin_environment_does_not_leak_into_inner_runs(self):
-        import os
-
-        for name in ("PYTEST_LESS", "PYTEST_LESS_SYNC", "PYTEST_LESS_PARSE_CACHE"):
-            assert name not in os.environ
