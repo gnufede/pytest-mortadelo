@@ -1,0 +1,9 @@
+.pytest_mortadelo/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+docs/performance-notes.md

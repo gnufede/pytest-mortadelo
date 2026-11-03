@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-mortadelo"
+version = "0.1.0"
+description = "Test impact analysis for pytest: per-test dependencies at function and class level recorded with sys.monitoring, hashed from compiled bytecode, stored as JSON under .pytest_mortadelo/, selected by comparing file fingerprints."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+  "pytest>=8.0",
+]
+classifiers = [
+  "Framework :: Pytest",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.entry-points.pytest11]
+mortadelo = "pytest_mortadelo.plugin"
+
+[dependency-groups]
+dev = ["ruff>=0.8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pytest_mortadelo"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff.lint]
+# BLE001/S110: the monitor and storage layer intentionally swallow broad
+# exceptions -- a monitoring bug must never break the user's test run.
+ignore = ["BLE001", "S110"]
+
+[tool.ruff.lint.per-file-ignores]
+# demo/sqlalchemy_demo.py: a talk script -- terse reads and fire-and-forget
+# subprocess calls are the point.
+"demo/*" = ["SIM115", "PLW1510"]
